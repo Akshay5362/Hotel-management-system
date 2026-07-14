@@ -4,12 +4,10 @@ export default function RoomShiftingModal({ isOpen, onClose, room, vacantRooms, 
   const [targetRoomNo, setTargetRoomNo] = useState('');
 
   useEffect(() => {
-    if (vacantRooms.length > 0) {
+    if (isOpen && vacantRooms.length > 0) {
       setTargetRoomNo(vacantRooms[0].number);
-    } else {
-      setTargetRoomNo('');
     }
-  }, [vacantRooms, isOpen]);
+  }, [isOpen]);
 
   if (!isOpen || !room) return null;
 

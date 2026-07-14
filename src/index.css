@@ -124,7 +124,7 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 0 2rem;
+  padding: 0 1rem;
   background: var(--bg-header);
   border-bottom: 1px solid var(--border-color);
   backdrop-filter: var(--glass-blur);
@@ -141,6 +141,7 @@ body {
   font-size: 1.8rem;
   background: linear-gradient(135deg, #38bdf8 0%, #818cf8 100%);
   -webkit-background-clip: text;
+  background-clip: text;
   -webkit-text-fill-color: transparent;
   animation: pulse 3s infinite;
 }
@@ -206,17 +207,17 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 0 2rem;
+  padding: 0 1rem;
   background: rgba(13, 17, 23, 0.5);
   border-bottom: 1px solid var(--border-color);
   overflow: visible;
-  gap: 1.5rem;
+  gap: 0.75rem;
 }
 
 .quick-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
 }
 
 .btn-action {
@@ -224,17 +225,17 @@ body {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  width: 72px;
-  height: 60px;
+  width: 66px;
+  height: 54px;
   border: 1px solid var(--border-color);
   background: rgba(255, 255, 255, 0.03);
   color: var(--text-secondary);
   border-radius: 8px;
   cursor: pointer;
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-  font-size: 0.72rem;
+  font-size: 0.68rem;
   font-weight: 500;
-  gap: 4px;
+  gap: 2px;
 }
 
 .btn-action svg {
@@ -291,10 +292,10 @@ body {
 .filter-chip {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
+  gap: 5px;
+  padding: 5px 9px;
   border-radius: 6px;
-  font-size: 0.8rem;
+  font-size: 0.74rem;
   font-weight: 600;
   cursor: pointer;
   transition: all 0.2s;
@@ -923,5 +924,22 @@ input:focus, select:focus, textarea:focus {
 
 @keyframes popupShow {
   to { transform: scale(1); opacity: 1; }
+}
+
+@keyframes floatAnimation {
+  0% { transform: translateY(0px); }
+  50% { transform: translateY(-8px); }
+  100% { transform: translateY(0px); }
+}
+
+.upcoming-row {
+  transition: all 0.2s ease-in-out !important;
+}
+
+.upcoming-row:hover {
+  background: rgba(139, 92, 246, 0.08) !important;
+  border-color: rgba(139, 92, 246, 0.35) !important;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(139, 92, 246, 0.1);
 }
 

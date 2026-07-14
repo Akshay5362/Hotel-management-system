@@ -70,6 +70,17 @@ export default function Toolbar({
           Day End
         </button>
 
+        <button className="btn-action" onClick={() => onActionClick('reservations')} data-tooltip="View upcoming future guest reservations">
+          <svg viewBox="0 0 24 24">
+            <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+            <line x1="16" y1="2" x2="16" y2="6" />
+            <line x1="8" y1="2" x2="8" y2="6" />
+            <line x1="3" y1="10" x2="21" y2="10" />
+            <path d="M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01M16 18h.01" />
+          </svg>
+          Upcoming Res
+        </button>
+
         <button className="btn-action" onClick={() => onActionClick('refresh')} data-tooltip="Re-sync dashboard with database">
           <svg viewBox="0 0 24 24">
             <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67" />
@@ -88,8 +99,8 @@ export default function Toolbar({
       </div>
 
       {/* Guest/Room Search bar */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '15px', flexGrow: 1, maxWidth: '350px' }}>
-        <div className="input-icon-wrapper" style={{ width: '100%' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexGrow: 1, maxWidth: '240px' }}>
+        <div className="input-icon-wrapper" style={{ width: '100%', position: 'relative' }}>
           <svg viewBox="0 0 24 24">
             <circle cx="11" cy="11" r="8" />
             <line x1="21" y1="21" x2="16.65" y2="16.65" />
@@ -99,8 +110,32 @@ export default function Toolbar({
             placeholder="Search by Room / Guest..." 
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            style={{ padding: '8px 12px 8px 36px', height: '40px', borderRadius: '8px', border: '1px solid var(--border-color)' }}
+            style={{ padding: '6px 32px 6px 36px', height: '36px', borderRadius: '8px', border: '1px solid var(--border-color)', width: '100%' }}
           />
+          {searchQuery && (
+            <button 
+              onClick={() => setSearchQuery('')}
+              style={{
+                position: 'absolute',
+                right: '10px',
+                top: '50%',
+                transform: 'translateY(-50%)',
+                background: 'transparent',
+                border: 'none',
+                color: 'var(--text-muted)',
+                fontSize: '1.2rem',
+                cursor: 'pointer',
+                padding: '0 4px',
+                lineHeight: 1,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+              title="Clear search"
+            >
+              &times;
+            </button>
+          )}
         </div>
       </div>
 

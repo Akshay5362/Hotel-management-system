@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 
-export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAddLedgerItem, showAlert, showConfirm }) {
+export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAddLedgerItem, onModifyClick, showAlert, showConfirm }) {
   const [newDesc, setNewDesc] = useState('');
   const [newAmount, setNewAmount] = useState('');
 
@@ -140,9 +140,16 @@ export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAdd
           </div>
         </div>
 
-        <div className="modal-footer">
-          <button className="btn-secondary" onClick={onClose}>Close</button>
-          <button className="btn-danger" onClick={handleCheckOut}>Settle & Check Out</button>
+        <div className="modal-footer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div>
+            <button className="btn-secondary" style={{ background: 'linear-gradient(135deg, #0284c7 0%, #0369a1 100%)', color: '#fff', border: 'none' }} onClick={onModifyClick}>
+              ✏️ Modify Check-In
+            </button>
+          </div>
+          <div style={{ display: 'flex', gap: '10px' }}>
+            <button className="btn-secondary" onClick={onClose}>Close</button>
+            <button className="btn-danger" onClick={handleCheckOut}>Settle & Check Out</button>
+          </div>
         </div>
       </div>
     </div>
