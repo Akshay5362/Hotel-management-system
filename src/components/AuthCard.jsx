@@ -141,10 +141,10 @@ export default function AuthCard({ isAdmin = false, initialIsSignUp = false, onA
         <form onSubmit={handleSubmit} autoComplete="off" style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
           
           <div className="form-group">
-            <label style={{ fontSize: '0.75rem', marginBottom: '4px' }}>Username</label>
+            <label style={{ fontSize: '0.75rem', marginBottom: '4px' }}>Username, Email, or Phone</label>
             <input 
               type="text" 
-              placeholder="Enter username"
+              placeholder="Enter username, email, or phone"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               required

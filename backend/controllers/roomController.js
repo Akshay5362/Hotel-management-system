@@ -1,4 +1,7 @@
 import pool from '../db.js';
+import fs from 'fs';
+import path from 'path';
+import { extractOCRData, verifyDocumentData } from '../services/ocrService.js';
 
 // Helper to format time (e.g. 09:30 AM)
 function formatTime(date) {
@@ -290,6 +293,30 @@ export const checkOut = async (req, res) => {
       [room.id]
     );
 
+    // Log CHECKED_OUT event in booking_history
+    await connection.query(
+      `INSERT INTO booking_history (booking_id, action, old_room_id, new_room_id, changed_by, business_date, notes)
+       VALUES (?, 'CHECKED_OUT', ?, ?, ?, ?, ?)`,
+      [activeBooking.id, room.id, room.id, resolvedUserId, businessDate,
+       `Checkout settled. Balance paid: ₹${parsedBalancePaid}. Payment status: ${finalPaymentStatus}.`]
+    );
+
+    // Notify the guest about checkout completion and request feedback
+    // Fetch the guest's user_id so we can send them a notification
+    const [guestUserRows] = await connection.query(
+      `SELECT g.user_id FROM guests g WHERE g.id = ?`,
+      [activeBooking.guest_id]
+    );
+    const guestUserId = guestUserRows[0]?.user_id;
+    if (guestUserId) {
+      await connection.query(
+        `INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)`,
+        [guestUserId,
+         '🏨 Thank You for Staying With Us!',
+         `Your checkout from Room ${number} is complete. We hope you had a wonderful stay! Please take a moment to share your experience — your feedback helps us serve you better.`]
+      );
+    }
+
     // Increment todayCheckouts count
     await connection.query(
       `UPDATE system_settings 
@@ -299,6 +326,7 @@ export const checkOut = async (req, res) => {
 
     await connection.commit();
     res.json({ message: `Successfully checked out Room ${number}` });
+
   } catch (error) {
     if (connection) {
       try {
@@ -579,7 +607,36 @@ export const bookRoom = async (req, res) => {
   }
   const parsedDeposit = parseInt(deposit, 10);
   if (isNaN(parsedDeposit) || parsedDeposit < 0) {
-    return res.status(400).json({ error: 'Deposit must be a non-negative integer' });
+    return res.status(400).json({ success: false, message: 'Deposit must be a non-negative integer' });
+  }
+
+  // Strict Document Validation
+  const val = (governmentId || '').trim();
+  let docError = null;
+  if (!idType || !val) {
+    docError = 'ID Type and Document Number are required';
+  } else if (idType === 'Aadhaar Card') {
+    if (!/^\d{12}$/.test(val)) docError = 'Aadhaar must be exactly 12 numeric digits.';
+  } else if (idType === 'Passport') {
+    if (!/^[A-Z]\d{7}$/.test(val)) docError = 'Passport must be 1 uppercase letter followed by 7 digits.';
+  } else if (idType === 'Voter ID') {
+    if (!/^[A-Z]{3}\d{7}$/.test(val)) docError = 'Voter ID must be 3 uppercase letters followed by 7 digits.';
+  } else if (idType === 'Driving Licence') {
+    const cleanDL = val.replace(/[- ]/g, '');
+    if (!/^[A-Z]{2}\d{2}(19|20)\d{2}\d{7}$/.test(cleanDL)) {
+      docError = 'Driving Licence must match standard format (e.g. DL0420101234567).';
+    }
+  } else {
+    docError = 'Invalid Document Type.';
+  }
+
+  if (docError) {
+    return res.status(400).json({ success: false, message: 'Validation Failed', errors: { governmentId: docError } });
+  }
+
+  const { idDocumentPath, idOcrText } = req.body;
+  if (!idDocumentPath) {
+    return res.status(400).json({ success: false, message: 'Identity document scan upload is required' });
   }
 
   // Obtain user ID from authenticated request context
@@ -676,15 +733,15 @@ export const bookRoom = async (req, res) => {
       // Update their profile details
       await connection.query(
         `UPDATE guests 
-         SET full_name = ?, phone = ?, email = ?, gender = ?, age = ?, id_type = ?, government_id = ?
+         SET full_name = ?, phone = ?, email = ?, gender = ?, age = ?, id_type = ?, government_id = ?, id_document_path = ?, id_upload_timestamp = NOW(), id_verification_status = 'Pending', id_ocr_text = ?
          WHERE id = ?`,
-        [guestNameUpper, phone || '', email || '', gender || '', age ? parseInt(age, 10) : null, idType || '', governmentId || '', guestId]
+        [guestNameUpper, phone || '', email || '', gender || '', age ? parseInt(age, 10) : null, idType || '', governmentId || '', idDocumentPath, idOcrText || '', guestId]
       );
     } else {
       const [newGuestRes] = await connection.query(
-        `INSERT INTO guests (full_name, phone, email, gender, age, id_type, government_id, user_id, loyalty_tier, loyalty_points) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Bronze', 0)`,
-        [guestNameUpper, phone || '', email || '', gender || '', age ? parseInt(age, 10) : null, idType || '', governmentId || '', parsedUserId]
+        `INSERT INTO guests (full_name, phone, email, gender, age, id_type, government_id, id_document_path, id_upload_timestamp, id_verification_status, id_ocr_text, user_id, loyalty_tier, loyalty_points) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), 'Pending', ?, ?, 'Bronze', 0)`,
+        [guestNameUpper, phone || '', email || '', gender || '', age ? parseInt(age, 10) : null, idType || '', governmentId || '', idDocumentPath, idOcrText || '', parsedUserId]
       );
       guestId = newGuestRes.insertId;
     }
@@ -986,3 +1043,607 @@ export const modifyCheckIn = async (req, res) => {
   }
 };
 
+// ─────────────────────────────────────────────────────────────
+// GUEST PORTAL PHASE 2 — Guest-Facing Controllers
+// ─────────────────────────────────────────────────────────────
+
+/** Guest self check-in — auto-approves if today >= booking check_in_date */
+export const guestRequestCheckIn = async (req, res) => {
+  const resolvedUserId = req.user?.id;
+  if (!resolvedUserId) return res.status(401).json({ error: 'Unauthorized' });
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    // Find the guest profile for this user
+    const [guestRows] = await connection.query('SELECT id FROM guests WHERE user_id = ?', [resolvedUserId]);
+    if (guestRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Guest profile not found' });
+    }
+    const guestId = guestRows[0].id;
+
+    // Find their Reserved booking
+    const [bookingRows] = await connection.query(
+      `SELECT b.*, r.number as room_number, r.id as room_id_val
+       FROM bookings b
+       JOIN rooms r ON b.room_id = r.id
+       WHERE b.guest_id = ? AND b.booking_status = 'Reserved'
+       ORDER BY b.id DESC LIMIT 1`,
+      [guestId]
+    );
+    if (bookingRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'No upcoming reservation found' });
+    }
+    const booking = bookingRows[0];
+
+    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
+    const businessDate = settings[0]?.value_val || new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
+
+    // Update booking to Checked In
+    await connection.query(
+      "UPDATE bookings SET booking_status = 'Checked In' WHERE id = ?",
+      [booking.id]
+    );
+    // Update room to occupied
+    await connection.query(
+      "UPDATE rooms SET status = 'occupied' WHERE id = ?",
+      [booking.room_id_val]
+    );
+    // Log status history
+    await connection.query(
+      `INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date)
+       VALUES (?, 'booked', 'occupied', ?, ?)`,
+      [booking.room_id_val, resolvedUserId, businessDate]
+    );
+    // Create welcome notification for guest
+    await connection.query(
+      `INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)`,
+      [resolvedUserId, '🏨 Welcome to Hotel Sky-5!', `You have successfully checked in to Room ${booking.room_number}. Enjoy your stay! If you need anything, use your Guest Dashboard.`]
+    );
+    await connection.query(
+      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'GUEST_CHECKIN', ?, ?)`,
+      [resolvedUserId, `Guest self check-in for Room ${booking.room_number}, Booking ID: ${booking.id}`, businessDate]
+    );
+
+    await connection.commit();
+    res.json({ message: `Successfully checked in to Room ${booking.room_number}`, roomNumber: booking.room_number });
+  } catch (error) {
+    if (connection) { try { await connection.rollback(); } catch (e) {} }
+    console.error('guestRequestCheckIn error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+/** Guest adds a service request (room service / housekeeping) — creates ledger item + admin notification */
+export const guestAddService = async (req, res) => {
+  const resolvedUserId = req.user?.id;
+  if (!resolvedUserId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { serviceDesc, amount, qty = 1 } = req.body;
+  if (!serviceDesc || !amount) return res.status(400).json({ error: 'serviceDesc and amount are required' });
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    // Get guest's active booking
+    const [guestRows] = await connection.query('SELECT id FROM guests WHERE user_id = ?', [resolvedUserId]);
+    if (guestRows.length === 0) { await connection.rollback(); return res.status(404).json({ error: 'Guest profile not found' }); }
+    const guestId = guestRows[0].id;
+
+    const [bookingRows] = await connection.query(
+      `SELECT b.*, r.number as room_number FROM bookings b
+       JOIN rooms r ON b.room_id = r.id
+       WHERE b.guest_id = ? AND b.booking_status = 'Checked In'
+       ORDER BY b.id DESC LIMIT 1`,
+      [guestId]
+    );
+    if (bookingRows.length === 0) { await connection.rollback(); return res.status(404).json({ error: 'No active stay found' }); }
+    const booking = bookingRows[0];
+
+    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
+    const businessDate = settings[0]?.value_val || new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
+
+    const parsedAmt = parseInt(amount, 10);
+    const parsedQty = parseInt(qty, 10);
+
+    // Insert ledger item
+    await connection.query(
+      'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, ?, ?, ?, ?)',
+      [booking.room_number, serviceDesc, parsedQty, parsedAmt * parsedQty, businessDate, booking.id]
+    );
+    // Notify guest
+    await connection.query(
+      'INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)',
+      [resolvedUserId, '✅ Service Requested', `Your request for "${serviceDesc}" has been received and will be delivered shortly.`]
+    );
+
+    await connection.commit();
+    res.json({ message: 'Service request submitted successfully' });
+  } catch (error) {
+    if (connection) { try { await connection.rollback(); } catch (e) {} }
+    console.error('guestAddService error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+/** Guest reports a maintenance issue */
+export const guestReportMaintenance = async (req, res) => {
+  const resolvedUserId = req.user?.id;
+  if (!resolvedUserId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { issue } = req.body;
+  if (!issue || issue.trim() === '') return res.status(400).json({ error: 'Issue description is required' });
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [guestRows] = await connection.query('SELECT id FROM guests WHERE user_id = ?', [resolvedUserId]);
+    if (guestRows.length === 0) { await connection.rollback(); return res.status(404).json({ error: 'Guest profile not found' }); }
+    const guestId = guestRows[0].id;
+
+    const [bookingRows] = await connection.query(
+      `SELECT b.*, r.id as room_id_val, r.number as room_number FROM bookings b
+       JOIN rooms r ON b.room_id = r.id
+       WHERE b.guest_id = ? AND b.booking_status = 'Checked In'
+       ORDER BY b.id DESC LIMIT 1`,
+      [guestId]
+    );
+    if (bookingRows.length === 0) { await connection.rollback(); return res.status(404).json({ error: 'No active stay found' }); }
+    const booking = bookingRows[0];
+
+    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
+    const businessDate = settings[0]?.value_val || new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
+
+    await connection.query(
+      `INSERT INTO maintenance (room_id, reported_by, issue, status, business_date) VALUES (?, ?, ?, 'Pending', ?)`,
+      [booking.room_id_val, resolvedUserId, issue.trim(), businessDate]
+    );
+    await connection.query(
+      'INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)',
+      [resolvedUserId, '🔧 Maintenance Report Received', `Your maintenance report for Room ${booking.room_number} has been logged. Our team will attend to it shortly.`]
+    );
+
+    await connection.commit();
+    res.json({ message: 'Maintenance request submitted successfully' });
+  } catch (error) {
+    if (connection) { try { await connection.rollback(); } catch (e) {} }
+    console.error('guestReportMaintenance error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+/** Guest extends their checkout date */
+export const guestExtendStay = async (req, res) => {
+  const resolvedUserId = req.user?.id;
+  if (!resolvedUserId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { newCheckOutDate } = req.body;
+  if (!newCheckOutDate) return res.status(400).json({ error: 'newCheckOutDate is required' });
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [guestRows] = await connection.query('SELECT id FROM guests WHERE user_id = ?', [resolvedUserId]);
+    if (guestRows.length === 0) { await connection.rollback(); return res.status(404).json({ error: 'Guest profile not found' }); }
+    const guestId = guestRows[0].id;
+
+    const [bookingRows] = await connection.query(
+      `SELECT b.*, r.number as room_number FROM bookings b
+       JOIN rooms r ON b.room_id = r.id
+       WHERE b.guest_id = ? AND b.booking_status = 'Checked In'
+       ORDER BY b.id DESC LIMIT 1`,
+      [guestId]
+    );
+    if (bookingRows.length === 0) { await connection.rollback(); return res.status(404).json({ error: 'No active stay found' }); }
+    const booking = bookingRows[0];
+
+    // Validate new date is after existing check-out
+    const existingOut = new Date(booking.expected_check_out_date);
+    const newOut = new Date(newCheckOutDate);
+    if (newOut <= existingOut) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'New checkout date must be after the current checkout date' });
+    }
+
+    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
+    const businessDate = settings[0]?.value_val || new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
+
+    await connection.query(
+      'UPDATE bookings SET expected_check_out_date = ? WHERE id = ?',
+      [newCheckOutDate, booking.id]
+    );
+    await connection.query(
+      'INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)',
+      [resolvedUserId, '📅 Stay Extended!', `Your checkout has been extended to ${new Date(newCheckOutDate).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}. Enjoy your extended stay at Hotel Sky-5!`]
+    );
+    await connection.query(
+      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'EXTEND_STAY', ?, ?)`,
+      [resolvedUserId, `Guest extended stay for Room ${booking.room_number} to ${newCheckOutDate}, Booking ID: ${booking.id}`, businessDate]
+    );
+
+    await connection.commit();
+    res.json({ message: `Stay extended to ${newCheckOutDate}` });
+  } catch (error) {
+    if (connection) { try { await connection.rollback(); } catch (e) {} }
+    console.error('guestExtendStay error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+/** Get the live bill/folio for the guest's active booking */
+export const getGuestBill = async (req, res) => {
+  const resolvedUserId = req.user?.id;
+  if (!resolvedUserId) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const [guestRows] = await pool.query('SELECT id FROM guests WHERE user_id = ?', [resolvedUserId]);
+    if (guestRows.length === 0) return res.status(404).json({ error: 'Guest profile not found' });
+    const guestId = guestRows[0].id;
+
+    const [bookingRows] = await pool.query(
+      `SELECT b.*, r.number as room_number, rt.title as room_type_title, rt.base_rate
+       FROM bookings b
+       JOIN rooms r ON b.room_id = r.id
+       JOIN room_types rt ON r.room_type_id = rt.id
+       WHERE b.guest_id = ? AND b.booking_status IN ('Checked In', 'Reserved')
+       ORDER BY b.id DESC LIMIT 1`,
+      [guestId]
+    );
+    if (bookingRows.length === 0) return res.json({ booking: null, ledger: [] });
+    const booking = bookingRows[0];
+
+    const [ledger] = await pool.query(
+      'SELECT * FROM ledger_items WHERE booking_id = ? ORDER BY id ASC',
+      [booking.id]
+    );
+
+    res.json({ booking, ledger });
+  } catch (error) {
+    console.error('getGuestBill error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+/** Get notifications for the logged-in guest */
+export const getGuestNotifications = async (req, res) => {
+  const resolvedUserId = req.user?.id;
+  if (!resolvedUserId) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const [rows] = await pool.query(
+      'SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50',
+      [resolvedUserId]
+    );
+    res.json({ notifications: rows });
+  } catch (error) {
+    console.error('getGuestNotifications error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+/** Mark a notification as read */
+export const markNotificationRead = async (req, res) => {
+  const resolvedUserId = req.user?.id;
+  if (!resolvedUserId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { id } = req.params;
+  try {
+    await pool.query('UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?', [id, resolvedUserId]);
+    res.json({ message: 'Notification marked as read' });
+  } catch (error) {
+    console.error('markNotificationRead error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+/** Guest requests checkout — sends admin notification */
+export const guestRequestCheckout = async (req, res) => {
+  const resolvedUserId = req.user?.id;
+  if (!resolvedUserId) return res.status(401).json({ error: 'Unauthorized' });
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [guestRows] = await connection.query('SELECT id, full_name FROM guests WHERE user_id = ?', [resolvedUserId]);
+    if (guestRows.length === 0) { await connection.rollback(); return res.status(404).json({ error: 'Guest profile not found' }); }
+    const guest = guestRows[0];
+
+    const [bookingRows] = await connection.query(
+      `SELECT b.*, r.number as room_number FROM bookings b
+       JOIN rooms r ON b.room_id = r.id
+       WHERE b.guest_id = ? AND b.booking_status = 'Checked In'
+       ORDER BY b.id DESC LIMIT 1`,
+      [guest.id]
+    );
+    if (bookingRows.length === 0) { await connection.rollback(); return res.status(404).json({ error: 'No active stay found' }); }
+    const booking = bookingRows[0];
+
+    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
+    const businessDate = settings[0]?.value_val || new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
+
+    // Notify the guest
+    await connection.query(
+      'INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)',
+      [resolvedUserId, '📋 Checkout Requested', `Your checkout request for Room ${booking.room_number} has been received. Please visit the reception desk to complete bill settlement.`]
+    );
+    await connection.query(
+      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'GUEST_CHECKOUT_REQUEST', ?, ?)`,
+      [resolvedUserId, `Guest ${guest.full_name} requested checkout from Room ${booking.room_number}, Booking ID: ${booking.id}`, businessDate]
+    );
+
+    await connection.commit();
+    res.json({ message: 'Checkout request submitted. Please proceed to the reception desk.', roomNumber: booking.room_number });
+  } catch (error) {
+    if (connection) { try { await connection.rollback(); } catch (e) {} }
+    console.error('guestRequestCheckout error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+// ─── POST-CHECKOUT: Submit Feedback & Rating ────────────────────────────────
+/** Guest submits a post-stay review */
+export const guestSubmitFeedback = async (req, res) => {
+  const resolvedUserId = req.user?.id;
+  if (!resolvedUserId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { bookingId, overallRating, roomCleanliness, serviceQuality, valueForMoney, comments, wouldRecommend } = req.body;
+
+  if (!bookingId || !overallRating) {
+    return res.status(400).json({ error: 'bookingId and overallRating are required' });
+  }
+  const rating = parseInt(overallRating, 10);
+  if (isNaN(rating) || rating < 1 || rating > 5) {
+    return res.status(400).json({ error: 'overallRating must be between 1 and 5' });
+  }
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    // Verify this booking belongs to this guest and is checked out
+    const [guestRows] = await connection.query('SELECT id FROM guests WHERE user_id = ?', [resolvedUserId]);
+    if (guestRows.length === 0) { await connection.rollback(); return res.status(404).json({ error: 'Guest profile not found' }); }
+    const guestId = guestRows[0].id;
+
+    const [bookingRows] = await connection.query(
+      `SELECT b.id, b.booking_status, r.number as room_number 
+       FROM bookings b JOIN rooms r ON b.room_id = r.id
+       WHERE b.id = ? AND b.guest_id = ?`,
+      [bookingId, guestId]
+    );
+    if (bookingRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Booking not found or does not belong to you' });
+    }
+    if (bookingRows[0].booking_status !== 'Checked Out') {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Feedback can only be submitted after checkout' });
+    }
+
+    // Check for duplicate feedback
+    const [existingFeedback] = await connection.query('SELECT id FROM feedback WHERE booking_id = ?', [bookingId]);
+    if (existingFeedback.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'Feedback already submitted for this booking' });
+    }
+
+    // Insert feedback
+    await connection.query(
+      `INSERT INTO feedback (booking_id, guest_id, overall_rating, room_cleanliness, service_quality, value_for_money, comments, would_recommend)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [bookingId, guestId, rating,
+       roomCleanliness ? parseInt(roomCleanliness, 10) : null,
+       serviceQuality ? parseInt(serviceQuality, 10) : null,
+       valueForMoney ? parseInt(valueForMoney, 10) : null,
+       comments || null,
+       wouldRecommend === false || wouldRecommend === 0 ? 0 : 1]
+    );
+
+    // Award 50 loyalty points for leaving a review
+    await connection.query(
+      `UPDATE guests SET loyalty_points = loyalty_points + 50 WHERE id = ?`,
+      [guestId]
+    );
+
+    // Notify guest of points earned
+    await connection.query(
+      `INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)`,
+      [resolvedUserId, '⭐ Thank You for Your Review!', 'You earned 50 loyalty points for sharing your feedback. We look forward to welcoming you again!']
+    );
+
+    // Audit log
+    const [settings] = await connection.query("SELECT value_val FROM system_settings WHERE key_name = 'system_date'");
+    const businessDate = settings[0]?.value_val || new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
+    await connection.query(
+      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'GUEST_FEEDBACK', ?, ?)`,
+      [resolvedUserId, `Guest submitted ${rating}-star review for Booking ID: ${bookingId}`, businessDate]
+    );
+
+    await connection.commit();
+    res.json({ message: 'Thank you for your feedback! You earned 50 loyalty points.', pointsEarned: 50 });
+  } catch (error) {
+    if (connection) { try { await connection.rollback(); } catch (e) {} }
+    console.error('guestSubmitFeedback error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+// ─── GET: Guest's own booking history ──────────────────────────────────────
+/** Returns all bookings for the authenticated guest with payment and feedback status */
+export const getGuestHistory = async (req, res) => {
+  const resolvedUserId = req.user?.id;
+  if (!resolvedUserId) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const [guestRows] = await pool.query('SELECT id, full_name, phone, email, loyalty_tier, loyalty_points FROM guests WHERE user_id = ?', [resolvedUserId]);
+    if (guestRows.length === 0) return res.status(404).json({ error: 'Guest profile not found' });
+    const guest = guestRows[0];
+
+    const [bookings] = await pool.query(`
+      SELECT 
+        b.id,
+        b.booking_number,
+        b.check_in_date,
+        b.check_out_date,
+        b.expected_check_out_date,
+        b.adults,
+        b.booking_status,
+        b.payment_status,
+        b.total_amount,
+        b.advance_amount,
+        b.created_at,
+        r.number as room_number,
+        rt.code as room_type,
+        rt.title as room_title,
+        f.id as feedback_id,
+        f.overall_rating,
+        f.comments as feedback_comments,
+        f.created_at as feedback_date,
+        COALESCE(
+          (SELECT SUM(p.amount) FROM payments p WHERE p.booking_id = b.id), 0
+        ) as total_paid
+      FROM bookings b
+      JOIN rooms r ON b.room_id = r.id
+      JOIN room_types rt ON r.room_type_id = rt.id
+      LEFT JOIN feedback f ON f.booking_id = b.id
+      WHERE b.guest_id = ?
+      ORDER BY b.created_at DESC
+    `, [guest.id]);
+
+    res.json({ guest, bookings, totalStays: bookings.length });
+  } catch (error) {
+    console.error('getGuestHistory error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+// ─── GET (Admin): View a specific guest's full history ──────────────────────
+export const getGuestHistoryAdmin = async (req, res) => {
+  const { guestId } = req.params;
+  try {
+    const [guestRows] = await pool.query(
+      'SELECT id, full_name, phone, email, loyalty_tier, loyalty_points, created_at FROM guests WHERE id = ?',
+      [guestId]
+    );
+    if (guestRows.length === 0) return res.status(404).json({ error: 'Guest not found' });
+    const guest = guestRows[0];
+
+    const [bookings] = await pool.query(`
+      SELECT 
+        b.id, b.booking_number, b.check_in_date, b.check_out_date,
+        b.booking_status, b.payment_status, b.total_amount, b.advance_amount,
+        r.number as room_number, rt.code as room_type,
+        f.overall_rating, f.comments as feedback_comments,
+        COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.booking_id = b.id), 0) as total_paid
+      FROM bookings b
+      JOIN rooms r ON b.room_id = r.id
+      JOIN room_types rt ON r.room_type_id = rt.id
+      LEFT JOIN feedback f ON f.booking_id = b.id
+      WHERE b.guest_id = ?
+      ORDER BY b.created_at DESC
+    `, [guest.id]);
+
+    const [payments] = await pool.query(`
+      SELECT p.*, b.booking_number
+      FROM payments p
+      JOIN bookings b ON p.booking_id = b.id
+      WHERE b.guest_id = ?
+      ORDER BY p.created_at DESC
+    `, [guest.id]);
+
+    res.json({ guest, bookings, payments });
+  } catch (error) {
+    console.error('getGuestHistoryAdmin error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+export const uploadIdentity = async (req, res) => {
+  console.log('--- UPLOAD IDENTITY START ---');
+  console.log('Request body:', req.body);
+  console.log('Request file:', req.file);
+
+  if (!req.file) {
+    console.log('FAILED: No req.file');
+    return res.status(400).json({ success: false, message: 'Upload Failed', errors: { document: 'No file uploaded or invalid file format.' } });
+  }
+
+  const { idType, documentNumber } = req.body;
+  if (!idType) {
+    console.log('FAILED: No idType provided');
+    try { fs.unlinkSync(req.file.path); } catch(e) {}
+    return res.status(400).json({ success: false, message: 'Upload Failed', errors: { document: 'ID Type is required for verification.' } });
+  }
+
+  try {
+    // 1. Extract Text
+    console.log('Starting OCR extraction for file:', req.file.path);
+    const ocrData = await extractOCRData(req.file.path, req.file.mimetype);
+    console.log('OCR Extraction Result (first 100 chars):', ocrData.preprocessedText ? ocrData.preprocessedText.substring(0, 100).replace(/\n/g, ' ') : 'NULL');
+
+    // 2. Verify Document Type Match
+    console.log(`Starting Document Verification. ID Type: ${idType}, Document Number: ${documentNumber}`);
+    const verificationResult = verifyDocumentData(ocrData, idType, documentNumber);
+    console.log('Document Match Result:', verificationResult);
+    
+    if (!verificationResult.success) {
+      console.log('FAILED: Document verification failed. isMatch=false');
+      try { fs.unlinkSync(req.file.path); } catch(e) {} // Clean up mismatched file
+    } else {
+      console.log('SUCCESS: Document verified successfully');
+    }
+
+    const report = {
+      success: verificationResult.success,
+      message: verificationResult.message,
+      data: verificationResult.success ? {
+        filePath: req.file.filename,
+        ocrText: ocrData.preprocessedText.substring(0, 1000) // Keep reasonable length
+      } : undefined,
+      errors: !verificationResult.success ? { document: verificationResult.message } : undefined,
+      verificationReport: {
+        reasonFailed: verificationResult.success ? null : verificationResult.reason,
+        ocrRawText: ocrData.rawText.substring(0, 500),
+        ocrPreprocessedText: ocrData.preprocessedText.substring(0, 500),
+        confidenceScore: ocrData.confidence,
+        matchingScore: verificationResult.score,
+        decision: verificationResult.success ? 'ACCEPTED' : 'REJECTED'
+      }
+    };
+
+    if (verificationResult.success) {
+      res.json(report);
+    } else {
+      res.status(400).json(report);
+    }
+  } catch (error) {
+    console.error('OCR Process Error:', error);
+    try { if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); } catch(e) {}
+    res.status(500).json({ success: false, message: 'Internal Server Error during document verification.' });
+  }
+};

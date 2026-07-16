@@ -134,8 +134,8 @@ export const signIn = async (req, res) => {
        FROM users u
        LEFT JOIN roles r ON u.role_id = r.id 
        LEFT JOIN guests g ON g.user_id = u.id
-       WHERE u.username = ? AND u.password = ?`,
-      [cleanUsername, passwordHash]
+       WHERE (u.username = ? OR u.phone = ? OR g.email = ?) AND u.password = ?`,
+      [cleanUsername, cleanUsername, cleanUsername, passwordHash]
     );
 
     if (users.length === 0) {
@@ -192,6 +192,13 @@ export const authenticate = async (req, res, next) => {
 export const requireAdmin = (req, res, next) => {
   if (!req.user || req.user.role !== 'admin') {
     return res.status(403).json({ error: 'Forbidden: Admin access required' });
+  }
+  next();
+};
+
+export const requireGuest = (req, res, next) => {
+  if (!req.user || req.user.role !== 'guest') {
+    return res.status(403).json({ error: 'Forbidden: Guest access required' });
   }
   next();
 };

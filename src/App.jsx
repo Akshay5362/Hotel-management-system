@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import Toolbar from './components/Toolbar';
 import RoomGrid from './components/RoomGrid';
 import MetricsBar from './components/MetricsBar';
@@ -11,6 +11,11 @@ import AuthCard from './components/AuthCard';
 import GuestDashboard from './components/GuestDashboard';
 import ModifyCheckInModal from './components/ModifyCheckInModal';
 import UpcomingReservationsModal from './components/UpcomingReservationsModal';
+import GuestRequestsModal from './components/GuestRequestsModal';
+import IdentityVerificationModal from './components/IdentityVerificationModal';
+import { AdminAuthProvider, AdminAuthContext } from './contexts/AdminAuthContext';
+import { GuestAuthProvider, GuestAuthContext } from './contexts/GuestAuthContext';
+import { AdminProtectedRoute, GuestProtectedRoute } from './components/ProtectedRoutes';
 
 // Starting initial room configuration directly mimicking the screenshot layout
 const INITIAL_ROOMS = [
@@ -144,7 +149,7 @@ function LandingPage({ onNavigate }) {
   );
 }
 
-export default function App() {
+function AppContent() {
   const [rooms, setRooms] = useState([]);
   const [filter, setFilter] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -166,14 +171,10 @@ export default function App() {
   const [isBackendOnline, setIsBackendOnline] = useState(false);
   const [upcomingReservations, setUpcomingReservations] = useState([]);
 
-  // Route & Session State
-  const [user, setUser] = useState(() => {
-    const saved = localStorage.getItem('user');
-    return saved ? JSON.parse(saved) : null;
-  });
-  const [token, setToken] = useState(() => {
-    return localStorage.getItem('token') || '';
-  });
+  // Contexts
+  const { guestUser, guestToken, login: guestLogin, logout: guestLogout, updateUser: updateGuestUser } = React.useContext(GuestAuthContext);
+  const { adminUser, adminToken, login: adminLogin, logout: adminLogout, updateUser: updateAdminUser } = React.useContext(AdminAuthContext);
+
   const [currentPath, setCurrentPath] = useState(window.location.pathname);
 
   // Custom Navigation Router
@@ -190,45 +191,15 @@ export default function App() {
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
-  // Auth-based route protection
+  // Auth-based route protection for login pages
   useEffect(() => {
     const path = currentPath;
-    if (path === '/dashboard') {
-      if (!user) {
-        navigate('/login');
-      } else if (user.role !== 'guest') {
-        navigate('/admin/dashboard');
-      }
-    } else if (path === '/admin/dashboard') {
-      if (!user) {
-        navigate('/admin/login');
-      }
-    } else if (path === '/login' || path === '/signup') {
-      if (user) {
-        if (user.role === 'guest') {
-          navigate('/dashboard');
-        } else {
-          // Log out admin user because they are accessing guest portal
-          localStorage.removeItem('user');
-          localStorage.removeItem('token');
-          setUser(null);
-          setToken('');
-        }
-      }
-    } else if (path === '/admin/login') {
-      if (user) {
-        if (user.role === 'admin') {
-          navigate('/admin/dashboard');
-        } else {
-          // Log out guest user because they are accessing admin portal
-          localStorage.removeItem('user');
-          localStorage.removeItem('token');
-          setUser(null);
-          setToken('');
-        }
-      }
+    if ((path === '/login' || path === '/signup') && guestUser) {
+      navigate('/dashboard');
+    } else if (path === '/admin/login' && adminUser) {
+      navigate('/admin/dashboard');
     }
-  }, [currentPath, user]);
+  }, [currentPath, guestUser, adminUser]);
 
   // Custom Popup Notification/Confirmation/Prompt System state
   const [popup, setPopup] = useState(null);
@@ -291,7 +262,7 @@ export default function App() {
 
   // Load status from backend
   const fetchStatus = async () => {
-    const currentToken = localStorage.getItem('token') || token;
+    const currentToken = adminToken || guestToken;
     if (!currentToken) {
       setIsLoading(false);
       return;
@@ -343,13 +314,38 @@ export default function App() {
     }
   };
 
+  // Fetch guest requests count for badge
+  const [requestCount, setRequestCount] = useState(0);
+  const fetchRequestCount = useCallback(async () => {
+    const currentToken = adminToken;
+    if (!currentToken) return;
+    try {
+      const res = await fetch('http://localhost:5000/api/admin/guest-requests', {
+        headers: { Authorization: `Bearer ${currentToken}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setRequestCount(data.total || 0);
+      }
+    } catch (e) { /* silent */ }
+  }, [adminToken]);
+
+  // Auto-refresh request count every 15 seconds for admins (near real-time)
   useEffect(() => {
-    if (token) {
+    if (!adminUser || adminUser.role !== 'admin' || !adminToken) return;
+    fetchRequestCount();
+    const interval = setInterval(fetchRequestCount, 15000);
+    return () => clearInterval(interval);
+  }, [adminUser, adminToken, fetchRequestCount]);
+
+
+  useEffect(() => {
+    if (adminToken || guestToken) {
       fetchStatus();
     } else {
       setIsLoading(false);
     }
-  }, [token]);
+  }, [adminToken, guestToken]);
 
   // Clock runner
   useEffect(() => {
@@ -371,28 +367,57 @@ export default function App() {
 
   // Room card click logic
   const handleRoomClick = async (room) => {
-    setSelectedRoom(room);
-    if (room.status === 'vacant') {
+    // Force refresh status first to ensure we have the absolute latest ledger details/requests
+    let freshRoom = room;
+    try {
+      const currentToken = adminToken;
+      if (currentToken) {
+        const res = await fetch('http://localhost:5000/api/status', {
+          headers: { 'Authorization': `Bearer ${currentToken}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setRooms(data.rooms);
+          setSystemDate(data.systemDate);
+          setTodayCheckins(data.todayCheckins);
+          setTodayCheckouts(data.todayCheckouts);
+          setContinuedRooms(data.continuedRooms);
+          setCashLog(data.cashLog);
+          setUpcomingReservations(data.upcomingReservations || []);
+          setIsBackendOnline(true);
+          
+          const updated = data.rooms.find(r => r.number === room.number);
+          if (updated) {
+            freshRoom = updated;
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Error auto-refreshing room details on card click:', e);
+    }
+
+    setSelectedRoom(freshRoom);
+    if (freshRoom.status === 'vacant') {
       setActiveModal('checkin');
-    } else if (room.status === 'occupied') {
+    } else if (freshRoom.status === 'occupied') {
       setActiveModal('checkout');
-    } else if (room.status === 'booked') {
+    } else if (freshRoom.status === 'booked') {
       const confirmed = await showConfirm(
-        `Guest ${room.guestName} has booked Room ${room.number} with a ₹${room.deposit} deposit. Check in this guest now?`,
+        `Guest ${freshRoom.guestName} has booked Room ${freshRoom.number} with a ₹${freshRoom.deposit} deposit. Check in this guest now?`,
         'Guest Arrival',
         'Yes',
         'No'
       );
       if (confirmed) {
-        checkInBookedGuest(room.number);
+        checkInBookedGuest(freshRoom.number);
       }
-    } else if (room.status === 'dirty') {
-      const confirmed = await showConfirm(`Mark Room ${room.number} as CLEAN and make it vacant?`, 'Clean Room Service');
+    } else if (freshRoom.status === 'dirty') {
+      const confirmed = await showConfirm(`Mark Room ${freshRoom.number} as CLEAN and make it vacant?`, 'Clean Room Service');
       if (confirmed) {
-        cleanRoom(room.number);
+        cleanRoom(freshRoom.number);
       }
     } else {
-      showAlert(`Room ${room.number} is inactive and cannot be operated.`, 'Room Status');
+      showAlert(`Room ${freshRoom.number} is inactive and cannot be operated.`, 'Room Status');
     }
   };
 
@@ -413,7 +438,31 @@ export default function App() {
         // Prompt for room number
         const outNo = await showPrompt('Enter Occupied Room Number for checkout folio:', 'e.g. 102', 'Folio Checkout Lookup');
         if (outNo) {
-          const roomToOut = rooms.find(r => r.number === outNo && r.status === 'occupied');
+          let freshRooms = rooms;
+          try {
+            const currentToken = adminToken;
+            if (currentToken) {
+              const res = await fetch('http://localhost:5000/api/status', {
+                headers: { 'Authorization': `Bearer ${currentToken}` }
+              });
+              if (res.ok) {
+                const data = await res.json();
+                setRooms(data.rooms);
+                setSystemDate(data.systemDate);
+                setTodayCheckins(data.todayCheckins);
+                setTodayCheckouts(data.todayCheckouts);
+                setContinuedRooms(data.continuedRooms);
+                setCashLog(data.cashLog);
+                setUpcomingReservations(data.upcomingReservations || []);
+                setIsBackendOnline(true);
+                freshRooms = data.rooms;
+              }
+            }
+          } catch (e) {
+            console.error('Error auto-refreshing rooms for checkout action:', e);
+          }
+
+          const roomToOut = freshRooms.find(r => r.number === outNo && r.status === 'occupied');
           if (roomToOut) {
             setSelectedRoom(roomToOut);
             setActiveModal('checkout');
@@ -433,6 +482,7 @@ export default function App() {
             showAlert('Room not found or is not currently occupied.', 'Shifting Lookup Error');
           }
         }
+
         break;
       case 'cash':
         setActiveModal('cash');
@@ -443,10 +493,17 @@ export default function App() {
       case 'reports':
         setActiveModal('reports');
         break;
+      case 'id_verify':
+        setActiveModal('id_verify');
+        break;
+      case 'requests':
+        setActiveModal('requests');
+        break;
       case 'refresh':
         setFilter('all');
         setSearchQuery('');
         await fetchStatus();
+        await fetchRequestCount();
         showAlert('Dashboard re-synced successfully with Front Office logs.', 'Sync Status');
         break;
       case 'exit':
@@ -478,7 +535,7 @@ export default function App() {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${adminToken}`
         },
         body: JSON.stringify(formattedData)
       });
@@ -509,7 +566,7 @@ export default function App() {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${adminToken}`
         },
         body: JSON.stringify({
           guestName: room.guestName,
@@ -542,7 +599,7 @@ export default function App() {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${adminToken}`
         },
         body: JSON.stringify({ balancePaid })
       });
@@ -576,7 +633,7 @@ export default function App() {
         method: 'PUT',
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${adminToken}`
         },
         body: JSON.stringify(formattedData)
       });
@@ -625,7 +682,7 @@ export default function App() {
       const res = await fetch(`http://localhost:5000/api/rooms/${roomNumber}/clean`, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${adminToken}`
         }
       });
 
@@ -650,7 +707,7 @@ export default function App() {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${adminToken}`
         },
         body: JSON.stringify({ fromRoomNumber, toRoomNumber })
       });
@@ -678,7 +735,7 @@ export default function App() {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${adminToken}`
         },
         body: JSON.stringify({ desc, amount })
       });
@@ -716,7 +773,7 @@ export default function App() {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${adminToken}`
         },
         body: JSON.stringify({ nextDate: auditReport.nextDate })
       });
@@ -797,23 +854,27 @@ export default function App() {
   }
 
   const handleAuthSuccess = (userData, userToken) => {
-    localStorage.setItem('user', JSON.stringify(userData));
-    localStorage.setItem('token', userToken);
-    setUser(userData);
-    setToken(userToken);
+    if (userData.role === 'admin') {
+      adminLogin(userData, userToken);
+      navigate('/admin/dashboard');
+    } else {
+      guestLogin(userData, userToken);
+      navigate('/dashboard');
+    }
   };
 
-  const handleUserUpdate = (updatedUserData) => {
-    localStorage.setItem('user', JSON.stringify(updatedUserData));
-    setUser(updatedUserData);
+  const handleGuestUpdate = (updatedUserData) => {
+    updateGuestUser(updatedUserData);
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem('user');
-    localStorage.removeItem('token');
-    setUser(null);
-    setToken('');
-    navigate('/');
+  const handleGuestLogout = () => {
+    guestLogout();
+    navigate('/login');
+  };
+
+  const handleAdminLogout = () => {
+    adminLogout();
+    navigate('/admin/login');
   };
 
   let pageContent = null;
@@ -850,29 +911,23 @@ export default function App() {
       />
     );
   } else if (currentPath === '/dashboard') {
-    if (user && user.role === 'guest') {
-      pageContent = (
+    pageContent = (
+      <GuestProtectedRoute navigate={navigate}>
         <GuestDashboard 
-          user={user} 
-          token={token}
+          user={guestUser} 
+          token={guestToken}
           rooms={rooms} 
           systemDate={systemDate} 
-          onLogout={handleLogout} 
+          onLogout={handleGuestLogout} 
           showAlert={showAlert} 
           fetchStatus={fetchStatus} 
-          onUserUpdate={handleUserUpdate}
+          onUserUpdate={handleGuestUpdate}
         />
-      );
-    } else {
-      pageContent = (
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: '#080b10', color: '#fff' }}>
-          <h3>Redirecting to guest portal...</h3>
-        </div>
-      );
-    }
+      </GuestProtectedRoute>
+    );
   } else if (currentPath === '/admin/dashboard') {
-    if (user && user.role === 'admin') {
-      pageContent = (
+    pageContent = (
+      <AdminProtectedRoute navigate={navigate}>
         <div className="app-container">
           {/* Header Panel */}
           <header className="header">
@@ -893,9 +948,9 @@ export default function App() {
               <div className="user-badge" data-tooltip={isBackendOnline ? "System Sync Active (MySQL Connected)" : "Demo Mode (MySQL Disconnected)"}>
                 <span className="user-indicator" style={{ background: isBackendOnline ? 'var(--color-booked)' : 'var(--color-occupied)', boxShadow: isBackendOnline ? '0 0 8px var(--color-booked)' : '0 0 8px var(--color-occupied)' }}></span>
                 <span style={{ fontSize: '0.8rem', fontWeight: '600' }}>
-                  USER: {user.fullName.toUpperCase()}
+                  USER: {adminUser?.fullName?.toUpperCase()}
                 </span>
-                <button onClick={handleLogout} style={{ background: 'transparent', border: 'none', color: '#ff4d4d', marginLeft: '10px', cursor: 'pointer', fontSize: '0.75rem', fontWeight: '700' }}>
+                <button onClick={handleAdminLogout} style={{ background: 'transparent', border: 'none', color: '#ff4d4d', marginLeft: '10px', cursor: 'pointer', fontSize: '0.75rem', fontWeight: '700' }}>
                   Logout
                 </button>
               </div>
@@ -910,6 +965,7 @@ export default function App() {
             roomCounts={roomCounts}
             searchQuery={searchQuery}
             setSearchQuery={setSearchQuery}
+            requestCount={requestCount}
           />
 
           {/* Main Workspace Scrollable Body */}
@@ -963,6 +1019,13 @@ export default function App() {
             onSelectReservation={handleUpcomingReservationClick}
           />
 
+          <GuestRequestsModal
+            isOpen={activeModal === 'requests'}
+            onClose={() => setActiveModal(null)}
+            token={adminToken}
+            onRequestResolved={fetchRequestCount}
+          />
+
           <RoomShiftingModal 
             isOpen={activeModal === 'shifting'}
             onClose={() => { setActiveModal(null); setSelectedRoom(null); }}
@@ -987,40 +1050,16 @@ export default function App() {
             currentDate={systemDate}
             onRunDayEnd={runDayEnd}
           />
+
+          <IdentityVerificationModal
+            isOpen={activeModal === 'id_verify'}
+            onClose={() => setActiveModal(null)}
+            token={adminToken}
+            rooms={rooms}
+          />
         </div>
-      );
-    } else if (user && user.role === 'guest') {
-      pageContent = (
-        <div style={{
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          justifyContent: 'center',
-          height: '100vh',
-          width: '100vw',
-          background: '#080b10',
-          color: '#fff',
-          textAlign: 'center',
-          padding: '20px'
-        }}>
-          <div style={{ fontSize: '5rem', marginBottom: '20px' }}>🚫</div>
-          <h1 style={{ fontSize: '3rem', fontWeight: '900', color: '#ff4d4d', marginBottom: '10px', fontFamily: 'var(--font-heading)' }}>403 - Forbidden</h1>
-          <h2 style={{ fontSize: '1.5rem', marginBottom: '15px' }}>Access Denied</h2>
-          <p style={{ color: 'var(--text-muted)', maxWidth: '500px', marginBottom: '30px', fontSize: '0.95rem', lineHeight: '1.5' }}>
-            You do not have the required administrative permissions to access the Staff & Management Portal.
-          </p>
-          <button className="btn-primary" onClick={() => navigate('/')} style={{ background: 'var(--accent-grad)', padding: '10px 24px', fontSize: '0.95rem' }}>
-            Return to Portal Hub
-          </button>
-        </div>
-      );
-    } else {
-      pageContent = (
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: '#080b10', color: '#fff' }}>
-          <h3>Redirecting to staff portal...</h3>
-        </div>
-      );
-    }
+      </AdminProtectedRoute>
+    );
   } else {
     pageContent = (
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100vh', background: '#080b10', color: '#fff' }}>
@@ -1087,5 +1126,15 @@ export default function App() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <AdminAuthProvider>
+      <GuestAuthProvider>
+        <AppContent />
+      </GuestAuthProvider>
+    </AdminAuthProvider>
   );
 }

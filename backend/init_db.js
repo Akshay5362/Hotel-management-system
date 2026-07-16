@@ -143,6 +143,13 @@ async function initialize() {
       \`id_type\` VARCHAR(50) DEFAULT '',
       \`gender\` VARCHAR(20) DEFAULT '',
       \`age\` INT DEFAULT NULL,
+      \`id_document_path\` VARCHAR(255) DEFAULT NULL,
+      \`id_upload_timestamp\` TIMESTAMP DEFAULT NULL,
+      \`id_verification_status\` VARCHAR(50) DEFAULT 'Pending',
+      \`id_rejection_reason\` VARCHAR(255) DEFAULT NULL,
+      \`id_verified_by\` INT DEFAULT NULL,
+      \`id_verified_at\` TIMESTAMP DEFAULT NULL,
+      \`id_ocr_text\` TEXT DEFAULT NULL,
       \`user_id\` INT DEFAULT NULL,
       \`loyalty_tier\` VARCHAR(50) DEFAULT 'Bronze',
       \`loyalty_points\` INT DEFAULT 0,
@@ -227,10 +234,13 @@ async function initialize() {
       \`amount\` INT NOT NULL,
       \`business_date\` VARCHAR(20) NOT NULL,
       \`booking_id\` INT DEFAULT NULL,
+      \`status\` VARCHAR(20) DEFAULT 'Pending',
+      \`created_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (\`room_number\`) REFERENCES \`rooms\`(\`number\`) ON DELETE CASCADE,
       FOREIGN KEY (\`booking_id\`) REFERENCES \`bookings\`(\`id\`) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
+
 
   // 11. Payments Table
   await dbConn.query(`
@@ -355,6 +365,24 @@ async function initialize() {
     CREATE TABLE \`system_settings\` (
       \`key_name\` VARCHAR(50) PRIMARY KEY,
       \`value_val\` VARCHAR(100) NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  // 20. Feedback Table (Post-checkout guest reviews)
+  await dbConn.query(`
+    CREATE TABLE \`feedback\` (
+      \`id\` INT AUTO_INCREMENT PRIMARY KEY,
+      \`booking_id\` INT NOT NULL,
+      \`guest_id\` INT NOT NULL,
+      \`overall_rating\` TINYINT NOT NULL,
+      \`room_cleanliness\` TINYINT DEFAULT NULL,
+      \`service_quality\` TINYINT DEFAULT NULL,
+      \`value_for_money\` TINYINT DEFAULT NULL,
+      \`comments\` TEXT DEFAULT NULL,
+      \`would_recommend\` TINYINT(1) DEFAULT 1,
+      \`created_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (\`booking_id\`) REFERENCES \`bookings\`(\`id\`) ON DELETE CASCADE,
+      FOREIGN KEY (\`guest_id\`) REFERENCES \`guests\`(\`id\`) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 

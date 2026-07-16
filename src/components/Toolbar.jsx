@@ -6,7 +6,8 @@ export default function Toolbar({
   setFilter, 
   roomCounts, 
   searchQuery, 
-  setSearchQuery 
+  setSearchQuery,
+  requestCount
 }) {
   const filters = [
     { key: 'all', label: 'All Rooms', class: 'chip-all', count: roomCounts.all },
@@ -79,6 +80,49 @@ export default function Toolbar({
             <path d="M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01M16 18h.01" />
           </svg>
           Upcoming Res
+        </button>
+
+        <button className="btn-action" onClick={() => onActionClick('requests')} data-tooltip="View guest service, maintenance & checkout requests" style={{ position: 'relative' }}>
+          <svg viewBox="0 0 24 24">
+            <path d="M18 8h1a4 4 0 0 1 0 8h-1"/>
+            <path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z"/>
+            <line x1="6" y1="1" x2="6" y2="4"/>
+            <line x1="10" y1="1" x2="10" y2="4"/>
+            <line x1="14" y1="1" x2="14" y2="4"/>
+          </svg>
+          Requests
+          {requestCount > 0 && (
+            <span style={{
+              position: 'absolute',
+              top: '-6px',
+              right: '-6px',
+              background: '#ef4444',
+              color: '#fff',
+              borderRadius: '50%',
+              minWidth: '18px',
+              height: '18px',
+              fontSize: '0.65rem',
+              fontWeight: '800',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: '0 4px',
+              boxShadow: '0 0 8px rgba(239,68,68,0.6)',
+              animation: 'pulse 2s infinite',
+              lineHeight: 1,
+              zIndex: 10
+            }}>
+              {requestCount > 99 ? '99+' : requestCount}
+            </span>
+          )}
+        </button>
+
+        <button className="btn-action" onClick={() => onActionClick('id_verify')} data-tooltip="Review and verify uploaded Guest ID documents">
+          <svg viewBox="0 0 24 24">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+            <polyline points="9 12 11 14 15 10" />
+          </svg>
+          ID Verify
         </button>
 
         <button className="btn-action" onClick={() => onActionClick('refresh')} data-tooltip="Re-sync dashboard with database">

@@ -11,6 +11,13 @@ app.use(express.json());
 // Mount the API Router
 app.use('/api', apiRouter);
 
+// Serve uploaded documents statically (Admin verification UI needs this)
+import path from 'path';
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+app.use('/guest-documents', express.static(path.join(__dirname, 'guest-documents')));
+
 // Basic root checker
 app.get('/', (req, res) => {
   res.send('Webline PMS Plus Backend API is running!');
