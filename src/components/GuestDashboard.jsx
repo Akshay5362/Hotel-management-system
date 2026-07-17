@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import PaymentPanel from './PaymentPanel';
 
 export default function GuestDashboard({ user, token, rooms, systemDate, onLogout, showAlert, fetchStatus, onUserUpdate }) {
   const [wizardStep, setWizardStep] = useState(1); // 1: Room Selection, 2: Guest Details, 3: ID Verification, 4: Extra Services, 5: Payment, 6: Confirmation
@@ -52,11 +53,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
   });
 
   // STEP 5: Payment States
-  const [paymentMethod, setPaymentMethod] = useState('card'); // 'card' | 'upi'
-  const [cardNumber, setCardNumber] = useState('');
-  const [cardExpiry, setCardExpiry] = useState('');
-  const [cardCvv, setCardCvv] = useState('');
-  const [upiId, setUpiId] = useState('');
+  const [paymentMethod, setPaymentMethod] = useState('Cash'); // 'Cash' | 'UPI' | 'Debit Card' | 'Credit Card' | 'QR Code' | 'Net Banking' | 'Wallet'
   const [paymentDeposit, setPaymentDeposit] = useState('0'); // dynamically calculated default
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -66,6 +63,10 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
   // ─── PHASE 2: Guest Stay Dashboard State ───────────────────────────────────
   const [dashTab, setDashTab] = useState('overview'); // overview|service|maintenance|bill|notifications|extend|food
   const [isCheckingIn, setIsCheckingIn] = useState(false);
+
+  // Payment status for the active booked reservation
+  const [paymentStatusInfo, setPaymentStatusInfo] = useState(null);
+  // { paymentStatus, paymentMethod, amount, paymentConfirmed, cashPendingConfirmation }
 
   // Live bill state
   const [liveBill, setLiveBill] = useState(null); // { booking, ledger }
@@ -251,6 +252,19 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
     }
   };
 
+  // Fetch payment status whenever activeBooking appears with status === 'booked'
+  useEffect(() => {
+    if (activeBooking && activeBooking.status === 'booked') {
+      fetchPaymentStatus();
+      // Poll every 20 seconds so guest sees update without manual refresh
+      const interval = setInterval(fetchPaymentStatus, 20000);
+      return () => clearInterval(interval);
+    } else {
+      setPaymentStatusInfo(null);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeBooking?.status]);
+
   const unreadCount = notifications.filter(n => !n.is_read).length;
 
   // Phase 2 action: self check-in
@@ -261,9 +275,31 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
       showAlert(`✅ ${data.message}`, 'Check-In Successful');
       await fetchStatus();
     } catch (e) {
-      showAlert(e.message, 'Check-In Error');
+      // If backend returns a cash-pending specific error, show a friendlier message
+      if (e.message && e.message.includes('Cash payment not yet confirmed')) {
+        showAlert(
+          'Your cash payment has not been confirmed by the reception yet. Please visit the front desk and pay your advance, then the staff will unlock your check-in.',
+          '💵 Cash Payment Required'
+        );
+      } else {
+        showAlert(e.message, 'Check-In Error');
+      }
     } finally {
       setIsCheckingIn(false);
+    }
+  };
+
+  // Fetch payment status for active booked reservation
+  const fetchPaymentStatus = async () => {
+    try {
+      const data = await apiFetch('/payments/guest/payment-status');
+      if (data.hasActivePayment) {
+        setPaymentStatusInfo(data);
+      } else {
+        setPaymentStatusInfo(null);
+      }
+    } catch (e) {
+      console.warn('fetchPaymentStatus error:', e.message);
     }
   };
 
@@ -892,29 +928,17 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
   const taxesAmount = Math.round((baseRate - loyaltyDiscount + servicesTotal) * 0.12);
   const totalStayPrice = (baseRate - loyaltyDiscount) + servicesTotal + taxesAmount;
 
-  // Initialize deposit value on step transition to payment
+  // Initialize deposit value and default payment method on step transition to payment
   const handleTransitionToPayment = () => {
     setPaymentDeposit(totalStayPrice.toString());
+    setPaymentMethod('Cash'); // Default to Cash (only functional method in Phase 2)
     setWizardStep(5);
   };
 
-  const handleBookSubmit = async (e) => {
-    e.preventDefault();
+  const handleBookSubmit = async () => {
     if (!selectedRoomNumber) {
       showAlert('Please select a room first.', 'Validation Error');
       return;
-    }
-
-    if (paymentMethod === 'card') {
-      if (!cardNumber.trim() || !cardExpiry.trim() || !cardCvv.trim()) {
-        showAlert('Please enter credit card details to complete payment', 'Secure Payment');
-        return;
-      }
-    } else {
-      if (!upiId.trim() || !upiId.includes('@')) {
-        showAlert('Please enter a valid UPI address (e.g. username@upi)', 'Secure Payment');
-        return;
-      }
     }
 
     const parsedDeposit = parseInt(paymentDeposit, 10);
@@ -931,6 +955,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
     try {
       const activeExtraGuests = extraGuests.slice(0, numGuests - 1);
 
+      // ── Step A: Create booking (existing, unchanged) ────────────────────
       const res = await fetch(`http://localhost:5000/api/rooms/${selectedRoomNumber}/book`, {
         method: 'POST',
         headers: { 
@@ -961,7 +986,23 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
         throw new Error(data.message || data.error || (data.errors && Object.values(data.errors)[0]) || 'Booking failed');
       }
 
-      // Set confirmation info
+      // ── Step B: Finalize payment with chosen method (Phase 2 API) ────────
+      // Non-blocking — if this fails the booking is still valid.
+      if (data.bookingId) {
+        try {
+          await apiFetch('/payments/finalize', {
+            method: 'POST',
+            body: JSON.stringify({
+              bookingId: data.bookingId,
+              paymentMethod
+            })
+          });
+        } catch (finalizeErr) {
+          console.warn('Payment finalize call failed (booking still confirmed):', finalizeErr.message);
+        }
+      }
+
+      // ── Step C: Set confirmation state ────────────────────────────────────
       setConfirmedBooking({
         bookingNumber: data.bookingNumber || ('BKG-' + Math.floor(100000 + Math.random() * 900000)),
         roomNumber: selectedRoomNumber,
@@ -984,17 +1025,13 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
       });
 
       showAlert(
-        `Room ${selectedRoomNumber} booked successfully! Verification complete and invoice receipt generated.`,
+        `Room ${selectedRoomNumber} booked successfully! Payment recorded. Confirmation receipt generated.`,
         'Booking Confirmed'
       );
 
-      // Reset forms and navigate to step 6 (Confirmation)
       setWizardStep(6);
-      
-      // Refresh room database
       await fetchStatus();
 
-      // Trigger user state update
       if (data.loyalty && onUserUpdate) {
         onUserUpdate({
           ...user,
@@ -1011,15 +1048,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
   };
 
   const handleFinishConfirmation = async () => {
-    // First, refresh the rooms data from the server so activeBooking is detected
-    // before we clear the wizard. This prevents the brief flash to room selection.
-    try {
-      await fetchStatus();
-    } catch (e) {
-      console.error('fetchStatus error on finish:', e);
-    }
-
-    // Reset wizard form states (NOT wizardStep - the activeBooking guard will hide the wizard)
+    try { await fetchStatus(); } catch (e) { console.error('fetchStatus error on finish:', e); }
     setSelectedRoomNumber(null);
     setSelectedCategory('ALL');
     setFilterCapacity('1');
@@ -1033,17 +1062,8 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
     ]);
     setGovernmentId('');
     setUploadedFile(null);
-    setExtraServices({
-      breakfast: false,
-      lunch: false,
-      dinner: false,
-      parking: false
-    });
-    setCardNumber('');
-    setCardExpiry('');
-    setCardCvv('');
-    setUpiId('');
-    // Clear confirmed booking LAST so the wizard doesn't flash before data loads
+    setExtraServices({ breakfast: false, lunch: false, dinner: false, parking: false });
+    setPaymentMethod('Cash');
     setConfirmedBooking(null);
     setWizardStep(1);
   };
@@ -1135,32 +1155,81 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                 ))}
               </div>
 
-              {/* Check In Button */}
-              <div style={{ display: 'flex', gap: '12px', justifyContent: 'center', flexWrap: 'wrap' }}>
-                <button
-                  onClick={handleSelfCheckIn}
-                  disabled={isCheckingIn}
-                  style={{
-                    background: isCheckingIn ? 'rgba(255,255,255,0.1)' : 'linear-gradient(135deg, #22c55e 0%, #16a34a 100%)',
-                    border: 'none',
-                    borderRadius: '10px',
-                    padding: '14px 36px',
-                    color: '#fff',
-                    fontSize: '1rem',
-                    fontWeight: '800',
-                    cursor: isCheckingIn ? 'not-allowed' : 'pointer',
-                    transition: 'all 0.2s',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '10px',
-                    boxShadow: '0 4px 20px rgba(34,197,94,0.3)'
-                  }}
-                >
-                  {isCheckingIn ? '⏳ Checking In...' : '✅ Check In Now'}
-                </button>
+              {/* Check In Button / Payment Pending Lock */}
+              <div style={{ display: 'flex', gap: '12px', justifyContent: 'center', flexWrap: 'wrap', flexDirection: 'column', alignItems: 'center' }}>
+
+                {/* Case A: Cash payment still pending admin confirmation */}
+                {paymentStatusInfo?.cashPendingConfirmation && (
+                  <div style={{ width: '100%', maxWidth: '520px', background: 'rgba(239,68,68,0.07)', border: '1px solid rgba(239,68,68,0.25)', borderRadius: '12px', padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                      <span style={{ fontSize: '1.8rem' }}>💵</span>
+                      <div>
+                        <p style={{ fontWeight: '800', color: '#ef4444', margin: 0, fontSize: '0.95rem' }}>Cash Payment Pending Confirmation</p>
+                        <p style={{ color: 'var(--text-muted)', margin: '4px 0 0', fontSize: '0.8rem', lineHeight: '1.5' }}>
+                          Please visit the hotel reception desk and pay your advance deposit of
+                          <strong style={{ color: '#fff' }}> ₹{(paymentStatusInfo.amount || 0).toLocaleString('en-IN')}</strong>.
+                          Once the staff confirms receipt, your <strong style={{ color: '#fbbf24' }}>Check In Now</strong> button will activate automatically.
+                        </p>
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', background: 'rgba(251,191,36,0.06)', border: '1px solid rgba(251,191,36,0.15)', borderRadius: '8px', padding: '10px 14px' }}>
+                      <span style={{ fontSize: '0.9rem' }}>ℹ️</span>
+                      <p style={{ fontSize: '0.75rem', color: '#94a3b8', margin: 0, lineHeight: '1.4' }}>
+                        This page refreshes every 20 seconds. You’ll also receive a notification once the staff confirms your payment.
+                      </p>
+                    </div>
+                    {/* Disabled Check In button to show it exists but is locked */}
+                    <button
+                      disabled
+                      style={{
+                        background: 'rgba(255,255,255,0.05)',
+                        border: '1px dashed rgba(255,255,255,0.15)',
+                        borderRadius: '10px',
+                        padding: '14px 36px',
+                        color: 'rgba(255,255,255,0.25)',
+                        fontSize: '1rem',
+                        fontWeight: '700',
+                        cursor: 'not-allowed',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '10px',
+                        alignSelf: 'center'
+                      }}
+                    >
+                      🔒 Check In Locked — Awaiting Payment
+                    </button>
+                  </div>
+                )}
+
+                {/* Case B: Payment confirmed OR no payment pending → normal Check In Now */}
+                {!paymentStatusInfo?.cashPendingConfirmation && (
+                  <button
+                    onClick={handleSelfCheckIn}
+                    disabled={isCheckingIn}
+                    style={{
+                      background: isCheckingIn ? 'rgba(255,255,255,0.1)' : 'linear-gradient(135deg, #22c55e 0%, #16a34a 100%)',
+                      border: 'none',
+                      borderRadius: '10px',
+                      padding: '14px 36px',
+                      color: '#fff',
+                      fontSize: '1rem',
+                      fontWeight: '800',
+                      cursor: isCheckingIn ? 'not-allowed' : 'pointer',
+                      transition: 'all 0.2s',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '10px',
+                      boxShadow: '0 4px 20px rgba(34,197,94,0.3)'
+                    }}
+                  >
+                    {isCheckingIn ? '⏳ Checking In...' : '✅ Check In Now'}
+                  </button>
+                )}
               </div>
               <p style={{ textAlign: 'center', fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '14px' }}>
-                ℹ️ Clicking "Check In Now" will confirm your arrival and activate your room. Make sure you are physically at the hotel reception.
+                {paymentStatusInfo?.cashPendingConfirmation
+                  ? '💵 Pay your advance deposit at the reception desk. Check-in will unlock once confirmed.'
+                  : 'ℹ️ Clicking "Check In Now" will confirm your arrival and activate your room. Make sure you are physically at the hotel reception.'}
               </p>
             </div>
           </div>
@@ -2585,7 +2654,8 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                   {/* Dropzone File Upload Simulator */}
                   <div style={{ marginBottom: '25px' }}>
                     <label style={{ display: 'block', fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '8px', fontWeight: '500' }}>
-                      Upload ID Document Image / PDF <span style={{ color: '#ef4444' }}>*</span>
+                      Upload ID Document Image / PDF
+                      <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginLeft: '8px', fontWeight: '400' }}>(Optional — can show offline at reception)</span>
                     </label>
                     <input 
                       type="file" 
@@ -2674,6 +2744,16 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                     )}
                   </div>
 
+                  {/* Skip notice when no document uploaded */}
+                  {!uploadedFile && !isUploading && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 14px', background: 'rgba(251, 191, 36, 0.06)', border: '1px solid rgba(251, 191, 36, 0.2)', borderRadius: '8px', marginBottom: '18px' }}>
+                      <span style={{ fontSize: '1rem' }}>📋</span>
+                      <p style={{ fontSize: '0.75rem', color: '#fbbf24', margin: 0, lineHeight: '1.4' }}>
+                        <strong>No document uploaded.</strong> You can proceed and present your ID document physically at the reception desk during check-in.
+                      </p>
+                    </div>
+                  )}
+
                   <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
                     <button type="button" className="btn-secondary" onClick={() => setWizardStep(2)}>
                       ← Back
@@ -2681,18 +2761,21 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                     <button 
                       type="button" 
                       className="btn-primary" 
-                      disabled={!!docError || !!fileError || !governmentId.trim() || !uploadedFile}
+                      disabled={!!docError || (!!fileError && !!uploadedFile) || !governmentId.trim()}
                       onClick={() => {
-                        if (docError || fileError || !governmentId.trim() || !uploadedFile) return;
+                        if (docError || !governmentId.trim()) return;
+                        // If there's a file error but no file actually uploaded, clear the error and allow skip
+                        if (fileError && !uploadedFile) setFileError(null);
+                        if (fileError && uploadedFile) return;
                         setWizardStep(4);
                       }}
                       style={{ 
-                        background: (docError || fileError || !governmentId.trim() || !uploadedFile) ? '#1e293b' : 'var(--accent-grad)',
-                        color: (docError || fileError || !governmentId.trim() || !uploadedFile) ? 'var(--text-muted)' : '#fff',
-                        cursor: (docError || fileError || !governmentId.trim() || !uploadedFile) ? 'not-allowed' : 'pointer'
+                        background: (docError || (fileError && uploadedFile) || !governmentId.trim()) ? '#1e293b' : 'var(--accent-grad)',
+                        color: (docError || (fileError && uploadedFile) || !governmentId.trim()) ? 'var(--text-muted)' : '#fff',
+                        cursor: (docError || (fileError && uploadedFile) || !governmentId.trim()) ? 'not-allowed' : 'pointer'
                       }}
                     >
-                      Next: Extra Services →
+                      {uploadedFile ? 'Next: Extra Services →' : 'Skip Upload & Continue →'}
                     </button>
                   </div>
                 </div>
@@ -2900,196 +2983,156 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                 </div>
               )}
 
-              {/* STEP 5: Payment Page */}
+              {/* STEP 5: Booking Summary + Payment */}
               {wizardStep === 5 && (
-                <div className="glass" style={{ borderRadius: '12px', padding: '25px', border: '1px solid rgba(56, 189, 248, 0.2)', background: 'rgba(10, 15, 30, 0.6)' }}>
-                  <div style={{ borderBottom: '1px solid var(--border-color)', paddingBottom: '12px', marginBottom: '20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <div>
-                      <h4 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.15rem', fontWeight: '700', color: '#fff' }}>
-                        💳 Secure Payment Gateway
-                      </h4>
-                      <p style={{ color: 'var(--text-muted)', fontSize: '0.78rem', marginTop: '2px' }}>
-                        Review details and complete booking check-in payment.
-                      </p>
-                    </div>
-                    <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', background: 'rgba(56, 189, 248, 0.08)', padding: '4px 10px', borderRadius: '4px', border: '1px solid rgba(56, 189, 248, 0.2)' }}>
-                      Room {selectedRoomNumber} ({selectedRoom?.type})
-                    </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+
+                  {/* ── Section Header ── */}
+                  <div style={{ borderBottom: '1px solid var(--border-color)', paddingBottom: '14px' }}>
+                    <h4 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.15rem', fontWeight: '700', color: '#fff' }}>
+                      📋 Step 5: Booking Summary &amp; Payment
+                    </h4>
+                    <p style={{ color: 'var(--text-muted)', fontSize: '0.78rem', marginTop: '2px' }}>
+                      Review your complete booking details before confirming payment.
+                    </p>
                   </div>
 
-                  <form onSubmit={handleBookSubmit}>
-                    
-                    {/* Itemized final invoices panel */}
-                    <div style={{ padding: '15px', background: 'rgba(0,0,0,0.25)', borderRadius: '8px', border: '1px solid var(--border-color)', marginBottom: '20px' }}>
-                      <h5 style={{ color: '#fff', fontSize: '0.8rem', textTransform: 'uppercase', marginBottom: '8px' }}>Stay Summary</h5>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                          <span>Base Room Rate:</span>
-                          <span>₹ {baseRate}</span>
-                        </div>
-                        {loyaltyDiscount > 0 && (
-                          <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--color-booked)' }}>
-                            <span>Loyalty Discount ({user.loyalty_tier} - {discountPercent * 100}%):</span>
-                            <span>- ₹ {loyaltyDiscount}</span>
-                          </div>
-                        )}
-                        {servicesList.map((srv, idx) => (
-                          <div key={idx} style={{ display: 'flex', justifyContent: 'space-between' }}>
-                            <span>{srv.name}:</span>
-                            <span>₹ {srv.total}</span>
-                          </div>
-                        ))}
-                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                          <span>GST (12%):</span>
-                          <span>₹ {taxesAmount}</span>
-                        </div>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', color: '#fff', fontWeight: 'bold', borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '6px', marginTop: '4px' }}>
-                          <span>Net Stays Total:</span>
-                          <span>₹ {totalStayPrice}</span>
-                        </div>
-                        
-                        {/* Loyalty earnings details */}
-                        <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--color-vacant)', fontSize: '0.75rem', borderTop: '1px dashed rgba(255,255,255,0.05)', paddingTop: '6px', marginTop: '4px' }}>
-                          <span>Estimated Loyalty Points Earned:</span>
-                          <span><strong>+{Math.round(totalStayPrice / 10)} pts</strong></span>
-                        </div>
+                  {/* ── Booking Summary Card ── */}
+                  <div className="glass" style={{ borderRadius: '12px', border: '1px solid rgba(255,255,255,0.07)', background: 'rgba(10,15,30,0.5)', overflow: 'hidden' }}>
+
+                    {/* Card header */}
+                    <div style={{ padding: '14px 20px', background: 'rgba(56,189,248,0.06)', borderBottom: '1px solid rgba(56,189,248,0.1)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div>
+                        <p style={{ fontSize: '0.65rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Room</p>
+                        <p style={{ fontSize: '1.1rem', fontWeight: '800', color: '#38bdf8' }}>Room {selectedRoomNumber} &mdash; {selectedRoom?.type}</p>
+                      </div>
+                      <div style={{ textAlign: 'right' }}>
+                        <p style={{ fontSize: '0.65rem', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Guest</p>
+                        <p style={{ fontSize: '0.92rem', fontWeight: '700', color: '#fff' }}>{guestName.trim().toUpperCase()}</p>
                       </div>
                     </div>
 
-                    {/* Deposit selector */}
-                    <div className="form-group" style={{ marginBottom: '20px' }}>
-                      <label style={{ fontSize: '0.85rem' }}>Advance Deposit Amount (₹) - <em>Min ₹ 1,000 required</em></label>
-                      <input 
-                        type="number" 
-                        min="1000"
-                        max={totalStayPrice}
-                        value={paymentDeposit} 
-                        onChange={(e) => setPaymentDeposit(e.target.value)}
-                        required 
-                      />
-                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '4px' }}>
-                        <span>Paid Deposit: ₹ {paymentDeposit}</span>
-                        <span>Post-Checkin Balance: ₹ {Math.max(0, totalStayPrice - parseInt(paymentDeposit || '0', 10))}</span>
+                    {/* Stay dates row */}
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                      {[
+                        { label: 'Check-in', value: checkInDate, color: '#38bdf8' },
+                        { label: 'Check-out', value: checkOutDate || '—', color: '#818cf8' },
+                        { label: 'Guests', value: `${numGuests} Adult${numGuests > 1 ? 's' : ''}`, color: '#fff' },
+                      ].map((item, i) => (
+                        <div key={i} style={{ padding: '14px 18px', borderRight: i < 2 ? '1px solid rgba(255,255,255,0.05)' : 'none' }}>
+                          <p style={{ fontSize: '0.62rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.4px' }}>{item.label}</p>
+                          <p style={{ fontSize: '0.9rem', fontWeight: '700', color: item.color, marginTop: '3px' }}>{item.value}</p>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* ID & Document */}
+                    <div style={{ padding: '12px 18px', borderBottom: '1px solid rgba(255,255,255,0.05)', display: 'flex', gap: '12px', alignItems: 'center' }}>
+                      <span style={{ fontSize: '0.85rem' }}>🛡️</span>
+                      <div>
+                        <p style={{ fontSize: '0.62rem', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Identity</p>
+                        <p style={{ fontSize: '0.82rem', color: '#fff', marginTop: '2px' }}>
+                          {idType} &mdash; <span style={{ fontFamily: 'monospace' }}>{governmentId || '—'}</span>
+                          {!idDocumentPath && <span style={{ marginLeft: '8px', fontSize: '0.65rem', color: '#fbbf24', background: 'rgba(251,191,36,0.1)', padding: '2px 6px', borderRadius: '3px' }}>Offline</span>}
+                          {idDocumentPath && <span style={{ marginLeft: '8px', fontSize: '0.65rem', color: '#4ade80', background: 'rgba(74,222,128,0.1)', padding: '2px 6px', borderRadius: '3px' }}>Uploaded</span>}
+                        </p>
                       </div>
                     </div>
 
-                    {/* Payment Mode Selector Tabs */}
-                    <div style={{ display: 'flex', background: 'rgba(0,0,0,0.2)', padding: '4px', borderRadius: '8px', marginBottom: '20px', border: '1px solid var(--border-color)' }}>
-                      <button 
-                        type="button"
-                        onClick={() => setPaymentMethod('card')}
-                        style={{
-                          flex: 1,
-                          padding: '8px 0',
-                          border: 'none',
-                          background: paymentMethod === 'card' ? 'var(--accent-grad)' : 'transparent',
-                          color: paymentMethod === 'card' ? '#fff' : 'var(--text-secondary)',
-                          borderRadius: '6px',
-                          fontWeight: '600',
-                          fontSize: '0.85rem',
-                          cursor: 'pointer',
-                          transition: 'all 0.2s'
-                        }}
-                      >
-                        💳 Debit / Credit Card
-                      </button>
-                      <button 
-                        type="button"
-                        onClick={() => setPaymentMethod('upi')}
-                        style={{
-                          flex: 1,
-                          padding: '8px 0',
-                          border: 'none',
-                          background: paymentMethod === 'upi' ? 'var(--accent-grad)' : 'transparent',
-                          color: paymentMethod === 'upi' ? '#fff' : 'var(--text-secondary)',
-                          borderRadius: '6px',
-                          fontWeight: '600',
-                          fontSize: '0.85rem',
-                          cursor: 'pointer',
-                          transition: 'all 0.2s'
-                        }}
-                      >
-                        📱 UPI Mobile Payments
-                      </button>
-                    </div>
-
-                    {/* Conditional Payment Methods */}
-                    {paymentMethod === 'card' ? (
-                      <div style={{ padding: '15px', background: 'rgba(0,0,0,0.3)', borderRadius: '8px', border: '1px solid var(--border-color)', marginBottom: '20px' }}>
-                        <div className="form-group" style={{ marginBottom: '10px' }}>
-                          <label style={{ fontSize: '0.7rem' }}>Card Number</label>
-                          <input 
-                            type="text" 
-                            name="cardnumber"
-                            autoComplete="cc-number"
-                            placeholder="1234 5678 1234 5678"
-                            value={cardNumber}
-                            onChange={(e) => setCardNumber(e.target.value)}
-                            maxLength="19"
-                            required
-                          />
+                    {/* Services */}
+                    {servicesList.length > 0 && (
+                      <div style={{ padding: '12px 18px', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                        <p style={{ fontSize: '0.62rem', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '6px' }}>Services</p>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                          {servicesList.map((srv, i) => (
+                            <span key={i} style={{ fontSize: '0.72rem', color: '#4ade80', background: 'rgba(74,222,128,0.08)', border: '1px solid rgba(74,222,128,0.2)', padding: '3px 8px', borderRadius: '4px' }}>
+                              {srv.name} &mdash; ₹{srv.total}
+                            </span>
+                          ))}
                         </div>
-
-                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-                          <div className="form-group" style={{ marginBottom: '0' }}>
-                            <label style={{ fontSize: '0.7rem' }}>Expiry Date</label>
-                            <input 
-                              type="text" 
-                              name="cc-exp"
-                              autoComplete="cc-exp"
-                              placeholder="MM/YY"
-                              value={cardExpiry}
-                              onChange={(e) => setCardExpiry(e.target.value)}
-                              maxLength="5"
-                              required
-                            />
-                          </div>
-                          <div className="form-group" style={{ marginBottom: '0' }}>
-                            <label style={{ fontSize: '0.7rem' }}>CVV</label>
-                            <input 
-                              type="password" 
-                              name="cvv"
-                              autoComplete="cc-csc"
-                              placeholder="***"
-                              value={cardCvv}
-                              onChange={(e) => setCardCvv(e.target.value)}
-                              maxLength="3"
-                              required
-                            />
-                          </div>
-                        </div>
-                      </div>
-                    ) : (
-                      <div style={{ padding: '15px', background: 'rgba(0,0,0,0.3)', borderRadius: '8px', border: '1px solid var(--border-color)', marginBottom: '20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '15px' }}>
-                        
-                        <div className="form-group" style={{ width: '100%', marginBottom: '0' }}>
-                          <label style={{ fontSize: '0.7rem' }}>UPI ID Address</label>
-                          <input 
-                            type="text" 
-                            placeholder="e.g. guestname@upi / guest@paytm"
-                            value={upiId}
-                            onChange={(e) => setUpiId(e.target.value)}
-                            required
-                          />
-                        </div>
-
-                        {/* Styled QR Code mockup */}
-                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px', background: '#fff', padding: '12px', borderRadius: '8px', width: '130px', height: '130px', justifyContent: 'center', border: '2px solid var(--color-booked)' }}>
-                          <div style={{ width: '100px', height: '100px', background: 'repeating-conic-gradient(from 45deg, #000 0% 25%, transparent 0% 50%) 0 0/ 15px 15px, repeating-conic-gradient(from 45deg, #000 0% 25%, transparent 0% 50%) 7.5px 7.5px/ 15px 15px', opacity: 0.85 }} />
-                        </div>
-                        <span style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>Scan QR with your mobile app or enter UPI address above.</span>
                       </div>
                     )}
 
-                    <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
-                      <button type="button" className="btn-secondary" onClick={() => setWizardStep(4)}>
-                        ← Back
-                      </button>
-                      <button type="submit" className="btn-primary" disabled={isSubmitting} style={{ background: 'var(--accent-grad)', borderColor: 'var(--accent-color)' }}>
-                        {isSubmitting ? 'Processing Payment...' : `Authorize ₹ ${paymentDeposit} & Confirm Booking`}
-                      </button>
+                    {/* Pricing Breakdown */}
+                    <div style={{ padding: '14px 18px' }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '7px', fontSize: '0.82rem', color: 'var(--text-secondary)' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                          <span>Room {selectedRoomNumber} Base Tariff</span>
+                          <span>₹ {baseRate.toLocaleString()}</span>
+                        </div>
+                        {loyaltyDiscount > 0 && (
+                          <div style={{ display: 'flex', justifyContent: 'space-between', color: '#4ade80' }}>
+                            <span>🎖️ {user.loyalty_tier} Loyalty Discount (-{discountPercent * 100}%)</span>
+                            <span>- ₹ {loyaltyDiscount.toLocaleString()}</span>
+                          </div>
+                        )}
+                        {servicesList.map((srv, i) => (
+                          <div key={i} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                            <span>{srv.name}</span>
+                            <span>₹ {srv.total.toLocaleString()}</span>
+                          </div>
+                        ))}
+                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                          <span>GST &amp; Taxes (12%)</span>
+                          <span>₹ {taxesAmount.toLocaleString()}</span>
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '8px', marginTop: '2px', fontSize: '1rem', fontWeight: 'bold', color: '#fff' }}>
+                          <span>Total Payable</span>
+                          <span style={{ color: '#38bdf8' }}>₹ {totalStayPrice.toLocaleString()}</span>
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.72rem', color: '#a3e635' }}>
+                          <span>🏅 Est. Loyalty Points Earned</span>
+                          <span>+{Math.round(totalStayPrice / 10)} pts</span>
+                        </div>
+                      </div>
                     </div>
-                  </form>
+                  </div>
+
+                  {/* ── Deposit Selector ── */}
+                  <div className="form-group" style={{ marginBottom: '0' }}>
+                    <label style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', fontWeight: '500' }}>
+                      Advance Deposit Amount (₹) &mdash; <em style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>Min ₹ 1,000 required</em>
+                    </label>
+                    <input
+                      type="number"
+                      min="1000"
+                      max={totalStayPrice}
+                      value={paymentDeposit}
+                      onChange={(e) => setPaymentDeposit(e.target.value)}
+                      style={{ marginTop: '6px' }}
+                    />
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '4px' }}>
+                      <span>Advance Deposit: ₹ {parseInt(paymentDeposit || '0', 10).toLocaleString()}</span>
+                      <span>Balance at Check-out: ₹ {Math.max(0, totalStayPrice - parseInt(paymentDeposit || '0', 10)).toLocaleString()}</span>
+                    </div>
+                  </div>
+
+
+                  {/* ── Payment Method Selector — Reusable PaymentPanel component ── */}
+                  {/* RAZORPAY HOOK: In next phase, pass onGatewayPay prop here */}
+                  <PaymentPanel
+                    selectedMethod={paymentMethod}
+                    onMethodChange={setPaymentMethod}
+                    amount={parseInt(paymentDeposit || '0', 10)}
+                  />
+
+
+                  {/* ── Action Buttons ── */}
+                  <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', paddingTop: '6px', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                    <button type="button" className="btn-secondary" onClick={() => setWizardStep(4)}>← Back</button>
+                    <button
+                      type="button"
+                      className="btn-primary"
+                      disabled={isSubmitting}
+                      onClick={handleBookSubmit}
+                      style={{ background: 'var(--accent-grad)', minWidth: '200px' }}
+                    >
+                      {isSubmitting
+                        ? '⏳ Processing Booking...'
+                        : `Confirm Booking & Pay ₹ ${parseInt(paymentDeposit || '0', 10).toLocaleString()} →`}
+                    </button>
+                  </div>
+
                 </div>
               )}
 
@@ -3195,9 +3238,19 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                     <span>- ₹ {confirmedBooking.loyaltyDiscount}</span>
                   </div>
                 )}
-                <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--color-booked)' }}>
-                  <span>Advance Deposit Paid:</span>
-                  <strong>₹ {confirmedBooking.deposit} ({confirmedBooking.paymentMethod.toUpperCase()})</strong>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#fbbf24' }}>
+                  <span>
+                    {confirmedBooking.paymentMethod === 'Cash'
+                      ? 'Cash Advance (Pay at Reception):'
+                      : `${confirmedBooking.paymentMethod} (Gateway Payment):`}
+                  </span>
+                  <strong>
+                    ₹ {confirmedBooking.deposit} ({confirmedBooking.paymentMethod.toUpperCase()})
+                    {confirmedBooking.paymentMethod === 'Cash'
+                      ? <span style={{ fontSize: '0.62rem', marginLeft: '6px', background: 'rgba(239,68,68,0.15)', color: '#ef4444', padding: '1px 5px', borderRadius: '3px', fontWeight: '700' }}>PENDING</span>
+                      : <span style={{ fontSize: '0.62rem', marginLeft: '6px', background: 'rgba(251,191,36,0.12)', color: '#fbbf24', padding: '1px 5px', borderRadius: '3px', fontWeight: '700' }}>AWAITING GATEWAY</span>
+                    }
+                  </strong>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '8px', marginTop: '4px', fontSize: '0.92rem', fontWeight: 'bold' }}>
                   <span style={{ color: '#fff' }}>Folio Balance Due:</span>

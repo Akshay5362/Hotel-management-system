@@ -141,16 +141,23 @@ export default function AuthCard({ isAdmin = false, initialIsSignUp = false, onA
         <form onSubmit={handleSubmit} autoComplete="off" style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
           
           <div className="form-group">
-            <label style={{ fontSize: '0.75rem', marginBottom: '4px' }}>Username, Email, or Phone</label>
+            <label style={{ fontSize: '0.75rem', marginBottom: '4px' }}>
+              {(!isAdmin && isSignUp) ? 'Choose a Login ID (email, phone, or any handle)' : 'Username, Email, or Phone'}
+            </label>
             <input 
               type="text" 
-              placeholder="Enter username, email, or phone"
+              placeholder={(!isAdmin && isSignUp) ? 'e.g. amit@gmail.com or 9876543210' : 'Enter username, email, or phone'}
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               required
               autoComplete="off"
               style={{ padding: '10px 14px', background: 'rgba(0,0,0,0.4)', borderColor: 'var(--border-color)' }}
             />
+            {(!isAdmin && isSignUp) && (
+              <p style={{ fontSize: '0.65rem', color: 'var(--text-muted)', marginTop: '4px', lineHeight: '1.4' }}>
+                🔑 This is what you’ll use to sign in. Must be unique — use your email or phone for best results.
+              </p>
+            )}
           </div>
 
           <div className="form-group">

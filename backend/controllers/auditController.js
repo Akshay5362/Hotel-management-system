@@ -39,17 +39,21 @@ async function autoAdvanceToToday(connection) {
   const storedDate = parsePmsDate(settingsMap['system_date']);
   if (!storedDate) return;
 
-  // Today at midnight UTC (Indian time is UTC+5:30 — use getUTC methods after offset)
-  const nowIST     = new Date(Date.now() + 5.5 * 60 * 60 * 1000); // shift to IST
-  const todayUTC   = new Date(Date.UTC(nowIST.getUTCFullYear(), nowIST.getUTCMonth(), nowIST.getUTCDate()));
+  // Use machine local date (Node.js on Windows IST returns local date correctly).
+  // Do NOT add a UTC+5:30 offset — that was causing the date to jump 2 days ahead.
+  const now        = new Date();
+  const todayLocal = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
 
-  if (storedDate >= todayUTC) return; // already current — nothing to do
+  // Safety cap: NEVER advance beyond today. storedDate is midnight UTC.
+  if (storedDate >= todayLocal) return; // already current — nothing to do
 
   let current = storedDate;
+  let iterations = 0;
 
-  while (current < todayUTC) {
-    const next     = addDay(current);
-    const nextStr  = formatPmsDate(next);
+  while (current < todayLocal && iterations < 30) {
+    iterations++;
+    const next    = addDay(current);
+    const nextStr = formatPmsDate(next);
 
     // Get all currently occupied rooms
     const [occupiedRooms] = await connection.query(`
@@ -189,22 +193,33 @@ export const getStatus = async (req, res) => {
       ORDER BY b.check_in_date ASC
     `);
 
-    const [ledgerItems] = await pool.query('SELECT * FROM ledger_items');
-    const ledgerMap = {};
-    ledgerItems.forEach(item => {
-      if (!ledgerMap[item.room_number]) {
-        ledgerMap[item.room_number] = [];
-      }
-      ledgerMap[item.room_number].push({
-        id: item.id,
-        desc: item.desc,
-        qty: item.qty,
-        amount: item.amount
+    // Fetch ledger items only for active bookings (Checked In or Reserved)
+    // This prevents old checked-out booking charges from polluting the current folio
+    const activeBookingIds = activeBookings.map(b => b.booking_id).filter(Boolean);
+    let ledgerByBookingId = {};
+    if (activeBookingIds.length > 0) {
+      const placeholders = activeBookingIds.map(() => '?').join(',');
+      const [ledgerItems] = await pool.query(
+        `SELECT * FROM ledger_items WHERE booking_id IN (${placeholders})`,
+        activeBookingIds
+      );
+      ledgerItems.forEach(item => {
+        const bookingId = item.booking_id;
+        if (!ledgerByBookingId[bookingId]) {
+          ledgerByBookingId[bookingId] = [];
+        }
+        ledgerByBookingId[bookingId].push({
+          id: item.id,
+          desc: item.desc,
+          qty: item.qty,
+          amount: item.amount
+        });
       });
-    });
+    }
 
     const processedRooms = rooms.map(r => {
       const activeBooking = activeBookings.find(b => b.room_id === r.id);
+      const bookingId = activeBooking ? activeBooking.booking_id : null;
       return {
         id: r.id,
         number: r.number,
@@ -224,9 +239,9 @@ export const getStatus = async (req, res) => {
         arrival_from: activeBooking ? (activeBooking.arrival_from || '') : '',
         departure_to: activeBooking ? (activeBooking.departure_to || '') : '',
         user_id: activeBooking ? activeBooking.user_id : null,
-        booking_id: activeBooking ? activeBooking.booking_id : null,
+        booking_id: bookingId,
         booking_number: activeBooking ? activeBooking.booking_number : null,
-        ledger: ledgerMap[r.number] || []
+        ledger: (bookingId && ledgerByBookingId[bookingId]) ? ledgerByBookingId[bookingId] : []
       };
     });
 

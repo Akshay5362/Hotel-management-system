@@ -1,4 +1,29 @@
+/**
+ * ⚠️  WARNING — DESTRUCTIVE OPERATION  ⚠️
+ * ─────────────────────────────────────────────────────────────────────────────
+ * This file DROPS and recreates the entire database from scratch.
+ * Running it WILL DESTROY all existing data and migrations.
+ *
+ * DO NOT RUN THIS FILE UNLESS YOU INTEND TO RESET THE ENTIRE DATABASE.
+ *
+ * For schema changes, use the migration system instead:
+ *   npm run migrate          -> apply all pending migrations
+ *   npm run migrate:down     -> roll back the last migration
+ *   npm run migrate:status   -> show migration status
+ *
+ * To run anyway (e.g. fresh dev environment), you MUST explicitly set:
+ *   $env:FORCE_INIT_DB="yes"  (PowerShell)
+ *   FORCE_INIT_DB=yes         (bash/cmd)
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+if (process.env.FORCE_INIT_DB !== 'yes') {
+  console.error('\n  BLOCKED: init_db.js requires FORCE_INIT_DB=yes to run.');
+  console.error('  Use migration scripts instead: npm run migrate\n');
+  process.exit(1);
+}
+
 import mysql from 'mysql2/promise';
+
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';

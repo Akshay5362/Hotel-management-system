@@ -1,8 +1,9 @@
 import express from 'express';
-import { checkIn, checkOut, clean, addLedgerItem, shift, bookRoom, modifyCheckIn, guestRequestCheckIn, guestAddService, guestReportMaintenance, guestExtendStay, getGuestBill, getGuestNotifications, markNotificationRead, guestRequestCheckout, guestSubmitFeedback, getGuestHistory, getGuestHistoryAdmin, uploadIdentity } from '../controllers/roomController.js';
+import { checkIn, checkOut, clean, addLedgerItem, shift, bookRoom, modifyCheckIn, guestRequestCheckIn, guestAddService, guestReportMaintenance, guestExtendStay, getGuestBill, getGuestNotifications, markNotificationRead, guestRequestCheckout, guestSubmitFeedback, getGuestHistory, getGuestHistoryAdmin, uploadIdentity, getRefundPolicy, updateRefundPolicy, processRefundCheckout } from '../controllers/roomController.js';
 import { getStatus, runDayEnd, getGuestRequests, resolveGuestRequest, getGuestDocuments, verifyGuestDocument } from '../controllers/auditController.js';
 import { uploadIDDocument } from '../middleware/uploadMiddleware.js';
 import { signUp, signIn, authenticate, requireAdmin, requireGuest } from '../controllers/authController.js';
+import paymentRoutes from './paymentRoutes.js';
 
 const router = express.Router();
 
@@ -22,6 +23,11 @@ router.post('/rooms/:number/clean', authenticate, requireAdmin, clean);
 router.post('/rooms/:number/ledger', authenticate, requireAdmin, addLedgerItem);
 router.post('/rooms/shift', authenticate, requireAdmin, shift);
 router.post('/rooms/:number/book', authenticate, bookRoom);
+router.post('/rooms/:number/refund-checkout', authenticate, requireAdmin, processRefundCheckout);
+
+// Refund Policy routes (Admin only)
+router.get('/refund-policy', authenticate, requireAdmin, getRefundPolicy);
+router.put('/refund-policy', authenticate, requireAdmin, updateRefundPolicy);
 
 // Guest Portal Phase 2 routes (Guest-facing, no admin required)
 router.post('/guest/upload-id', authenticate, requireGuest, uploadIDDocument.single('document'), uploadIdentity);
@@ -44,6 +50,9 @@ router.post('/admin/guest-documents/:guestId/verify', authenticate, requireAdmin
 // Guest — History & Feedback (post-checkout)
 router.get('/guest/history', authenticate, requireGuest, getGuestHistory);
 router.post('/guest/feedback', authenticate, requireGuest, guestSubmitFeedback);
+
+// ── Payment Module (Phase 2) ────────────────────────────────────────────────
+router.use('/payments', paymentRoutes);
 
 export default router;
 

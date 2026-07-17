@@ -46,10 +46,10 @@ export const signUp = async (req, res) => {
     return res.status(400).json({ error: 'Full name is required' });
   }
 
-  const cleanUsername = username.trim().toLowerCase();
-  const cleanFullName = fullName.trim();
-  const cleanPhone = (phone || mobile || '').trim();
-  const userRole = 'guest'; // Guests cannot create admin accounts under any circumstance. Always force 'guest' role on signup.
+  const baseUsername   = username.trim().toLowerCase();
+  const cleanFullName  = fullName.trim();
+  const cleanPhone     = (phone || mobile || '').trim();
+  const userRole       = 'guest'; // Guests cannot create admin accounts
 
   let connection;
   try {
@@ -60,18 +60,36 @@ export const signUp = async (req, res) => {
     const [roles] = await connection.query("SELECT id FROM roles WHERE name = 'guest'");
     const roleId = roles[0]?.id || null;
 
-    const [result] = await connection.query(
-      `INSERT INTO users (username, password, fullName, phone, role_id) VALUES (?, ?, ?, ?, ?)`,
-      [cleanUsername, passwordHash, cleanFullName, cleanPhone, roleId]
-    );
-    const userId = result.insertId;
+    // ── Auto-resolve username collisions ───────────────────────────────────
+    // If 'amit' is taken, try 'amit2', 'amit3', ... 'amit10'.
+    // This means guests NEVER see a "username taken" error.
+    let cleanUsername = baseUsername;
+    let userId        = null;
+
+    for (let attempt = 0; attempt <= 10; attempt++) {
+      const tryName = attempt === 0 ? baseUsername : `${baseUsername}${attempt + 1}`;
+      try {
+        const [result] = await connection.query(
+          `INSERT INTO users (username, password, fullName, phone, role_id) VALUES (?, ?, ?, ?, ?)`,
+          [tryName, passwordHash, cleanFullName, cleanPhone, roleId]
+        );
+        cleanUsername = tryName;
+        userId        = result.insertId;
+        break; // success
+      } catch (dupErr) {
+        if (dupErr.code === 'ER_DUP_ENTRY' && attempt < 10) {
+          continue; // try next suffix
+        }
+        throw dupErr; // give up after 10 attempts or non-dup error
+      }
+    }
 
     await connection.query(
       `INSERT INTO guests (full_name, phone, user_id) VALUES (?, ?, ?)`,
       [cleanFullName, cleanPhone, userId]
     );
 
-    // Insert Audit Log entry
+    // Audit log
     await connection.query(
       `INSERT INTO audit_logs (user_id, action, details, business_date)
        VALUES (?, 'SIGNUP', ?, '11-Jul-2026')`,
@@ -99,14 +117,11 @@ export const signUp = async (req, res) => {
     });
   } catch (error) {
     if (connection) {
-      try {
-        await connection.rollback();
-      } catch (rollbackError) {
-        console.error('Rollback failed:', rollbackError);
-      }
+      try { await connection.rollback(); } catch (e) { console.error('Rollback failed:', e); }
     }
     if (error.code === 'ER_DUP_ENTRY') {
-      return res.status(400).json({ error: 'Username is already taken' });
+      // At this point only a phone/other unique column collision remains
+      return res.status(400).json({ error: 'An account with this phone number already exists. Try signing in instead.' });
     }
     console.error('Error during signUp:', error);
     res.status(500).json({ error: 'Internal Server Error' });

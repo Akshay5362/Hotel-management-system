@@ -13,6 +13,7 @@ import ModifyCheckInModal from './components/ModifyCheckInModal';
 import UpcomingReservationsModal from './components/UpcomingReservationsModal';
 import GuestRequestsModal from './components/GuestRequestsModal';
 import IdentityVerificationModal from './components/IdentityVerificationModal';
+import RefundCheckoutModal from './components/RefundCheckoutModal';
 import { AdminAuthProvider, AdminAuthContext } from './contexts/AdminAuthContext';
 import { GuestAuthProvider, GuestAuthContext } from './contexts/GuestAuthContext';
 import { AdminProtectedRoute, GuestProtectedRoute } from './components/ProtectedRoutes';
@@ -170,6 +171,7 @@ function AppContent() {
   const [isLoading, setIsLoading] = useState(true);
   const [isBackendOnline, setIsBackendOnline] = useState(false);
   const [upcomingReservations, setUpcomingReservations] = useState([]);
+  const [refundPolicy, setRefundPolicy] = useState({ noStayPct: 100, partialStayPct: 50, fullStayPct: 0, partialHours: 12 });
 
   // Contexts
   const { guestUser, guestToken, login: guestLogin, logout: guestLogout, updateUser: updateGuestUser } = React.useContext(GuestAuthContext);
@@ -338,6 +340,35 @@ function AppContent() {
     return () => clearInterval(interval);
   }, [adminUser, adminToken, fetchRequestCount]);
 
+  // ── AUTO-POLL: Refresh full room grid every 20 seconds for admin ───────────────────
+  // This ensures new guest bookings appear without manual refresh.
+  const [lastSynced, setLastSynced] = useState(null);
+  const [isSyncing,  setIsSyncing]  = useState(false);
+
+  useEffect(() => {
+    if (!adminToken || !adminUser || adminUser.role !== 'admin') return;
+
+    const poll = async () => {
+      // Don't poll while a modal is open (to avoid data flickering mid-operation)
+      if (activeModal) return;
+      setIsSyncing(true);
+      try {
+        await fetchStatus();
+        setLastSynced(new Date());
+      } catch (e) {
+        // silent — fetchStatus handles its own error state
+      } finally {
+        setIsSyncing(false);
+      }
+    };
+
+    // Immediate first poll
+    poll();
+    const interval = setInterval(poll, 20000); // every 20 seconds
+    return () => clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adminToken, adminUser?.role, activeModal]);
+
 
   useEffect(() => {
     if (adminToken || guestToken) {
@@ -402,11 +433,16 @@ function AppContent() {
     } else if (freshRoom.status === 'occupied') {
       setActiveModal('checkout');
     } else if (freshRoom.status === 'booked') {
+      // Build a context-aware message about payment method
+      const paymentNote = freshRoom.payment_method === 'Cash' || !freshRoom.payment_method
+        ? `\n\n💵 This guest selected CASH payment. Confirm you have received \u20b9${freshRoom.deposit} cash at the reception before proceeding.`
+        : `\n\nPayment method: ${freshRoom.payment_method}`;
+
       const confirmed = await showConfirm(
-        `Guest ${freshRoom.guestName} has booked Room ${freshRoom.number} with a ₹${freshRoom.deposit} deposit. Check in this guest now?`,
-        'Guest Arrival',
-        'Yes',
-        'No'
+        `Guest ${freshRoom.guestName} has booked Room ${freshRoom.number} with a \u20b9${freshRoom.deposit} deposit.${paymentNote}\n\nCheck in this guest now?`,
+        'Guest Arrival — Confirm Check-In',
+        'Yes, Check In',
+        'Cancel'
       );
       if (confirmed) {
         checkInBookedGuest(freshRoom.number);
@@ -562,6 +598,20 @@ function AppContent() {
     if (!room) return;
 
     try {
+      // ─ Step 1: If cash payment is pending, confirm it now (admin receiving cash = confirmation) ─
+      if (room.booking_id) {
+        try {
+          await fetch(`http://localhost:5000/api/payments/booking/${room.booking_id}/confirm-cash`, {
+            method: 'PUT',
+            headers: { 'Authorization': `Bearer ${adminToken}` }
+          });
+          // Non-fatal: booking can still proceed even if confirm-cash has nothing to confirm
+        } catch (cashErr) {
+          console.warn('Cash confirm attempt failed (non-blocking):', cashErr.message);
+        }
+      }
+
+      // ─ Step 2: Admin check-in (room status -> occupied) ────────────────────────
       const res = await fetch(`http://localhost:5000/api/rooms/${roomNumber}/checkin`, {
         method: 'POST',
         headers: { 
@@ -618,6 +668,17 @@ function AppContent() {
       console.error('Error in checkOutGuest:', err);
       showAlert('Network error, please try again.', 'Connection Error');
     }
+  };
+
+  // Process refund cancellation checkout — called when RefundCheckoutModal succeeds
+  const processRefundCheckout = async (roomNumber, refundAmount) => {
+    await fetchStatus();
+    setActiveModal(null);
+    setSelectedRoom(null);
+    showAlert(
+      `Cancellation refund of Rs.${refundAmount.toLocaleString('en-IN')} processed for Room ${roomNumber}. Room is now marked as dirty.`,
+      'Refund Checkout Complete'
+    );
   };
 
   // Modify guest check-in details
@@ -945,6 +1006,28 @@ function AppContent() {
               <div className="time-box">
                 {currentTime}
               </div>
+              {/* Live sync indicator */}
+              <div
+                title={lastSynced ? `Last synced: ${lastSynced.toLocaleTimeString()}` : 'Syncing...'}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: '5px',
+                  fontSize: '0.7rem', color: isSyncing ? '#38bdf8' : (lastSynced ? '#4ade80' : '#fbbf24'),
+                  background: 'rgba(255,255,255,0.04)',
+                  border: `1px solid ${isSyncing ? 'rgba(56,189,248,0.2)' : 'rgba(74,222,128,0.15)'}`,
+                  padding: '3px 8px', borderRadius: '4px', cursor: 'default'
+                }}
+              >
+                <span style={{
+                  width: '6px', height: '6px', borderRadius: '50%',
+                  background: isSyncing ? '#38bdf8' : (lastSynced ? '#4ade80' : '#fbbf24'),
+                  boxShadow: isSyncing ? '0 0 6px #38bdf8' : (lastSynced ? '0 0 6px #4ade80' : 'none'),
+                  animation: isSyncing ? 'pulse 1s infinite' : 'none',
+                  display: 'inline-block'
+                }} />
+                {isSyncing ? 'Syncing...' : lastSynced
+                  ? `Synced ${Math.round((Date.now() - lastSynced) / 1000)}s ago`
+                  : 'Connecting...'}
+              </div>
               <div className="user-badge" data-tooltip={isBackendOnline ? "System Sync Active (MySQL Connected)" : "Demo Mode (MySQL Disconnected)"}>
                 <span className="user-indicator" style={{ background: isBackendOnline ? 'var(--color-booked)' : 'var(--color-occupied)', boxShadow: isBackendOnline ? '0 0 8px var(--color-booked)' : '0 0 8px var(--color-occupied)' }}></span>
                 <span style={{ fontSize: '0.8rem', fontWeight: '600' }}>
@@ -1000,6 +1083,7 @@ function AppContent() {
             onCheckOut={checkOutGuest}
             onAddLedgerItem={addLedgerItem}
             onModifyClick={() => setActiveModal('modify_checkin')}
+            onRefundClick={() => setActiveModal('refund_checkout')}
             showAlert={showAlert}
             showConfirm={showConfirm}
           />
@@ -1056,6 +1140,16 @@ function AppContent() {
             onClose={() => setActiveModal(null)}
             token={adminToken}
             rooms={rooms}
+          />
+
+          <RefundCheckoutModal
+            isOpen={activeModal === 'refund_checkout'}
+            onClose={() => setActiveModal('checkout')}
+            room={selectedRoom}
+            token={adminToken}
+            onRefundComplete={processRefundCheckout}
+            showAlert={showAlert}
+            showConfirm={showConfirm}
           />
         </div>
       </AdminProtectedRoute>

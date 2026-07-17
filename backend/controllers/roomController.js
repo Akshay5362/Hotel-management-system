@@ -635,9 +635,9 @@ export const bookRoom = async (req, res) => {
   }
 
   const { idDocumentPath, idOcrText } = req.body;
-  if (!idDocumentPath) {
-    return res.status(400).json({ success: false, message: 'Identity document scan upload is required' });
-  }
+  // Document upload is optional — guest may show ID offline at reception.
+  // If no document is uploaded, id_verification_status is set to 'Offline' below.
+
 
   // Obtain user ID from authenticated request context
   const resolvedUserId = req.user?.id || userId;
@@ -730,18 +730,27 @@ export const bookRoom = async (req, res) => {
       guestId = guestRows[0].id;
       loyaltyTier = guestRows[0].loyalty_tier || 'Bronze';
       loyaltyPoints = guestRows[0].loyalty_points || 0;
-      // Update their profile details
+      // Update their profile details.
+      // id_verification_status: 'Pending' if document uploaded for OCR, 'Offline' if guest will show ID in person.
+      const verificationStatus = idDocumentPath ? 'Pending' : 'Offline';
       await connection.query(
         `UPDATE guests 
-         SET full_name = ?, phone = ?, email = ?, gender = ?, age = ?, id_type = ?, government_id = ?, id_document_path = ?, id_upload_timestamp = NOW(), id_verification_status = 'Pending', id_ocr_text = ?
+         SET full_name = ?, phone = ?, email = ?, gender = ?, age = ?, id_type = ?, government_id = ?,
+             id_document_path = ?, id_upload_timestamp = CASE WHEN ? IS NOT NULL AND ? != '' THEN NOW() ELSE id_upload_timestamp END,
+             id_verification_status = ?, id_ocr_text = ?
          WHERE id = ?`,
-        [guestNameUpper, phone || '', email || '', gender || '', age ? parseInt(age, 10) : null, idType || '', governmentId || '', idDocumentPath, idOcrText || '', guestId]
+        [guestNameUpper, phone || '', email || '', gender || '', age ? parseInt(age, 10) : null, idType || '', governmentId || '',
+         idDocumentPath || null, idDocumentPath || null, idDocumentPath || null,
+         verificationStatus, idOcrText || '', guestId]
       );
     } else {
+      const newVerificationStatus = idDocumentPath ? 'Pending' : 'Offline';
       const [newGuestRes] = await connection.query(
         `INSERT INTO guests (full_name, phone, email, gender, age, id_type, government_id, id_document_path, id_upload_timestamp, id_verification_status, id_ocr_text, user_id, loyalty_tier, loyalty_points) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), 'Pending', ?, ?, 'Bronze', 0)`,
-        [guestNameUpper, phone || '', email || '', gender || '', age ? parseInt(age, 10) : null, idType || '', governmentId || '', idDocumentPath, idOcrText || '', parsedUserId]
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NOT NULL THEN NOW() ELSE NULL END, ?, ?, ?, 'Bronze', 0)`,
+        [guestNameUpper, phone || '', email || '', gender || '', age ? parseInt(age, 10) : null, idType || '', governmentId || '',
+         idDocumentPath || null, idDocumentPath || null,
+         newVerificationStatus, idOcrText || '', parsedUserId]
       );
       guestId = newGuestRes.insertId;
     }
@@ -1079,6 +1088,24 @@ export const guestRequestCheckIn = async (req, res) => {
       return res.status(404).json({ error: 'No upcoming reservation found' });
     }
     const booking = bookingRows[0];
+
+    // ── Payment Guard: block self check-in if cash not yet confirmed ────────
+    const [pendingPayment] = await connection.query(
+      `SELECT id, amount, payment_method FROM payments
+       WHERE booking_id    = ?
+         AND payment_method = 'Cash'
+         AND payment_status = 'Pending'
+       LIMIT 1`,
+      [booking.id]
+    );
+    if (pendingPayment.length > 0) {
+      await connection.rollback();
+      return res.status(403).json({
+        error: 'Cash payment not yet confirmed.',
+        message: `Your advance cash payment of ₹${pendingPayment[0].amount} has not been confirmed by the reception yet. Please visit the front desk with your cash, and once the staff confirms receipt your Check In will be enabled.`,
+        code: 'CASH_PAYMENT_PENDING'
+      });
+    }
 
     const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
     const businessDate = settings[0]?.value_val || new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
@@ -1645,5 +1672,217 @@ export const uploadIdentity = async (req, res) => {
     console.error('OCR Process Error:', error);
     try { if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); } catch(e) {}
     res.status(500).json({ success: false, message: 'Internal Server Error during document verification.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REFUND POLICY — Admin-configurable cancellation refund settings
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** GET /api/refund-policy  — return the 4 refund policy keys */
+export const getRefundPolicy = async (req, res) => {
+  try {
+    const keys = ['refund_no_stay_pct', 'refund_partial_stay_pct', 'refund_full_stay_pct', 'refund_partial_hours'];
+    const [rows] = await pool.query(
+      'SELECT key_name, value_val FROM system_settings WHERE key_name IN (?)',
+      [keys]
+    );
+    const policy = {};
+    rows.forEach(r => { policy[r.key_name] = parseFloat(r.value_val); });
+    // Provide safe defaults if keys are missing
+    res.json({
+      noStayPct:      policy['refund_no_stay_pct']      ?? 100,
+      partialStayPct: policy['refund_partial_stay_pct'] ?? 50,
+      fullStayPct:    policy['refund_full_stay_pct']    ?? 0,
+      partialHours:   policy['refund_partial_hours']    ?? 12
+    });
+  } catch (error) {
+    console.error('Error in getRefundPolicy:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+/** PUT /api/refund-policy  — update the 4 refund policy keys (admin only) */
+export const updateRefundPolicy = async (req, res) => {
+  const { noStayPct, partialStayPct, fullStayPct, partialHours } = req.body;
+
+  // Validation
+  const vals = [noStayPct, partialStayPct, fullStayPct, partialHours];
+  if (vals.some(v => v === undefined || v === null || isNaN(parseFloat(v)))) {
+    return res.status(400).json({ error: 'All four refund policy values are required and must be numeric' });
+  }
+  if ([noStayPct, partialStayPct, fullStayPct].some(v => parseFloat(v) < 0 || parseFloat(v) > 100)) {
+    return res.status(400).json({ error: 'Refund percentages must be between 0 and 100' });
+  }
+
+  try {
+    const updates = [
+      ['refund_no_stay_pct',      String(parseFloat(noStayPct))],
+      ['refund_partial_stay_pct', String(parseFloat(partialStayPct))],
+      ['refund_full_stay_pct',    String(parseFloat(fullStayPct))],
+      ['refund_partial_hours',    String(parseFloat(partialHours))]
+    ];
+    for (const [key, val] of updates) {
+      await pool.query(
+        'INSERT INTO system_settings (key_name, value_val) VALUES (?, ?) ON DUPLICATE KEY UPDATE value_val = ?',
+        [key, val, val]
+      );
+    }
+
+    const resolvedUserId = req.user?.id || null;
+    const [settings] = await pool.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
+    const businessDate = settings[0]?.value_val || '18-Jul-2026';
+    await pool.query(
+      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'UPDATE_REFUND_POLICY', ?, ?)`,
+      [resolvedUserId, `Refund policy updated: NoStay=${noStayPct}%, Partial=${partialStayPct}%, Full=${fullStayPct}%, PartialHrs=${partialHours}`, businessDate]
+    );
+
+    res.json({ message: 'Refund policy updated successfully' });
+  } catch (error) {
+    console.error('Error in updateRefundPolicy:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+/**
+ * POST /api/rooms/:number/refund-checkout
+ * Processes a cancellation refund checkout.
+ * Body: { refundAmount, reason }
+ * - Adds a "Cancellation Refund" negative ledger entry
+ * - Logs refund in cash_logs (negative payout)
+ * - Marks booking Checked Out with payment_status = 'Refunded'
+ * - Sets room to dirty
+ * - Audit log: REFUND_CHECKOUT
+ */
+export const processRefundCheckout = async (req, res) => {
+  const { number } = req.params;
+  const { refundAmount, reason } = req.body;
+
+  if (!number) {
+    return res.status(400).json({ error: 'Room number is required' });
+  }
+  const parsedRefund = parseFloat(refundAmount);
+  if (isNaN(parsedRefund) || parsedRefund < 0) {
+    return res.status(400).json({ error: 'Refund amount must be a non-negative number' });
+  }
+
+  const resolvedUserId = req.user?.id || null;
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    // Fetch room
+    const [roomRows] = await connection.query(`
+      SELECT r.*, rt.base_rate as rate, rt.code as type
+      FROM rooms r
+      JOIN room_types rt ON r.room_type_id = rt.id
+      WHERE r.number = ?
+    `, [number]);
+    if (roomRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: `Room ${number} not found` });
+    }
+    const room = roomRows[0];
+    if (room.status !== 'occupied') {
+      await connection.rollback();
+      return res.status(400).json({ error: `Room ${number} is not currently occupied` });
+    }
+
+    // Fetch active booking
+    const [bookingRows] = await connection.query(
+      `SELECT b.*, g.full_name as guestName, g.user_id as guestUserId
+       FROM bookings b
+       JOIN guests g ON b.guest_id = g.id
+       WHERE b.room_id = ? AND b.booking_status = 'Checked In'`,
+      [room.id]
+    );
+    if (bookingRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: `No active booking found for Room ${number}` });
+    }
+    const booking = bookingRows[0];
+
+    // Fetch system date
+    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
+    const businessDate = settings[0]?.value_val || '18-Jul-2026';
+
+    const timeStr = formatTime(new Date());
+    const refundReason = (reason || 'Guest Cancellation').trim();
+
+    // Post Cancellation Refund ledger entry (negative amount = credit to guest)
+    if (parsedRefund > 0) {
+      await connection.query(
+        'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
+        [number, `Cancellation Refund (${refundReason})`, -parsedRefund, businessDate, booking.id]
+      );
+
+      // Log refund payout in cash_logs (amount stored as positive, type indicates direction)
+      await connection.query(
+        `INSERT INTO cash_logs (time, room, guest, type, amount, business_date, booking_id)
+         VALUES (?, ?, ?, 'Cancellation Refund', ?, ?, ?)`,
+        [timeStr, number, booking.guestName, parsedRefund, businessDate, booking.id]
+      );
+
+      // Log in payments table as refund
+      await connection.query(
+        `INSERT INTO payments (booking_id, amount, payment_method, payment_type, business_date)
+         VALUES (?, ?, 'Cash', 'Cancellation Refund', ?)`,
+        [booking.id, -parsedRefund, businessDate]
+      );
+    }
+
+    // Mark booking as Checked Out with Refunded status
+    await connection.query(
+      `UPDATE bookings SET booking_status = 'Checked Out', payment_status = 'Refunded', check_out_date = ? WHERE id = ?`,
+      [businessDate, booking.id]
+    );
+
+    // Room status → dirty
+    await connection.query(`UPDATE rooms SET status = 'dirty' WHERE id = ?`, [room.id]);
+
+    // Room status history
+    await connection.query(
+      `INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date)
+       VALUES (?, 'occupied', 'dirty', ?, ?)`,
+      [room.id, resolvedUserId, businessDate]
+    );
+
+    // Audit log
+    await connection.query(
+      `INSERT INTO audit_logs (user_id, action, details, business_date)
+       VALUES (?, 'REFUND_CHECKOUT', ?, ?)`,
+      [resolvedUserId,
+       `Refund checkout for Room ${number}. Guest: ${booking.guestName}. Refund: ₹${parsedRefund}. Reason: ${refundReason}. Booking ID: ${booking.id}`,
+       businessDate]
+    );
+
+    // Increment today_checkouts
+    await connection.query(
+      `UPDATE system_settings SET value_val = CAST(CAST(value_val AS UNSIGNED) + 1 AS CHAR) WHERE key_name = 'today_checkouts'`
+    );
+
+    // Notify guest if they have a portal account
+    if (booking.guestUserId) {
+      await connection.query(
+        `INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)`,
+        [booking.guestUserId,
+         '💰 Cancellation Processed',
+         `Your cancellation for Room ${number} has been processed. A refund of ₹${parsedRefund} will be returned to you. Reason: ${refundReason}.`]
+      );
+    }
+
+    await connection.commit();
+    res.json({ message: `Refund checkout processed for Room ${number}. Refund: ₹${parsedRefund}` });
+
+  } catch (error) {
+    if (connection) {
+      try { await connection.rollback(); } catch (e) { console.error('Rollback error:', e); }
+    }
+    console.error('Error in processRefundCheckout:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
   }
 };
