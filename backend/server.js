@@ -23,6 +23,12 @@ app.get('/', (req, res) => {
   res.send('Webline PMS Plus Backend API is running!');
 });
 
+// Health check endpoint — used by wait-on in electron:dev workflow
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', service: 'hotel-pms-backend', port: PORT });
+});
+
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error('Global Error Handler:', err);

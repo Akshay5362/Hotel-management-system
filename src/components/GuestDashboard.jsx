@@ -120,8 +120,10 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
   const [postCheckoutTab, setPostCheckoutTab] = useState('feedback'); // 'feedback' | 'history'
 
   // Active stay for the current logged-in guest (excludes Checked Out / Cancelled)
-  const activeBooking = rooms.find(r => String(r.user_id) === String(user.id) && (r.status === 'booked' || r.status === 'occupied'));
+  const activeReservation = guestHistory?.bookings?.find(b => b.booking_status === 'Reserved' || b.booking_status === 'Checked In');
+  const activeBooking = activeReservation ? rooms.find(r => String(r.number) === String(activeReservation.room_number)) : null;
   const isOccupied = activeBooking?.status === 'occupied';
+
   // Recently checked-out bookings (no active stay, but has a checkedout booking)
   const hasCheckedOut = !activeBooking && guestHistory?.bookings?.some(b => b.booking_status === 'Checked Out');
   const latestCheckedOutBooking = guestHistory?.bookings?.find(b => b.booking_status === 'Checked Out');
@@ -176,8 +178,10 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
   // Also call fetchStatus on initial mount so stale room data is refreshed immediately
   useEffect(() => {
     fetchStatus(); // Ensure we have the latest room state on mount
+    if (token) loadGuestHistory(); // Always load guest history to check for active bookings accurately
     if (isOccupied) loadNotifications();
-  }, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
 
   // Phase 3: Load guest history when no active booking (post-checkout state)
   const loadGuestHistory = useCallback(async () => {
@@ -209,19 +213,15 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
   // immediately load their history so the post-checkout screen appears.
   const prevIsOccupied = React.useRef(isOccupied);
   useEffect(() => {
-    if (prevIsOccupied.current === true && !isOccupied && !activeBooking) {
+    if (prevIsOccupied.current === true && !isOccupied) {
       // Just transitioned out of occupied — checkout happened on admin side
       loadGuestHistory();
       setPostCheckoutTab('feedback');
     }
     prevIsOccupied.current = isOccupied;
-  }, [isOccupied, activeBooking]);
+  }, [isOccupied, loadGuestHistory]);
 
-  useEffect(() => {
-    if (!activeBooking && token) {
-      loadGuestHistory();
-    }
-  }, [activeBooking, token]);
+  // We no longer need this separate useEffect because loadGuestHistory is called on mount with token.
 
 
   // Phase 3: Submit feedback
@@ -1048,7 +1048,11 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
   };
 
   const handleFinishConfirmation = async () => {
-    try { await fetchStatus(); } catch (e) { console.error('fetchStatus error on finish:', e); }
+    try { 
+      await Promise.all([fetchStatus(), loadGuestHistory()]); 
+    } catch (e) { 
+      console.error('fetch error on finish:', e); 
+    }
     setSelectedRoomNumber(null);
     setSelectedCategory('ALL');
     setFilterCapacity('1');
@@ -1069,8 +1073,8 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
   };
 
   // Calculations for billing statement display
-  const activeSubtotal = activeBooking ? activeBooking.ledger.reduce((sum, item) => sum + item.amount, 0) : 0;
-  const activeBookingDeposit = activeBooking ? activeBooking.deposit || 0 : 0;
+  const activeSubtotal = activeBooking ? liveBill?.ledger || [].reduce((sum, item) => sum + item.amount, 0) : 0;
+  const activeBookingDeposit = activeBooking ? activeReservation?.advance_amount || 0 : 0;
   const activeBalance = activeSubtotal - activeBookingDeposit;
 
   return (
@@ -1118,6 +1122,18 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
       </header>
 
       {/* ═══════════════════════════════════════════════════════════════════════
+          INITIALIZATION LOADING STATE
+      ═══════════════════════════════════════════════════════════════════════ */}
+      {(historyLoading || (activeReservation && !activeBooking)) && (
+        <main style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '16px' }}>
+          <div style={{ fontSize: '3rem', animation: 'pulse 1.5s infinite' }}>⏳</div>
+          <p style={{ color: 'var(--text-muted)', fontSize: '0.95rem', fontWeight: '600', letterSpacing: '0.5px' }}>
+            Loading your dashboard...
+          </p>
+        </main>
+      )}
+
+      {/* ═══════════════════════════════════════════════════════════════════════
           PHASE 2: GUEST CHECK-IN LANDING (status === 'booked') 
       ═══════════════════════════════════════════════════════════════════════ */}
       {activeBooking && activeBooking.status === 'booked' && wizardStep !== 6 && (
@@ -1139,14 +1155,14 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
               </h2>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '16px', marginBottom: '28px' }}>
                 {[
-                  { label: 'BOOKING NO', value: activeBooking.bookingNumber || '—' },
+                  { label: 'BOOKING NO', value: activeReservation?.booking_number || '—' },
                   { label: 'ROOM', value: `Room ${activeBooking.number} (${activeBooking.type})` },
-                  { label: 'GUEST NAME', value: activeBooking.guestName || user.fullName },
-                  { label: 'CHECK-IN DATE', value: activeBooking.checkInDate || '—' },
-                  { label: 'CHECK-OUT DATE', value: activeBooking.expectedCheckOutDate || '—' },
-                  { label: 'PAX', value: `${activeBooking.pax || 1} Guest(s)` },
-                  { label: 'DEPOSIT PAID', value: `₹ ${(activeBooking.deposit || 0).toLocaleString('en-IN')}` },
-                  { label: 'BASE RATE', value: `₹ ${(activeBooking.rate || 0).toLocaleString('en-IN')} / Night` },
+                  { label: 'GUEST NAME', value: guestHistory?.guest?.full_name || user.fullName },
+                  { label: 'CHECK-IN DATE', value: activeReservation?.check_in_date?.split('T')[0] || '—' },
+                  { label: 'CHECK-OUT DATE', value: activeReservation?.expected_check_out_date?.split('T')[0] || '—' },
+                  { label: 'PAX', value: `${activeReservation?.adults || 1} Guest(s)` },
+                  { label: 'DEPOSIT PAID', value: `₹ ${(activeReservation?.advance_amount || 0).toLocaleString('en-IN')}` },
+                  { label: 'BASE RATE', value: `₹ ${(liveBill?.booking?.base_rate || 0).toLocaleString('en-IN')} / Night` },
                 ].map(({ label, value }) => (
                   <div key={label} style={{ background: 'rgba(255,255,255,0.03)', borderRadius: '8px', padding: '14px', border: '1px solid rgba(255,255,255,0.05)' }}>
                     <p style={{ fontSize: '0.7rem', color: 'var(--text-muted)', letterSpacing: '0.8px', marginBottom: '4px', textTransform: 'uppercase' }}>{label}</p>
@@ -1295,11 +1311,11 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px' }}>
                   {[
                     { icon: '🏨', label: 'ROOM', value: `Room ${activeBooking.number}`, sub: activeBooking.type },
-                    { icon: '📋', label: 'BOOKING NO', value: activeBooking.bookingNumber || '—', sub: '' },
-                    { icon: '📅', label: 'CHECK-IN', value: activeBooking.checkInDate || '—', sub: '' },
-                    { icon: '🚪', label: 'CHECKOUT', value: activeBooking.expectedCheckOutDate || '—', sub: '' },
-                    { icon: '👥', label: 'GUESTS', value: `${activeBooking.pax || 1} Person(s)`, sub: '' },
-                    { icon: '💰', label: 'DEPOSIT PAID', value: `₹ ${(activeBooking.deposit || 0).toLocaleString('en-IN')}`, sub: '' },
+                    { icon: '📋', label: 'BOOKING NO', value: activeReservation?.booking_number || '—', sub: '' },
+                    { icon: '📅', label: 'CHECK-IN', value: activeReservation?.check_in_date?.split('T')[0] || '—', sub: '' },
+                    { icon: '🚪', label: 'CHECKOUT', value: activeReservation?.expected_check_out_date?.split('T')[0] || '—', sub: '' },
+                    { icon: '👥', label: 'GUESTS', value: `${activeReservation?.adults || 1} Person(s)`, sub: '' },
+                    { icon: '💰', label: 'DEPOSIT PAID', value: `₹ ${(activeReservation?.advance_amount || 0).toLocaleString('en-IN')}`, sub: '' },
                   ].map(({ icon, label, value, sub }) => (
                     <div key={label} className="glass" style={{ borderRadius: '12px', padding: '18px', border: '1px solid rgba(255,255,255,0.06)', display: 'flex', flexDirection: 'column', gap: '6px' }}>
                       <span style={{ fontSize: '1.4rem' }}>{icon}</span>
@@ -1757,7 +1773,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                 <div className="glass" style={{ borderRadius: '12px', padding: '28px', border: '1px solid rgba(255,255,255,0.07)', maxWidth: '500px' }}>
                   <div style={{ marginBottom: '20px', padding: '16px', background: 'rgba(56,189,248,0.06)', border: '1px solid rgba(56,189,248,0.2)', borderRadius: '8px' }}>
                     <p style={{ color: 'var(--text-muted)', fontSize: '0.78rem', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>CURRENT CHECKOUT DATE</p>
-                    <p style={{ fontWeight: '800', color: '#38bdf8', fontSize: '1.1rem' }}>{activeBooking.expectedCheckOutDate || '—'}</p>
+                    <p style={{ fontWeight: '800', color: '#38bdf8', fontSize: '1.1rem' }}>{activeReservation?.expected_check_out_date?.split('T')[0] || '—'}</p>
                   </div>
 
                   <form onSubmit={handleExtendStay} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
@@ -1767,7 +1783,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                         type="date"
                         value={extendDate}
                         onChange={e => setExtendDate(e.target.value)}
-                        min={activeBooking.expectedCheckOutDate || new Date().toISOString().split('T')[0]}
+                        min={activeReservation?.expected_check_out_date?.split('T')[0] || new Date().toISOString().split('T')[0]}
                         style={{ width: '100%', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '8px', padding: '12px 14px', color: '#fff', fontSize: '0.95rem', fontFamily: 'inherit', boxSizing: 'border-box' }}
                       />
                     </div>
@@ -1794,7 +1810,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
       {/* ═══════════════════════════════════════════════════════════════════════
           PHASE 3: POST-CHECKOUT SCREEN (no active stay + has booking history)
       ═══════════════════════════════════════════════════════════════════════ */}
-      {!activeBooking && hasCheckedOut && (
+      {!historyLoading && !activeReservation && hasCheckedOut && (
         <main style={{ flex: 1, overflow: 'auto', padding: '0' }}>
           {/* Top Tab Nav */}
           <div style={{ borderBottom: '1px solid rgba(255,255,255,0.06)', background: 'rgba(0,0,0,0.4)', padding: '0 2rem', display: 'flex', gap: '4px' }}>
@@ -2093,7 +2109,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
       {/* ═══════════════════════════════════════════════════════════════════════
           ORIGINAL BOOKING WIZARD (show when no active stay AND no prior history)
       ═══════════════════════════════════════════════════════════════════════ */}
-      {!activeBooking && !hasCheckedOut && (
+      {!historyLoading && !activeReservation && !hasCheckedOut && (
         <main style={{ flex: 1, padding: '2rem', maxWidth: '1400px', width: '100%', margin: '0 auto', display: 'grid', gridTemplateColumns: '1fr', gap: '2rem' }}>
 
         
@@ -2117,15 +2133,15 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
               </div>
               <div>
                 <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>CHECK-IN DATE</p>
-                <p style={{ fontWeight: '700', color: '#fff' }}>{activeBooking.checkInDate}</p>
+                <p style={{ fontWeight: '700', color: '#fff' }}>{activeReservation?.check_in_date?.split('T')[0]}</p>
               </div>
               <div>
                 <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>GUESTS COUNT (PAX)</p>
-                <p style={{ fontWeight: '700', color: '#fff' }}>{activeBooking.pax} Person(s)</p>
+                <p style={{ fontWeight: '700', color: '#fff' }}>{activeReservation?.adults} Person(s)</p>
               </div>
               <div>
                 <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>BASE RATE</p>
-                <p style={{ fontWeight: '700', color: '#fff' }}>₹ {activeBooking.rate} / Night</p>
+                <p style={{ fontWeight: '700', color: '#fff' }}>₹ {liveBill?.booking?.base_rate} / Night</p>
               </div>
             </div>
 
@@ -2144,7 +2160,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                     </tr>
                   </thead>
                   <tbody>
-                    {activeBooking.ledger.map((item, index) => (
+                    {liveBill?.ledger || [].map((item, index) => (
                       <tr key={item.id || index} style={{ borderBottom: '1px solid rgba(255,255,255,0.02)' }}>
                         <td style={{ padding: '8px 0' }}>{item.desc}</td>
                         <td style={{ textAlign: 'center' }}>{item.qty || 1}</td>

@@ -1,12 +1,50 @@
 {
-  "name": "hotel-pms-frontend",
+  "name": "webline-pms",
+  "productName": "Webline PMS",
+  "author": {
+    "name": "Webline",
+    "email": "info@webline.com"
+  },
+  "description": "Professional Hotel Property Management System",
   "private": true,
   "version": "1.0.0",
   "type": "module",
+  "main": "electron/main.js",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "backend:dev": "cd backend && node server.js",
+    "electron:start": "cross-env NODE_ENV=development electron .",
+    "electron:wait": "wait-on http://localhost:5173 http://localhost:5000/api/health --timeout 60000 && npm run electron:start",
+    "electron:dev": "concurrently --kill-others --names \"VITE,BACKEND,ELECTRON\" --prefix-colors \"cyan.bold,yellow.bold,magenta.bold\" --prefix \"[{name}]\" \"npm run dev\" \"npm run backend:dev\" \"npm run electron:wait\"",
+    "electron:prod": "npm run build && cross-env NODE_ENV=production electron .",
+    "electron:build": "npm run build && electron-builder"
+  },
+  "build": {
+    "appId": "com.webline.pms",
+    "productName": "Webline PMS",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": ["nsis"],
+      "icon": "assets/icons/icon.ico",
+      "publisherName": "Webline"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Webline PMS",
+      "installerIcon": "assets/icons/installer-icon.bmp"
+    }
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -16,7 +54,11 @@
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^10.0.3",
+    "cross-env": "^10.1.0",
     "electron": "^43.1.1",
-    "vite": "^5.3.1"
+    "electron-builder": "^26.15.3",
+    "vite": "^5.3.1",
+    "wait-on": "^9.0.10"
   }
 }

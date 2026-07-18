@@ -50,6 +50,7 @@ export const checkIn = async (req, res) => {
       FROM rooms r
       JOIN room_types rt ON r.room_type_id = rt.id
       WHERE r.number = ?
+      FOR UPDATE
     `, [number]);
     if (roomRows.length === 0) {
       await connection.rollback();
@@ -69,16 +70,21 @@ export const checkIn = async (req, res) => {
     let guestId;
     let bookingId;
 
-    if (room.status === 'booked') {
-      // Find pre-existing Reserved booking
-      const [bookingRows] = await connection.query(
-        "SELECT * FROM bookings WHERE room_id = ? AND booking_status = 'Reserved'",
-        [room.id]
-      );
-      if (bookingRows.length > 0) {
-        const booking = bookingRows[0];
-        guestId = booking.guest_id;
-        bookingId = booking.id;
+    // 1. Check for ANY existing active booking (Reserved or Checked In)
+    const [existingBookings] = await connection.query(
+      "SELECT id, booking_status, guest_id FROM bookings WHERE room_id = ? AND booking_status IN ('Reserved', 'Checked In') LIMIT 1",
+      [room.id]
+    );
+
+    if (existingBookings.length > 0) {
+      const existing = existingBookings[0];
+      if (existing.booking_status === 'Checked In') {
+        await connection.rollback();
+        return res.status(400).json({ error: `Room ${number} is already Checked In (Booking ID: ${existing.id}).` });
+      } else if (existing.booking_status === 'Reserved') {
+        // Automatically check them into this existing reservation
+        guestId = existing.guest_id;
+        bookingId = existing.id;
 
         // Update booking details to Checked In
         await connection.query(
@@ -215,6 +221,7 @@ export const checkOut = async (req, res) => {
       FROM rooms r
       JOIN room_types rt ON r.room_type_id = rt.id
       WHERE r.number = ?
+      FOR UPDATE
     `, [number]);
     if (roomRows.length === 0) {
       await connection.rollback();
@@ -465,6 +472,7 @@ export const shift = async (req, res) => {
       FROM rooms r
       JOIN room_types rt ON r.room_type_id = rt.id
       WHERE r.number = ?
+      FOR UPDATE
     `, [fromRoomNumber]);
     if (fromRooms.length === 0 || fromRooms[0].status !== 'occupied') {
       await connection.rollback();
@@ -477,12 +485,23 @@ export const shift = async (req, res) => {
       FROM rooms r
       JOIN room_types rt ON r.room_type_id = rt.id
       WHERE r.number = ?
+      FOR UPDATE
     `, [toRoomNumber]);
     if (toRooms.length === 0 || toRooms[0].status !== 'vacant') {
       await connection.rollback();
       return res.status(400).json({ error: `Target Room ${toRoomNumber} is not vacant` });
     }
     const targetRoom = toRooms[0];
+
+    // Ensure target room has no active bookings (strict 1-to-1)
+    const [targetActiveBookings] = await connection.query(
+      "SELECT id FROM bookings WHERE room_id = ? AND booking_status IN ('Reserved', 'Checked In') LIMIT 1",
+      [targetRoom.id]
+    );
+    if (targetActiveBookings.length > 0) {
+      await connection.rollback();
+      return res.status(400).json({ error: `Target Room ${toRoomNumber} already has an active reservation. Cannot shift here.` });
+    }
 
     // Find the active check-in booking
     const [bookings] = await connection.query(
@@ -663,6 +682,7 @@ export const bookRoom = async (req, res) => {
       FROM rooms r
       JOIN room_types rt ON r.room_type_id = rt.id
       WHERE r.number = ?
+      FOR UPDATE
     `, [number]);
     if (roomRows.length === 0) {
       await connection.rollback();
@@ -682,40 +702,20 @@ export const bookRoom = async (req, res) => {
       return res.status(400).json({ error: `Room ${number} is currently ${room.status} and cannot be booked` });
     }
 
-    // If room is 'booked' or 'vacant': check for date overlap with existing Reserved/Checked-In bookings
-    if (newCheckOut) {
-      // Query existing active bookings for this room that overlap with new date range
-      const [conflictRows] = await connection.query(`
-        SELECT id, check_in_date, expected_check_out_date, booking_status
-        FROM bookings
-        WHERE room_id = ?
-          AND booking_status IN ('Reserved', 'Checked In')
-      `, [room.id]);
+    // Strict 1-to-1 Mapping: A room must never have more than one active booking.
+    const [conflictRows] = await connection.query(`
+      SELECT booking_status
+      FROM bookings
+      WHERE room_id = ?
+        AND booking_status IN ('Reserved', 'Checked In')
+      LIMIT 1
+    `, [room.id]);
 
-      for (const existing of conflictRows) {
-        // Parse existing booking dates
-        const existingCheckIn = existing.check_in_date ? new Date(existing.check_in_date) : null;
-        const existingCheckOut = existing.expected_check_out_date ? new Date(existing.expected_check_out_date) : null;
-
-        if (!existingCheckIn) continue;
-
-        // Determine end bound for existing booking (use expected_check_out_date if set, else assume 1 night)
-        const existingEnd = existingCheckOut || new Date(existingCheckIn.getTime() + 86400000);
-
-        // Overlap check: [newCheckIn, newCheckOut) overlaps [existingCheckIn, existingEnd) iff
-        // newCheckIn < existingEnd AND newCheckOut > existingCheckIn
-        const hasOverlap = newCheckIn < existingEnd && newCheckOut > existingCheckIn;
-        if (hasOverlap) {
-          await connection.rollback();
-          return res.status(400).json({
-            error: `Room ${number} is already reserved from ${existing.check_in_date} to ${existing.expected_check_out_date || 'check-out date'}. Please choose different dates or another room.`
-          });
-        }
-      }
-    } else if (room.status === 'booked') {
-      // No checkOutDate provided and room is booked – block to be safe
+    if (conflictRows.length > 0) {
       await connection.rollback();
-      return res.status(400).json({ error: `Room ${number} is already booked. Please provide your check-out date for us to verify availability.` });
+      return res.status(400).json({ 
+        error: `Room ${number} already has an active reservation (${conflictRows[0].booking_status}). Please choose another room.` 
+      });
     }
 
     const guestNameUpper = guestName.trim().toUpperCase();
@@ -1779,6 +1779,7 @@ export const processRefundCheckout = async (req, res) => {
       FROM rooms r
       JOIN room_types rt ON r.room_type_id = rt.id
       WHERE r.number = ?
+      FOR UPDATE
     `, [number]);
     if (roomRows.length === 0) {
       await connection.rollback();

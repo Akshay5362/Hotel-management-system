@@ -275,7 +275,7 @@ function AppContent() {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
 
-      const res = await fetch('http://localhost:5000/api/status', { 
+      const res = await fetch(`http://localhost:5000/api/status?_t=${new Date().getTime()}`, { 
         signal: controller.signal,
         headers: {
           'Authorization': `Bearer ${currentToken}`
