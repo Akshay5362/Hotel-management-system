@@ -1,11 +1,14 @@
 import express from 'express';
-import { checkIn, checkOut, clean, addLedgerItem, shift, bookRoom, modifyCheckIn, guestRequestCheckIn, guestAddService, guestReportMaintenance, guestExtendStay, getGuestBill, getGuestNotifications, markNotificationRead, guestRequestCheckout, guestSubmitFeedback, getGuestHistory, getGuestHistoryAdmin, uploadIdentity, getRefundPolicy, updateRefundPolicy, processRefundCheckout } from '../controllers/roomController.js';
+import { checkIn, checkOut, clean, addLedgerItem, shift, bookRoom, modifyCheckIn, guestRequestCheckIn, guestAddService, guestReportMaintenance, guestExtendStay, getGuestBill, getGuestNotifications, markNotificationRead, guestRequestCheckout, guestSubmitFeedback, getGuestHistory, getGuestHistoryAdmin, uploadIdentity, getRefundPolicy, updateRefundPolicy, processRefundCheckout, getPublicRooms } from '../controllers/roomController.js';
 import { getStatus, runDayEnd, getGuestRequests, resolveGuestRequest, getGuestDocuments, verifyGuestDocument } from '../controllers/auditController.js';
 import { uploadIDDocument } from '../middleware/uploadMiddleware.js';
 import { signUp, signIn, authenticate, requireAdmin, requireGuest } from '../controllers/authController.js';
 import paymentRoutes from './paymentRoutes.js';
 
 const router = express.Router();
+
+// Public routes
+router.get('/public/rooms', getPublicRooms);
 
 // Auth routes
 router.post('/auth/signup', signUp);

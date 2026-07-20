@@ -132,21 +132,35 @@ export const checkIn = async (req, res) => {
       );
     }
 
-    // Insert cash log transaction if deposit paid
+    // Insert payment/cash log transaction if deposit paid
     if (parsedDeposit > 0) {
-      const timeStr = formatTime(new Date());
-      await connection.query(
-        `INSERT INTO cash_logs (time, room, guest, type, amount, business_date, booking_id)
-         VALUES (?, ?, ?, 'Advance Deposit', ?, ?, ?)`,
-        [timeStr, number, guestNameUpper, parsedDeposit, businessDate, bookingId]
-      );
+      if (paymentMethod !== 'Cash') {
+        // Link razorpay transaction
+        await connection.query(
+          "UPDATE razorpay_transactions SET booking_id = ? WHERE id = ?",
+          [bookingId, transactionId]
+        );
+        // Log Payment transaction as Razorpay
+        await connection.query(
+          `INSERT INTO payments (booking_id, amount, payment_method, payment_type, business_date)
+           VALUES (?, ?, 'Razorpay', 'Advance Deposit', ?)`,
+          [bookingId, parsedDeposit, businessDate]
+        );
+      } else {
+        const timeStr = formatTime(new Date());
+        await connection.query(
+          `INSERT INTO cash_logs (time, room, guest, type, amount, business_date, booking_id)
+           VALUES (?, ?, ?, 'Advance Deposit', ?, ?, ?)`,
+          [timeStr, number, guestNameUpper, parsedDeposit, businessDate, bookingId]
+        );
 
-      // Log Payment transaction
-      await connection.query(
-        `INSERT INTO payments (booking_id, amount, payment_method, payment_type, business_date)
-         VALUES (?, ?, 'Cash', 'Advance Deposit', ?)`,
-        [bookingId, parsedDeposit, businessDate]
-      );
+        // Log Payment transaction as Cash
+        await connection.query(
+          `INSERT INTO payments (booking_id, amount, payment_method, payment_type, business_date)
+           VALUES (?, ?, 'Cash', 'Advance Deposit', ?)`,
+          [bookingId, parsedDeposit, businessDate]
+        );
+      }
     }
 
     // Update Room Status History
@@ -187,7 +201,7 @@ export const checkIn = async (req, res) => {
       }
     }
     console.error('Error during checkin controller:', error);
-    res.status(500).json({ error: 'Internal Server Error' });
+    res.status(500).json({ error: error.message, stack: error.stack });
   } finally {
     if (connection) {
       connection.release();
@@ -610,7 +624,9 @@ export const bookRoom = async (req, res) => {
     checkOutDate,
     userId, 
     extraGuests, 
-    extraServices 
+    extraServices,
+    paymentMethod,
+    transactionId
   } = req.body;
 
   // Input Validation
@@ -690,6 +706,35 @@ export const bookRoom = async (req, res) => {
     }
 
     const room = roomRows[0];
+
+    // Razorpay Online Payment Validation
+    if (paymentMethod !== 'Cash') {
+      if (!transactionId) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'Transaction ID is required for online payments.' });
+      }
+      const [txnRows] = await connection.query(
+        "SELECT id, amount, status, booking_id FROM razorpay_transactions WHERE id = ? FOR UPDATE",
+        [transactionId]
+      );
+      if (txnRows.length === 0) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'Invalid transaction ID.' });
+      }
+      const txn = txnRows[0];
+      if (txn.status !== 'SUCCESS') {
+        await connection.rollback();
+        return res.status(400).json({ error: 'Payment was not successful.' });
+      }
+      if (txn.booking_id !== null) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'Payment already consumed by another booking.' });
+      }
+      if (txn.amount < parsedDeposit) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'Paid amount is less than the required deposit.' });
+      }
+    }
 
     // Determine effective check-in and check-out dates for overlap detection
     // Dates from client are ISO format (YYYY-MM-DD); convert for comparison
@@ -1882,6 +1927,44 @@ export const processRefundCheckout = async (req, res) => {
       try { await connection.rollback(); } catch (e) { console.error('Rollback error:', e); }
     }
     console.error('Error in processRefundCheckout:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+export const getPublicRooms = async (req, res) => {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const [rooms] = await connection.query(`
+      SELECT 
+        rt.id as category_id,
+        rt.code as category,
+        rt.title,
+        rt.description,
+        rt.base_rate as price,
+        rt.image,
+        COUNT(r.id) as total_rooms,
+        SUM(CASE WHEN r.status = 'VACANT' THEN 1 ELSE 0 END) as available_rooms
+      FROM room_types rt
+      JOIN rooms r ON r.room_type_id = rt.id
+      GROUP BY rt.id
+    `);
+    
+    // Map data to match what the frontend expects
+    const formattedRooms = rooms.map(r => ({
+      id: r.category_id,
+      type: r.category,
+      price: parseFloat(r.price),
+      capacity: r.capacity || 2,
+      image: r.image || 'https://images.unsplash.com/photo-1611892440504-42a792e24d32?auto=format&fit=crop&q=80&w=800',
+      available: r.available_rooms > 0
+    }));
+
+    res.json(formattedRooms);
+  } catch (error) {
+    console.error('Error fetching public rooms:', error);
     res.status(500).json({ error: 'Internal Server Error' });
   } finally {
     if (connection) connection.release();

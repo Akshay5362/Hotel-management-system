@@ -10,9 +10,14 @@
 
 import express from 'express';
 import { finalizePayment, getPaymentsByBooking, getMyPayments, confirmCashPayment, getGuestPaymentStatus } from '../controllers/paymentController.js';
+import { createRazorpayOrder, verifyRazorpayPayment } from '../controllers/razorpayController.js';
 import { authenticate, requireGuest, requireAdmin } from '../controllers/authController.js';
 
 const router = express.Router();
+
+// ── Razorpay Online Payments ───────────────────────────────────────────────
+router.post('/razorpay/order', authenticate, requireGuest, createRazorpayOrder);
+router.post('/razorpay/verify', authenticate, requireGuest, verifyRazorpayPayment);
 
 // ── Guest-facing ───────────────────────────────────────────────────────────
 

@@ -351,9 +351,9 @@ function WalletPanel({ color }) {
 function CashPanel({ amount }) {
   const steps = [
     'Your booking is confirmed after clicking "Confirm Booking".',
-    'Pay at reception.',
-    'Reception staff will confirm payment.',
-    'Check-In activates after confirmation.',
+    'Visit the hotel reception desk on your check-in date.',
+    `Pay ₹${Number(amount || 0).toLocaleString('en-IN')} advance in cash to the front-desk staff.`,
+    'Staff confirms receipt → your Check In button activates instantly.',
   ];
   return (
     <div style={{
