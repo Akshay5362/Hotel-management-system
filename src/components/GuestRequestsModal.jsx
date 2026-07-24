@@ -4,6 +4,7 @@ const TYPE_CONFIG = {
   service: { label: 'Room Service', color: '#818cf8', bg: 'rgba(129,140,248,0.12)', border: 'rgba(129,140,248,0.3)', icon: '🛎️' },
   maintenance: { label: 'Maintenance', color: '#facc15', bg: 'rgba(250,204,21,0.1)', border: 'rgba(250,204,21,0.3)', icon: '🔧' },
   checkout_request: { label: 'Checkout Request', color: '#ef4444', bg: 'rgba(239,68,68,0.1)', border: 'rgba(239,68,68,0.3)', icon: '🚪' },
+  extension_request: { label: 'Stay Extension', color: '#22c55e', bg: 'rgba(34,197,94,0.1)', border: 'rgba(34,197,94,0.3)', icon: '⏳' },
 };
 
 export default function GuestRequestsModal({ isOpen, onClose, token, onRequestResolved }) {
@@ -33,18 +34,30 @@ export default function GuestRequestsModal({ isOpen, onClose, token, onRequestRe
   }, [token]);
 
   // Handle request resolution (acknowledge/complete)
-  const handleResolve = async (id) => {
+  const handleResolve = async (id, action = null) => {
     if (!token || resolvingId) return;
     setResolvingId(id);
     try {
-      const res = await fetch(`http://localhost:5000/api/admin/guest-requests/${id}/resolve`, {
+      let url = `http://localhost:5000/api/admin/guest-requests/${id}/resolve`;
+      let body = {};
+      
+      if (id.startsWith('ext_')) {
+        url = `http://localhost:5000/api/admin/guest-requests/extension/${id}/resolve`;
+        body = { action }; // 'approve' or 'reject'
+      }
+
+      const res = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
-        }
+        },
+        body: Object.keys(body).length > 0 ? JSON.stringify(body) : undefined
       });
       if (res.ok) {
+        const data = await res.json();
+        if (data.message) alert(data.message);
+        
         // Instantly reload local modal requests list silently
         await fetchRequests(true);
         // Instantly refresh the parent toolbar requests badge count
@@ -65,8 +78,15 @@ export default function GuestRequestsModal({ isOpen, onClose, token, onRequestRe
   useEffect(() => {
     if (!isOpen) return;
     fetchRequests(false);
+
+    const handleRefresh = () => fetchRequests(true);
+    document.addEventListener('guest-request-refresh', handleRefresh);
+
     const interval = setInterval(() => fetchRequests(true), 15000);
-    return () => clearInterval(interval);
+    return () => {
+      document.removeEventListener('guest-request-refresh', handleRefresh);
+      clearInterval(interval);
+    };
   }, [isOpen, fetchRequests]);
 
   if (!isOpen) return null;
@@ -141,6 +161,7 @@ export default function GuestRequestsModal({ isOpen, onClose, token, onRequestRe
             { key: 'service', label: `🛎️ Services (${svcCount})`, color: '#818cf8' },
             { key: 'maintenance', label: `🔧 Maintenance (${mntCount})`, color: '#facc15' },
             { key: 'checkout_request', label: `🚪 Checkout (${coCount})`, color: '#ef4444' },
+            { key: 'extension_request', label: `⏳ Extension (${requests.filter(r => r.request_type === 'extension_request').length})`, color: '#22c55e' },
           ].map(tab => (
             <button key={tab.key} onClick={() => setFilter(tab.key)} style={{
               background: filter === tab.key ? 'rgba(255,255,255,0.08)' : 'transparent',
@@ -235,35 +256,63 @@ export default function GuestRequestsModal({ isOpen, onClose, token, onRequestRe
                         </div>
                       </div>
                     </div>
-
-                    {/* Acknowledge Button */}
-                    <button
-                      onClick={() => handleResolve(req.id)}
-                      disabled={resolvingId === req.id}
-                      style={{
-                        background: 'rgba(255,255,255,0.06)',
-                        border: '1px solid rgba(255,255,255,0.12)',
-                        borderRadius: '6px',
-                        padding: '6px 14px',
-                        color: cfg.color,
-                        fontWeight: '700',
-                        fontSize: '0.78rem',
-                        cursor: resolvingId === req.id ? 'not-allowed' : 'pointer',
-                        transition: 'all 0.2s',
-                        marginLeft: '12px',
-                        flexShrink: 0
-                      }}
-                      onMouseEnter={e => {
-                        e.currentTarget.style.background = cfg.bg;
-                        e.currentTarget.style.borderColor = cfg.color + '40';
-                      }}
-                      onMouseLeave={e => {
-                        e.currentTarget.style.background = 'rgba(255,255,255,0.06)';
-                        e.currentTarget.style.borderColor = 'rgba(255,255,255,0.12)';
-                      }}
-                    >
-                      {resolvingId === req.id ? '⏳ ...' : '✓ Acknowledge'}
-                    </button>
+                    
+                    {req.request_type === 'extension_request' ? (
+                      <div style={{ display: 'flex', gap: '8px' }}>
+                        <button
+                          onClick={() => handleResolve(req.id, 'approve')}
+                          disabled={resolvingId === req.id}
+                          className="btn-success"
+                          style={{
+                            padding: '6px 12px', fontSize: '0.85rem', flexShrink: 0,
+                            background: '#22c55e', color: '#fff', border: 'none', borderRadius: '6px',
+                            opacity: resolvingId === req.id ? 0.6 : 1, cursor: 'pointer'
+                          }}
+                        >
+                          {resolvingId === req.id ? '...' : '✅ Approve'}
+                        </button>
+                        <button
+                          onClick={() => handleResolve(req.id, 'reject')}
+                          disabled={resolvingId === req.id}
+                          className="btn-danger"
+                          style={{
+                            padding: '6px 12px', fontSize: '0.85rem', flexShrink: 0,
+                            background: '#ef4444', color: '#fff', border: 'none', borderRadius: '6px',
+                            opacity: resolvingId === req.id ? 0.6 : 1, cursor: 'pointer'
+                          }}
+                        >
+                          {resolvingId === req.id ? '...' : '❌ Reject'}
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => handleResolve(req.id)}
+                        disabled={resolvingId === req.id}
+                        style={{
+                          background: 'rgba(255,255,255,0.06)',
+                          border: '1px solid rgba(255,255,255,0.12)',
+                          borderRadius: '6px',
+                          padding: '6px 14px',
+                          color: cfg.color,
+                          fontWeight: '700',
+                          fontSize: '0.78rem',
+                          cursor: resolvingId === req.id ? 'not-allowed' : 'pointer',
+                          transition: 'all 0.2s',
+                          marginLeft: '12px',
+                          flexShrink: 0
+                        }}
+                        onMouseEnter={e => {
+                          e.currentTarget.style.background = cfg.bg;
+                          e.currentTarget.style.borderColor = cfg.color + '40';
+                        }}
+                        onMouseLeave={e => {
+                          e.currentTarget.style.background = 'rgba(255,255,255,0.06)';
+                          e.currentTarget.style.borderColor = 'rgba(255,255,255,0.12)';
+                        }}
+                      >
+                        {resolvingId === req.id ? '⏳ ...' : '✓ Acknowledge'}
+                      </button>
+                    )}
                   </div>
 
                 );

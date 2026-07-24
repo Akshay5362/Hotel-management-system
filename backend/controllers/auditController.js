@@ -1,4 +1,6 @@
 import pool from '../db.js';
+import fs from 'fs';
+import path from 'path';
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -32,7 +34,7 @@ function addDay(d) {
  * and resets today_checkins / today_checkouts counters — mirroring runDayEnd.
  */
 async function autoAdvanceToToday(connection) {
-  const [settings] = await connection.query('SELECT * FROM system_settings');
+  const [settings] = await connection.query('SELECT * FROM system_settings FOR UPDATE');
   const settingsMap = {};
   settings.forEach(s => { settingsMap[s.key_name] = s.value_val; });
 
@@ -65,7 +67,7 @@ async function autoAdvanceToToday(connection) {
 
     for (const room of occupiedRooms) {
       const tariff = room.rate;
-      const taxes  = Math.round(tariff * 0.12);
+      const taxes  = Math.round(tariff * 0.05);
 
       const [bookings] = await connection.query(
         "SELECT id FROM bookings WHERE room_id = ? AND booking_status = 'Checked In'",
@@ -74,19 +76,34 @@ async function autoAdvanceToToday(connection) {
       const bookingId = bookings[0]?.id || null;
 
       // Only post if we haven't already posted for this date (avoid duplicates on repeated calls)
-      const [existing] = await connection.query(
-        "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND `desc` LIKE 'Room Tariff%Rollover%'",
-        [room.number, nextStr]
+      const [existingTariff] = await connection.query(
+        "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Room Tariff%Rollover%'",
+        [room.number, nextStr, bookingId]
       );
-      if (existing.length === 0) {
+      
+      const [existingTax] = await connection.query(
+        "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Taxes & GST%'",
+        [room.number, nextStr, bookingId]
+      );
+
+      if (existingTariff.length === 0) {
         await connection.query(
           'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
           [room.number, 'Room Tariff Charge (Rollover)', tariff, nextStr, bookingId]
         );
+        console.log(`[AutoRollover] Created Room Tariff for Room ${room.number} on ${nextStr}`);
+      } else {
+        console.log(`[AutoRollover] Skipped duplicate Room Tariff for Room ${room.number} on ${nextStr}`);
+      }
+      
+      if (existingTax.length === 0) {
         await connection.query(
           'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-          [room.number, 'Taxes & GST (12%)', taxes, nextStr, bookingId]
+          [room.number, 'Taxes & GST (5%)', taxes, nextStr, bookingId]
         );
+        console.log(`[AutoRollover] Created Taxes for Room ${room.number} on ${nextStr}`);
+      } else {
+        console.log(`[AutoRollover] Skipped duplicate Taxes for Room ${room.number} on ${nextStr}`);
       }
     }
 
@@ -137,7 +154,7 @@ export const getStatus = async (req, res) => {
     const continuedRooms = parseInt(settingsMap['continued_rooms'] || '0', 10);
 
     const [rooms] = await pool.query(`
-      SELECT r.id, r.number, r.status, rt.code as type, rt.base_rate as rate
+      SELECT r.id, r.number, r.status, r.housekeeping_status, rt.code as type, rt.base_rate as rate
       FROM rooms r
       JOIN room_types rt ON r.room_type_id = rt.id
     `);
@@ -225,6 +242,7 @@ export const getStatus = async (req, res) => {
         number: r.number,
         type: r.type,
         status: r.status,
+        housekeeping_status: r.housekeeping_status,
         rate: r.rate,
         guestName: activeBooking ? activeBooking.guestName.toUpperCase() : '',
         phone: activeBooking ? activeBooking.phone : '',
@@ -277,6 +295,9 @@ export const runDayEnd = async (req, res) => {
     connection = await pool.getConnection();
     await connection.beginTransaction();
 
+    // Lock system_settings to prevent concurrent auto-rollovers during manual day end
+    await connection.query('SELECT * FROM system_settings FOR UPDATE');
+
     const [occupiedRooms] = await connection.query(`
       SELECT r.*, rt.base_rate as rate
       FROM rooms r
@@ -286,7 +307,7 @@ export const runDayEnd = async (req, res) => {
 
     for (const room of occupiedRooms) {
       const tariff = room.rate;
-      const taxes = Math.round(tariff * 0.12);
+      const taxes = Math.round(tariff * 0.05);
 
       // Find active booking for the room
       const [bookings] = await connection.query(
@@ -295,14 +316,35 @@ export const runDayEnd = async (req, res) => {
       );
       const bookingId = bookings[0]?.id || null;
 
-      await connection.query(
-        'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-        [room.number, 'Room Tariff Charge (Rollover)', tariff, nextDate, bookingId]
+      const [existingTariff] = await connection.query(
+        "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Room Tariff%Rollover%'",
+        [room.number, nextDate, bookingId]
       );
-      await connection.query(
-        'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-        [room.number, 'Taxes & GST (12%)', taxes, nextDate, bookingId]
+      
+      const [existingTax] = await connection.query(
+        "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Taxes & GST%'",
+        [room.number, nextDate, bookingId]
       );
+
+      if (existingTariff.length === 0) {
+        await connection.query(
+          'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
+          [room.number, 'Room Tariff Charge (Rollover)', tariff, nextDate, bookingId]
+        );
+        console.log(`[ManualDayEnd] Created Room Tariff for Room ${room.number} on ${nextDate}`);
+      } else {
+        console.log(`[ManualDayEnd] Skipped duplicate Room Tariff for Room ${room.number} on ${nextDate}`);
+      }
+
+      if (existingTax.length === 0) {
+        await connection.query(
+          'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
+          [room.number, 'Taxes & GST (5%)', taxes, nextDate, bookingId]
+        );
+        console.log(`[ManualDayEnd] Created Taxes for Room ${room.number} on ${nextDate}`);
+      } else {
+        console.log(`[ManualDayEnd] Skipped duplicate Taxes for Room ${room.number} on ${nextDate}`);
+      }
     }
 
     await connection.query(
@@ -406,6 +448,7 @@ export const getGuestRequests = async (req, res) => {
       JOIN bookings b ON (b.room_id = r.id AND b.booking_status = 'Checked In')
       JOIN guests g ON b.guest_id = g.id
       WHERE m.status IN ('Pending', 'In Progress')
+        AND m.reported_by = g.user_id
       ORDER BY m.created_at DESC
       LIMIT 100
     `);
@@ -437,11 +480,38 @@ export const getGuestRequests = async (req, res) => {
       LIMIT 50
     `);
 
+    // 4. Extension requests
+    const [extensionRequests] = await pool.query(`
+      SELECT 
+        er.id,
+        CONCAT('Requested Extension to: ', er.requested_checkout_date) as \`desc\`,
+        '11-Jul-2026' as business_date,
+        er.created_at,
+        'extension_request' as request_type,
+        er.status as \`status\`,
+        g.full_name as guest_name,
+        g.phone as guest_phone,
+        b.booking_number,
+        b.id as booking_id,
+        r.number as room_number,
+        rt.code as room_type,
+        er.requested_checkout_date
+      FROM stay_extension_requests er
+      JOIN bookings b ON er.booking_id = b.id
+      JOIN rooms r ON b.room_id = r.id
+      JOIN room_types rt ON r.room_type_id = rt.id
+      JOIN guests g ON b.guest_id = g.id
+      WHERE er.status = 'Pending'
+      ORDER BY er.created_at DESC
+      LIMIT 100
+    `);
+
     // Combine all request types
     const allRequests = [
       ...serviceItems.map(r => ({ ...r, id: `svc_${r.id}` })),
       ...maintenanceItems.map(r => ({ ...r, id: `mnt_${r.id}` })),
-      ...checkoutRequests.map(r => ({ ...r, id: `co_${r.id}` }))
+      ...checkoutRequests.map(r => ({ ...r, id: `co_${r.id}` })),
+      ...extensionRequests.map(r => ({ ...r, id: `ext_${r.id}` }))
     ].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
     res.json({ requests: allRequests, total: allRequests.length });
@@ -483,12 +553,181 @@ export const resolveGuestRequest = async (req, res) => {
       await connection.rollback();
       return res.status(400).json({ error: 'Invalid request ID format' });
     }
-
     await connection.commit();
     res.json({ message: 'Request resolved successfully' });
   } catch (error) {
-    if (connection) { try { await connection.rollback(); } catch (e) {} }
+    if (connection) {
+      try { await connection.rollback(); } catch (e) {}
+    }
     console.error('resolveGuestRequest error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+export const resolveExtensionRequest = async (req, res) => {
+  const { id } = req.params;
+  const { action } = req.body; // 'approve' or 'reject'
+  
+  if (!id) return res.status(400).json({ error: 'Request ID is required' });
+  if (!['approve', 'reject'].includes(action)) {
+    return res.status(400).json({ error: 'Invalid action. Must be approve or reject' });
+  }
+
+  const realId = id.replace('ext_', '');
+  const adminId = req.user?.id;
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [reqRows] = await connection.query(
+      "SELECT * FROM stay_extension_requests WHERE id = ? AND status = 'Pending' FOR UPDATE",
+      [realId]
+    );
+    if (reqRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Pending extension request not found' });
+    }
+    const extReq = reqRows[0];
+
+    // Get the booking
+    const [bookingRows] = await connection.query(
+      "SELECT * FROM bookings WHERE id = ? FOR UPDATE",
+      [extReq.booking_id]
+    );
+    const booking = bookingRows[0];
+
+    const [guestRows] = await connection.query(
+      "SELECT user_id FROM guests WHERE id = ?",
+      [extReq.guest_id]
+    );
+    const guestUserId = guestRows[0]?.user_id;
+
+    if (action === 'approve') {
+      console.log(`[ExtensionResolve] Admin ${adminId} called approve API for Request ID ${realId}`);
+      
+      // Update Booking
+      await connection.query(
+        "UPDATE bookings SET expected_check_out_date = ? WHERE id = ?",
+        [extReq.requested_checkout_date, booking.id]
+      );
+      console.log(`[ExtensionResolve] Booking ${booking.id} updated checkout date to ${extReq.requested_checkout_date}`);
+      
+      // Post Ledger Entries immediately for the new extension period
+      const [roomRows] = await connection.query(`
+        SELECT r.number, rt.base_rate FROM rooms r
+        JOIN room_types rt ON r.room_type_id = rt.id
+        WHERE r.id = ?
+      `, [extReq.room_id]);
+      const room = roomRows[0];
+      const tariff = room.base_rate;
+      const taxes = Math.round(tariff * 0.05);
+
+      let currentDate = new Date(extReq.current_checkout_date);
+      let endDate = new Date(extReq.requested_checkout_date);
+      currentDate.setHours(0,0,0,0);
+      endDate.setHours(0,0,0,0);
+      let additionalCharges = 0;
+      
+      console.log(`[ExtensionResolve] Ledger posting started. Dates: ${currentDate.toISOString()} to ${endDate.toISOString()}`);
+
+      while (currentDate < endDate) {
+        const bizDateStr = currentDate.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
+        
+        // Post Room Tariff
+        const [existingTariff] = await connection.query(
+          "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Room Tariff%Rollover%'",
+          [room.number, bizDateStr, booking.id]
+        );
+        if (existingTariff.length === 0) {
+          await connection.query(
+            'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
+            [room.number, 'Room Tariff Charge (Rollover)', tariff, bizDateStr, booking.id]
+          );
+          additionalCharges += tariff;
+          console.log(`[ExtensionResolve] Room tariff ₹${tariff} inserted for ${bizDateStr}`);
+        } else {
+          console.log(`[ExtensionResolve] Room tariff skipped (already exists) for ${bizDateStr}`);
+        }
+
+        // Post GST
+        const [existingTax] = await connection.query(
+          "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Taxes & GST%'",
+          [room.number, bizDateStr, booking.id]
+        );
+        if (existingTax.length === 0) {
+          await connection.query(
+            'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
+            [room.number, 'Taxes & GST (5%)', taxes, bizDateStr, booking.id]
+          );
+          additionalCharges += taxes;
+          console.log(`[ExtensionResolve] GST ₹${taxes} inserted for ${bizDateStr}`);
+        } else {
+          console.log(`[ExtensionResolve] GST skipped (already exists) for ${bizDateStr}`);
+        }
+        
+        currentDate.setDate(currentDate.getDate() + 1);
+      }
+      
+      console.log(`[ExtensionResolve] Balance recalculated successfully. Total added: ₹${additionalCharges}`);
+
+      // Update Request status
+      await connection.query(
+        "UPDATE stay_extension_requests SET status = 'Approved', admin_id = ? WHERE id = ?",
+        [adminId, realId]
+      );
+
+      // Notify Guest
+      if (guestUserId) {
+        await connection.query(
+          "INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)",
+          [guestUserId, '✅ Extension Approved', `Your request to extend your stay until ${extReq.requested_checkout_date} has been approved.`]
+        );
+      }
+      
+      await connection.query(
+        `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'EXTENSION_APPROVED', ?, CURDATE())`,
+        [adminId, `Admin approved stay extension for Booking ${booking.id} to ${extReq.requested_checkout_date}`]
+      );
+
+      await connection.commit();
+      console.log(`[ExtensionResolve] Transaction committed successfully for Request ${realId}`);
+      req.app.get('io')?.emit('guest_dashboard_refresh', { guestUserId });
+      return res.json({ message: `Stay extension approved. Additional charges of ₹${additionalCharges.toLocaleString('en-IN')} have been added to the guest folio.` });
+
+    } else if (action === 'reject') {
+      // Update Request status
+      await connection.query(
+        "UPDATE stay_extension_requests SET status = 'Rejected', admin_id = ? WHERE id = ?",
+        [adminId, realId]
+      );
+
+      // Notify Guest
+      if (guestUserId) {
+        await connection.query(
+          "INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)",
+          [guestUserId, '❌ Extension Rejected', `Your request to extend your stay until ${extReq.requested_checkout_date} could not be approved due to unavailability.`]
+        );
+      }
+
+      await connection.query(
+        `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'EXTENSION_REJECTED', ?, CURDATE())`,
+        [adminId, `Admin rejected stay extension for Booking ${booking.id}`]
+      );
+    }
+
+    await connection.commit();
+    // Notify clients to refresh dashboards
+    req.app.get('io')?.emit('guest_dashboard_refresh', { guestUserId });
+    res.json({ message: `Extension request ${action}d successfully` });
+  } catch (error) {
+    if (connection) {
+      try { await connection.rollback(); } catch (e) {}
+    }
+    console.error('resolveExtensionRequest error:', error);
     res.status(500).json({ error: 'Internal Server Error' });
   } finally {
     if (connection) connection.release();
@@ -596,3 +835,273 @@ export const verifyGuestDocument = async (req, res) => {
   }
 };
 
+// ─── ADMIN: DELETE GUEST DOCUMENT ──────────────────────────────────────────────────
+export const deleteGuestDocument = async (req, res) => {
+  const { guestId } = req.params;
+  
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    
+    const [guestRows] = await connection.query(
+      'SELECT id_document_path FROM guests WHERE id = ?',
+      [guestId]
+    );
+
+    if (guestRows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Guest not found' });
+    }
+
+    const docPath = guestRows[0].id_document_path;
+
+    // Start transaction to clean up DB
+    await connection.beginTransaction();
+
+    await connection.query(`
+      UPDATE guests 
+      SET id_document_path = NULL,
+          id_upload_timestamp = NULL,
+          id_verification_status = 'Pending',
+          id_rejection_reason = NULL,
+          id_verified_by = NULL,
+          id_verified_at = NULL,
+          id_ocr_text = NULL
+      WHERE id = ?
+    `, [guestId]);
+
+    await connection.commit();
+
+    // Delete the file from disk if it exists
+    if (docPath) {
+      let filePath;
+      if (path.isAbsolute(docPath)) {
+        filePath = docPath;
+      } else {
+        const backendRoot = process.cwd(); 
+        const relativePath = docPath.startsWith('/') ? docPath.slice(1) : docPath;
+        filePath = path.join(backendRoot, relativePath);
+      }
+
+      try {
+        await fs.promises.unlink(filePath);
+      } catch (err) {
+        if (err.code !== 'ENOENT') {
+          console.error(`Failed to delete document file ${filePath}:`, err);
+        }
+      }
+    }
+
+    res.json({ success: true, message: 'Identity document deleted successfully' });
+  } catch (error) {
+    if (connection) {
+      try { await connection.rollback(); } catch (e) {}
+    }
+    console.error('deleteGuestDocument error:', error);
+    res.status(500).json({ success: false, message: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+// ─── ADMIN: LIST ALL GUESTS (paginated, filterable) ──────────────────────────
+export const listGuests = async (req, res) => {
+  const page    = Math.max(1, parseInt(req.query.page  || '1',  10));
+  const limit   = Math.min(50, Math.max(1, parseInt(req.query.limit || '25', 10)));
+  const offset  = (page - 1) * limit;
+  const q       = (req.query.q || '').trim();
+  const filter  = req.query.filter || 'all'; // all | inhouse | checkedout | reserved | vip | blacklisted
+
+  // Build WHERE clauses
+  const whereClauses = [];
+  const params       = [];
+
+  if (q.length >= 2) {
+    const term = `%${q.toUpperCase()}%`;
+    whereClauses.push(`(UPPER(g.full_name) LIKE ? OR g.phone LIKE ? OR UPPER(g.email) LIKE ? OR g.government_id LIKE ?)`);
+    params.push(term, term, term, term);
+  }
+
+  if (filter === 'inhouse') {
+    whereClauses.push(`EXISTS (SELECT 1 FROM bookings ab WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved'))`);
+  } else if (filter === 'checkedout') {
+    whereClauses.push(`EXISTS (SELECT 1 FROM bookings ab WHERE ab.guest_id = g.id AND ab.booking_status = 'Checked Out')`);
+    whereClauses.push(`NOT EXISTS (SELECT 1 FROM bookings ab2 WHERE ab2.guest_id = g.id AND ab2.booking_status IN ('Checked In','Reserved'))`);
+  } else if (filter === 'reserved') {
+    whereClauses.push(`EXISTS (SELECT 1 FROM bookings ab WHERE ab.guest_id = g.id AND ab.booking_status = 'Reserved')`);
+  } else if (filter === 'vip') {
+    whereClauses.push(`g.loyalty_tier IN ('Gold','Platinum')`);
+  } else if (filter === 'blacklisted') {
+    whereClauses.push(`g.loyalty_tier = 'Blacklisted'`);
+  }
+
+  const whereSQL = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+  try {
+    const [statsResult] = await pool.query(`
+      SELECT 
+        COUNT(g.id) as total,
+        SUM(CASE WHEN EXISTS (SELECT 1 FROM bookings ab WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved')) THEN 1 ELSE 0 END) as inhouse,
+        SUM(CASE WHEN EXISTS (SELECT 1 FROM bookings ab WHERE ab.guest_id = g.id AND ab.booking_status = 'Checked Out') AND NOT EXISTS (SELECT 1 FROM bookings ab2 WHERE ab2.guest_id = g.id AND ab2.booking_status IN ('Checked In','Reserved')) THEN 1 ELSE 0 END) as checkedout,
+        SUM(CASE WHEN g.loyalty_tier IN ('Gold','Platinum') THEN 1 ELSE 0 END) as vip,
+        SUM(CASE WHEN g.loyalty_tier = 'Blacklisted' THEN 1 ELSE 0 END) as blacklisted,
+        SUM(CASE WHEN DATE(g.created_at) = CURDATE() THEN 1 ELSE 0 END) as new_today
+      FROM guests g
+    `);
+    const stats = statsResult[0];
+
+    // Total count
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(DISTINCT g.id) AS total FROM guests g ${whereSQL}`,
+      params
+    );
+
+    // Page of results
+    const [guests] = await pool.query(
+      `SELECT
+         g.id, g.full_name, g.phone, g.email, g.address, g.gst_no, g.pincode, g.country,
+         g.arrival_from, g.departure_to,
+         g.government_id, g.id_type, g.gender, g.age,
+         g.id_verification_status,
+         g.loyalty_tier, g.loyalty_points,
+         g.created_at, g.updated_at,
+         COUNT(b.id)                                                 AS total_bookings,
+         COALESCE(SUM(b.total_amount), 0)                           AS lifetime_spend,
+         MAX(b.created_at)                                          AS last_booking_at,
+         (SELECT r.number FROM bookings ab JOIN rooms r ON ab.room_id = r.id
+          WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved') LIMIT 1) AS current_room,
+         (SELECT ab.booking_status FROM bookings ab
+          WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved') LIMIT 1) AS current_status,
+         (SELECT ab.booking_number FROM bookings ab
+          WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved') LIMIT 1) AS current_booking_number
+       FROM guests g
+       LEFT JOIN bookings b ON b.guest_id = g.id
+       ${whereSQL}
+       GROUP BY g.id
+       ORDER BY last_booking_at DESC, g.id DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    res.json({
+      guests,
+      stats,
+      pagination: { total, page, limit, pages: Math.ceil(total / limit) }
+    });
+  } catch (error) {
+    console.error('listGuests error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+// ─── ADMIN: SEARCH GUESTS BY NAME OR PHONE ───────────────────────────────────
+export const searchGuests = async (req, res) => {
+  const { q } = req.query;
+  if (!q || q.trim().length < 2) {
+    return res.status(400).json({ error: 'Search query must be at least 2 characters' });
+  }
+  const term = `%${q.trim().toUpperCase()}%`;
+  try {
+    const [guests] = await pool.query(`
+      SELECT 
+        g.id, g.full_name, g.phone, g.email, g.loyalty_tier, g.loyalty_points,
+        g.id_verification_status,
+        COUNT(b.id) as total_bookings,
+        MAX(b.created_at) as last_booking_at,
+        (SELECT r.number FROM bookings ab JOIN rooms r ON ab.room_id = r.id 
+         WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved') LIMIT 1) as current_room,
+        (SELECT ab.booking_status FROM bookings ab 
+         WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved') LIMIT 1) as current_status
+      FROM guests g
+      LEFT JOIN bookings b ON b.guest_id = g.id
+      WHERE UPPER(g.full_name) LIKE ? OR g.phone LIKE ?
+      GROUP BY g.id
+      ORDER BY MAX(b.created_at) DESC
+      LIMIT 20
+    `, [term, term]);
+    res.json({ guests });
+  } catch (error) {
+    console.error('searchGuests error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+// ─── RECEPTION STAFF: GUEST SEARCH (name / phone / email / booking number) ───
+// Available to any authenticated staff — no requireAdmin.
+// Returns all guests (in-house, checked-out, reserved) across all history.
+export const searchGuestsStaff = async (req, res) => {
+  const { q } = req.query;
+  if (!q || q.trim().length < 2) {
+    return res.status(400).json({ error: 'Search query must be at least 2 characters' });
+  }
+  const term    = `%${q.trim().toUpperCase()}%`;
+  const termRaw = `%${q.trim()}%`;          // for booking_number (case-sensitive in some engines)
+  try {
+    // First try: match by booking number — find the guest via their booking
+    const [byBooking] = await pool.query(`
+      SELECT DISTINCT g.id
+      FROM guests g
+      JOIN bookings b ON b.guest_id = g.id
+      WHERE UPPER(b.booking_number) LIKE ?
+    `, [term]);
+    const bookingGuestIds = byBooking.map(r => r.id);
+
+    // Main search: by name, phone, email — plus any guest_ids from booking match
+    const idPlaceholders = bookingGuestIds.length > 0
+      ? `OR g.id IN (${bookingGuestIds.map(() => '?').join(',')})`
+      : '';
+
+    const queryParams = [term, termRaw, termRaw, ...bookingGuestIds];
+
+    const [guests] = await pool.query(`
+      SELECT 
+        g.id,
+        g.full_name,
+        g.phone,
+        g.email,
+        g.loyalty_tier,
+        g.loyalty_points,
+        g.id_verification_status,
+        COUNT(DISTINCT b.id)  AS total_bookings,
+        MAX(b.created_at)     AS last_booking_at,
+        -- current room / status if currently in-house
+        (SELECT r.number FROM bookings ab
+          JOIN rooms r ON ab.room_id = r.id
+          WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved')
+          ORDER BY ab.check_in_date DESC LIMIT 1) AS current_room,
+        (SELECT ab.booking_status FROM bookings ab
+          WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved')
+          ORDER BY ab.check_in_date DESC LIMIT 1) AS current_status,
+        -- most recent booking summary
+        (SELECT ab.booking_number FROM bookings ab
+          WHERE ab.guest_id = g.id
+          ORDER BY ab.created_at DESC LIMIT 1) AS last_booking_number,
+        (SELECT ab.booking_status FROM bookings ab
+          WHERE ab.guest_id = g.id
+          ORDER BY ab.created_at DESC LIMIT 1) AS last_booking_status,
+        (SELECT ab.check_in_date FROM bookings ab
+          WHERE ab.guest_id = g.id
+          ORDER BY ab.created_at DESC LIMIT 1) AS last_check_in,
+        (SELECT ab.check_out_date FROM bookings ab
+          WHERE ab.guest_id = g.id
+          ORDER BY ab.created_at DESC LIMIT 1) AS last_check_out
+      FROM guests g
+      LEFT JOIN bookings b ON b.guest_id = g.id
+      WHERE UPPER(g.full_name) LIKE ?
+         OR g.phone             LIKE ?
+         OR UPPER(g.email)      LIKE ?
+         ${idPlaceholders}
+      GROUP BY g.id
+      ORDER BY
+        CASE WHEN g.id IN (
+          SELECT ab.guest_id FROM bookings ab WHERE ab.booking_status IN ('Checked In','Reserved')
+        ) THEN 0 ELSE 1 END,
+        MAX(b.created_at) DESC
+      LIMIT 30
+    `, queryParams);
+
+    res.json({ guests });
+  } catch (error) {
+    console.error('searchGuestsStaff error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};

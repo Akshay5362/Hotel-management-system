@@ -36,8 +36,8 @@ export const checkIn = async (req, res) => {
     return res.status(400).json({ error: 'Phone number cannot exceed 50 characters' });
   }
 
-  // Obtain user ID from authenticated request context
-  const resolvedUserId = req.user?.id || null;
+  // staff logins carry ids from staff table, not users -- use NULL to avoid FK violation.
+  const resolvedUserId = req.user?.type === 'staff' ? null : (req.user?.id || null);
 
   let connection;
   try {
@@ -61,6 +61,28 @@ export const checkIn = async (req, res) => {
     if (room.status !== 'vacant' && room.status !== 'booked') {
       await connection.rollback();
       return res.status(400).json({ error: `Room ${number} is not vacant or booked` });
+    }
+
+    // Req 3: Block dirty rooms from auto-assignment unless override flag is set
+    const { manual_override } = req.body;
+    if (room.housekeeping_status === 'Dirty') {
+      if (!manual_override) {
+        await connection.rollback();
+        return res.status(400).json({
+          error: `Room ${number} has pending housekeeping (Dirty). Complete cleaning before check-in.`,
+          code: 'ROOM_DIRTY'
+        });
+      }
+      // Req 1 (new): Manual override is restricted to Admin/Manager roles only
+      const userRole = (req.user?.role || '').toUpperCase();
+      const canOverride = userRole === 'ADMIN' || userRole === 'MANAGER' || userRole === 'admin';
+      if (!canOverride) {
+        await connection.rollback();
+        return res.status(403).json({
+          error: `Room ${number} is Dirty. Manual override for dirty rooms requires Manager or Admin access. Please contact your supervisor.`,
+          code: 'OVERRIDE_FORBIDDEN'
+        });
+      }
     }
 
     const guestNameUpper = guestName.trim().toUpperCase();
@@ -120,7 +142,7 @@ export const checkIn = async (req, res) => {
 
       // Add initial ledger entries (Room Tariff Charge and Taxes)
       const tariffAmount = room.rate;
-      const taxesAmount = Math.round(tariffAmount * 0.12);
+      const taxesAmount = Math.round(tariffAmount * 0.05);
 
       await connection.query(
         'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
@@ -128,7 +150,7 @@ export const checkIn = async (req, res) => {
       );
       await connection.query(
         'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-        [number, 'Taxes & GST (12%)', taxesAmount, businessDate, bookingId]
+        [number, 'Taxes & GST (5%)', taxesAmount, businessDate, bookingId]
       );
     }
 
@@ -308,9 +330,9 @@ export const checkOut = async (req, res) => {
       [resolvedUserId, `Checked out Room ${number}. Booking ID: ${activeBooking.id}. Balance paid: ₹${parsedBalancePaid}`, businessDate]
     );
 
-    // Update room status to dirty
+    // Update room status to dirty and housekeeping to Dirty (High Priority)
     await connection.query(
-      `UPDATE rooms SET status = 'dirty' WHERE id = ?`,
+      `UPDATE rooms SET status = 'dirty', housekeeping_status = 'Dirty', housekeeping_priority = 'High Priority' WHERE id = ?`,
       [room.id]
     );
 
@@ -410,7 +432,7 @@ export const clean = async (req, res) => {
     );
 
     await pool.query(
-      `UPDATE rooms SET status = 'vacant' WHERE id = ?`,
+      `UPDATE rooms SET status = 'vacant', housekeeping_status = 'Clean', housekeeping_priority = 'Normal', last_cleaned_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [room.id]
     );
 
@@ -453,6 +475,21 @@ export const addLedgerItem = async (req, res) => {
     // Get current business date
     const [settings] = await pool.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
     const businessDate = settings[0]?.value_val || '11-Jul-2026';
+
+    // Idempotency check: prevent duplicate manual postings within a 5-second window
+    const [recentDups] = await pool.query(
+      `SELECT id FROM ledger_items 
+       WHERE booking_id = ? 
+         AND \`desc\` = ? 
+         AND amount = ? 
+         AND created_at >= NOW() - INTERVAL 5 SECOND`,
+      [bookingId, desc.trim(), parsedAmount]
+    );
+
+    if (recentDups.length > 0) {
+      console.log(`[Idempotency] Skipped duplicate manual charge for Room ${number}: ${desc.trim()}`);
+      return res.status(200).json({ message: `Charge already posted (Idempotency skip).` });
+    }
 
     await pool.query(
       'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
@@ -557,7 +594,7 @@ export const shift = async (req, res) => {
 
     // Insert target room's tariff and taxes for the current business date
     const targetTariff = targetRoom.rate;
-    const targetTaxes = Math.round(targetTariff * 0.12);
+    const targetTaxes = Math.round(targetTariff * 0.05);
 
     await connection.query(
       'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
@@ -565,7 +602,7 @@ export const shift = async (req, res) => {
     );
     await connection.query(
       'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-      [toRoomNumber, 'Taxes & GST (12%)', targetTaxes, businessDate, booking.id]
+      [toRoomNumber, 'Taxes & GST (5%)', targetTaxes, businessDate, booking.id]
     );
 
     // Log Room Status History for source room
@@ -850,7 +887,7 @@ export const bookRoom = async (req, res) => {
     }
 
     const netTariffAmount = tariffAmount; 
-    const taxesAmount = Math.round((netTariffAmount - loyaltyDiscountAmount + servicesTotal) * 0.12);
+    const taxesAmount = Math.round((netTariffAmount - loyaltyDiscountAmount + servicesTotal) * 0.05);
     const bookingTotal = (netTariffAmount - loyaltyDiscountAmount) + taxesAmount + servicesTotal;
 
     // Create Reserved Booking
@@ -887,7 +924,7 @@ export const bookRoom = async (req, res) => {
 
     await connection.query(
       'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-      [number, 'Taxes & GST (12%)', taxesAmount, businessDate, bookingId]
+      [number, 'Taxes & GST (5%)', taxesAmount, businessDate, bookingId]
     );
 
     // Add extra guests as zero-charge ledger items to folio
@@ -1238,6 +1275,7 @@ export const guestAddService = async (req, res) => {
     );
 
     await connection.commit();
+    req.app.get('io')?.emit('new_guest_request', { type: 'service' });
     res.json({ message: 'Service request submitted successfully' });
   } catch (error) {
     if (connection) { try { await connection.rollback(); } catch (e) {} }
@@ -1288,6 +1326,7 @@ export const guestReportMaintenance = async (req, res) => {
     );
 
     await connection.commit();
+    req.app.get('io')?.emit('new_guest_request', { type: 'maintenance' });
     res.json({ message: 'Maintenance request submitted successfully' });
   } catch (error) {
     if (connection) { try { await connection.rollback(); } catch (e) {} }
@@ -1333,24 +1372,50 @@ export const guestExtendStay = async (req, res) => {
       return res.status(400).json({ error: 'New checkout date must be after the current checkout date' });
     }
 
-    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
-    const businessDate = settings[0]?.value_val || new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
+    // Check if there is already a Pending request
+    const [existingReqs] = await connection.query(
+      "SELECT id FROM stay_extension_requests WHERE booking_id = ? AND status = 'Pending'",
+      [booking.id]
+    );
+    if (existingReqs.length > 0) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'You already have a pending extension request. Please wait for reception to approve it.' });
+    }
+
+    console.log(`[ExtendStay] Request received for Booking ${booking.id} to new checkout date ${newCheckOutDate}`);
+
+    // Verify room availability for the extension period
+    const [conflicts] = await connection.query(`
+      SELECT id FROM bookings 
+      WHERE room_id = ? 
+        AND id != ?
+        AND booking_status IN ('Confirmed', 'Checked In')
+        AND check_in_date < ? 
+        AND expected_check_out_date > ?
+    `, [booking.room_id, booking.id, newCheckOutDate, booking.expected_check_out_date]);
+
+    if (conflicts.length > 0) {
+      console.log(`[ExtendStay] Conflict found for Room ${booking.room_id}. Request rejected.`);
+      await connection.rollback();
+      return res.status(400).json({ error: 'Sorry, this room is already booked for the requested extension period.' });
+    }
+
+    // Create the extension request
+    await connection.query(
+      'INSERT INTO stay_extension_requests (booking_id, guest_id, room_id, current_checkout_date, requested_checkout_date) VALUES (?, ?, ?, ?, ?)',
+      [booking.id, guestId, booking.room_id, booking.expected_check_out_date, newCheckOutDate]
+    );
+    console.log(`[ExtendStay] Pending request saved to stay_extension_requests for Booking ${booking.id}`);
 
     await connection.query(
-      'UPDATE bookings SET expected_check_out_date = ? WHERE id = ?',
-      [newCheckOutDate, booking.id]
-    );
-    await connection.query(
       'INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)',
-      [resolvedUserId, '📅 Stay Extended!', `Your checkout has been extended to ${new Date(newCheckOutDate).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}. Enjoy your extended stay at Hotel Sky-5!`]
-    );
-    await connection.query(
-      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'EXTEND_STAY', ?, ?)`,
-      [resolvedUserId, `Guest extended stay for Room ${booking.room_number} to ${newCheckOutDate}, Booking ID: ${booking.id}`, businessDate]
+      [resolvedUserId, '⏳ Extension Requested', `Your request to extend stay until ${new Date(newCheckOutDate).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })} has been submitted to reception for approval.`]
     );
 
     await connection.commit();
-    res.json({ message: `Stay extended to ${newCheckOutDate}` });
+    console.log(`[ExtendStay] Transaction committed. Emitting socket notification...`);
+    req.app.get('io')?.emit('new_guest_request', { type: 'extension' });
+    res.json({ message: `Extension request to ${newCheckOutDate} submitted for approval.` });
   } catch (error) {
     if (connection) { try { await connection.rollback(); } catch (e) {} }
     console.error('guestExtendStay error:', error);
@@ -1464,6 +1529,7 @@ export const guestRequestCheckout = async (req, res) => {
     );
 
     await connection.commit();
+    req.app.get('io')?.emit('new_guest_request', { type: 'checkout' });
     res.json({ message: 'Checkout request submitted. Please proceed to the reception desk.', roomNumber: booking.room_number });
   } catch (error) {
     if (connection) { try { await connection.rollback(); } catch (e) {} }
@@ -1933,6 +1999,244 @@ export const processRefundCheckout = async (req, res) => {
   }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// FRONT OFFICE — Admin-only operations (no guest-facing equivalent)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/rooms/:number/extend-stay  (requireAdmin)
+ * Admin directly extends a checked-in guest's checkout date.
+ * Body: { newCheckOutDate }
+ * - Updates expected_check_out_date on the active booking
+ * - Posts additional night tariff + tax ledger entries
+ * - Audit log: ADMIN_EXTEND_STAY
+ */
+export const adminExtendStay = async (req, res) => {
+  const { number } = req.params;
+  const { newCheckOutDate } = req.body;
+  if (!number) return res.status(400).json({ error: 'Room number is required' });
+  if (!newCheckOutDate) return res.status(400).json({ error: 'newCheckOutDate is required' });
+
+  const resolvedUserId = req.user?.id || null;
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [roomRows] = await connection.query(`
+      SELECT r.*, rt.base_rate as rate, rt.code as type
+      FROM rooms r
+      JOIN room_types rt ON r.room_type_id = rt.id
+      WHERE r.number = ? FOR UPDATE
+    `, [number]);
+    if (roomRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: `Room ${number} not found` });
+    }
+    const room = roomRows[0];
+    if (room.status !== 'occupied') {
+      await connection.rollback();
+      return res.status(400).json({ error: `Room ${number} is not occupied` });
+    }
+
+    const [bookingRows] = await connection.query(
+      `SELECT b.*, g.full_name as guestName FROM bookings b
+       JOIN guests g ON b.guest_id = g.id
+       WHERE b.room_id = ? AND b.booking_status = 'Checked In'`,
+      [room.id]
+    );
+    if (bookingRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: `No active booking for Room ${number}` });
+    }
+    const booking = bookingRows[0];
+
+    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
+    const businessDate = settings[0]?.value_val || '11-Jul-2026';
+
+    // Extend booking checkout date
+    await connection.query(
+      `UPDATE bookings SET expected_check_out_date = ? WHERE id = ?`,
+      [newCheckOutDate, booking.id]
+    );
+
+    // Post additional tariff + tax for the extension
+    const tariff = room.rate;
+    const taxes  = Math.round(tariff * 0.05);
+    await connection.query(
+      'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
+      [number, `Stay Extension — Additional Night Tariff`, tariff, businessDate, booking.id]
+    );
+    await connection.query(
+      'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
+      [number, 'Taxes & GST (5%)', taxes, businessDate, booking.id]
+    );
+
+    await connection.query(
+      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'ADMIN_EXTEND_STAY', ?, ?)`,
+      [resolvedUserId, `Extended stay for Room ${number} (Booking ${booking.id}). New checkout: ${newCheckOutDate}`, businessDate]
+    );
+
+    await connection.commit();
+    res.json({ message: `Stay extended to ${newCheckOutDate} for Room ${number}` });
+  } catch (error) {
+    if (connection) { try { await connection.rollback(); } catch (e) {} }
+    console.error('adminExtendStay error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+/**
+ * POST /api/rooms/:number/late-checkout  (requireAdmin)
+ * Marks an occupied room for late checkout and optionally posts a fee.
+ * Body: { lateCheckoutTime, fee }
+ * - Posts Late Checkout Fee ledger item (default ₹500)
+ * - Audit log: LATE_CHECKOUT
+ */
+export const adminLateCheckout = async (req, res) => {
+  const { number } = req.params;
+  const { lateCheckoutTime, fee = 500 } = req.body;
+  if (!number) return res.status(400).json({ error: 'Room number is required' });
+
+  const resolvedUserId = req.user?.id || null;
+  const parsedFee = parseInt(fee, 10);
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [roomRows] = await connection.query(`
+      SELECT r.id, r.status FROM rooms r WHERE r.number = ? FOR UPDATE
+    `, [number]);
+    if (roomRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: `Room ${number} not found` });
+    }
+    const room = roomRows[0];
+    if (room.status !== 'occupied') {
+      await connection.rollback();
+      return res.status(400).json({ error: `Room ${number} is not occupied` });
+    }
+
+    const [bookingRows] = await connection.query(
+      `SELECT id FROM bookings WHERE room_id = ? AND booking_status = 'Checked In'`,
+      [room.id]
+    );
+    if (bookingRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: `No active booking for Room ${number}` });
+    }
+    const bookingId = bookingRows[0].id;
+
+    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
+    const businessDate = settings[0]?.value_val || '11-Jul-2026';
+
+    if (parsedFee > 0) {
+      await connection.query(
+        'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
+        [number, `Late Checkout Fee${lateCheckoutTime ? ` (Until ${lateCheckoutTime})` : ''}`, parsedFee, businessDate, bookingId]
+      );
+    }
+
+    await connection.query(
+      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'LATE_CHECKOUT', ?, ?)`,
+      [resolvedUserId, `Late checkout approved for Room ${number}. Time: ${lateCheckoutTime || 'TBD'}. Fee: ₹${parsedFee}. Booking: ${bookingId}`, businessDate]
+    );
+
+    await connection.commit();
+    res.json({ message: `Late checkout recorded for Room ${number}. Fee ₹${parsedFee} posted.` });
+  } catch (error) {
+    if (connection) { try { await connection.rollback(); } catch (e) {} }
+    console.error('adminLateCheckout error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+/**
+ * POST /api/rooms/:number/no-show  (requireAdmin)
+ * Marks a Reserved booking as No Show — frees the room back to vacant.
+ * Body: { reason }
+ * - booking_status → 'No Show'
+ * - room.status → 'vacant'
+ * - Deposit is forfeited (not refunded)
+ * - Audit log: NO_SHOW
+ */
+export const adminNoShow = async (req, res) => {
+  const { number } = req.params;
+  const { reason } = req.body;
+
+  if (!number) return res.status(400).json({ error: 'Room number is required' });
+
+  const resolvedUserId = req.user?.id || null;
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [roomRows] = await connection.query(`
+      SELECT r.id, r.status FROM rooms r WHERE r.number = ? FOR UPDATE
+    `, [number]);
+    if (roomRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: `Room ${number} not found` });
+    }
+    const room = roomRows[0];
+    if (room.status !== 'booked') {
+      await connection.rollback();
+      return res.status(400).json({ error: `Room ${number} does not have a Reserved booking` });
+    }
+
+    const [bookingRows] = await connection.query(
+      `SELECT b.*, g.full_name as guestName FROM bookings b
+       JOIN guests g ON b.guest_id = g.id
+       WHERE b.room_id = ? AND b.booking_status = 'Reserved'`,
+      [room.id]
+    );
+    if (bookingRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: `No Reserved booking found for Room ${number}` });
+    }
+    const booking = bookingRows[0];
+
+    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
+    const businessDate = settings[0]?.value_val || '11-Jul-2026';
+
+    // Mark booking as No Show
+    await connection.query(
+      `UPDATE bookings SET booking_status = 'No Show', check_out_date = ? WHERE id = ?`,
+      [businessDate, booking.id]
+    );
+
+    // Free the room back to vacant
+    await connection.query(`UPDATE rooms SET status = 'vacant' WHERE id = ?`, [room.id]);
+
+    // Room status history
+    await connection.query(
+      `INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date)
+       VALUES (?, 'booked', 'vacant', ?, ?)`,
+      [room.id, resolvedUserId, businessDate]
+    );
+
+    await connection.query(
+      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'NO_SHOW', ?, ?)`,
+      [resolvedUserId, `No Show marked for Room ${number}. Guest: ${booking.guestName}. Reason: ${reason || 'Not provided'}. Booking ID: ${booking.id}. Deposit of ₹${booking.advance_amount} forfeited.`, businessDate]
+    );
+
+    await connection.commit();
+    res.json({ message: `Room ${number} marked as No Show. Room is now vacant.` });
+  } catch (error) {
+    if (connection) { try { await connection.rollback(); } catch (e) {} }
+    console.error('adminNoShow error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
 export const getPublicRooms = async (req, res) => {
   let connection;
   try {
@@ -1965,6 +2269,123 @@ export const getPublicRooms = async (req, res) => {
     res.json(formattedRooms);
   } catch (error) {
     console.error('Error fetching public rooms:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+export const updateRoomStatus = async (req, res) => {
+  const { number } = req.params;
+  const { action } = req.body;
+
+  // CRITICAL: staff logins carry ids from the `staff` table, not the `users` table.
+  // Both room_status_history.changed_by and audit_logs.user_id have FK → users.id.
+  // Inserting a staff id that doesn't exist in users causes ER_NO_REFERENCED_ROW_2 (HTTP 500).
+  // Fix: use NULL for staff tokens — both columns allow NULL (ON DELETE SET NULL).
+  const isStaff       = req.user?.type === 'staff';
+  const resolvedUserId = isStaff ? null : (req.user?.id || null);
+
+  if (!number || !action) return res.status(400).json({ error: 'Room number and action required' });
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [roomRows] = await connection.query('SELECT * FROM rooms WHERE number = ? FOR UPDATE', [number]);
+    if (roomRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Room not found' });
+    }
+    const room = roomRows[0];
+
+    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
+    const businessDate = settings[0]?.value_val || new Date().toISOString().split('T')[0];
+
+    // Resolve user name for audit trail (Req 5)
+    let performerName = 'System';
+    if (resolvedUserId) {
+      const [userRows] = await connection.query('SELECT fullName FROM users WHERE id = ?', [resolvedUserId]);
+      if (userRows.length > 0) performerName = userRows[0].fullName;
+    }
+
+    let oldStatus   = room.status;
+    let newStatus   = room.status;   // occupancy status — only changed when appropriate
+    let oldHkStatus = room.housekeeping_status;
+    let newHkStatus = room.housekeeping_status;
+    let logDetail   = '';
+
+    if (action === 'mark_dirty') {
+      // Req 1 & 2: Always update HK status; only change occupancy if room is currently vacant
+      newHkStatus = 'Dirty';
+      if (room.status === 'vacant') {
+        newStatus = 'dirty'; // vacant → dirty (occupancy level)
+      }
+      // Occupied/booked rooms: HK status changes, occupancy stays unchanged
+      logDetail = `Room ${number}: Housekeeping marked Dirty (occupancy: ${oldStatus} → ${newStatus}).`;
+    } else if (action === 'mark_clean') {
+      // Req 1 & 2: Always update HK status; only restore occupancy if room is currently dirty
+      newHkStatus = 'Clean';
+      if (room.status === 'dirty') {
+        newStatus = 'vacant'; // dirty → vacant (room available again)
+      }
+      // Occupied rooms: HK cleaned while occupied — occupancy stays occupied
+      logDetail = `Room ${number}: Housekeeping marked Clean (occupancy: ${oldStatus} → ${newStatus}).`;
+    } else if (action === 'mark_inactive') {
+      if (room.status !== 'vacant' && room.status !== 'dirty') {
+        await connection.rollback();
+        return res.status(400).json({ error: 'Only vacant or dirty rooms can be marked inactive' });
+      }
+      newStatus = 'inactive';
+      logDetail = `Room ${number}: Marked Inactive.`;
+    } else if (action === 'mark_active') {
+      if (room.status !== 'inactive') {
+        await connection.rollback();
+        return res.status(400).json({ error: 'Room is not inactive' });
+      }
+      newStatus = room.housekeeping_status === 'Dirty' ? 'dirty' : 'vacant';
+      logDetail = `Room ${number}: Marked Active.`;
+    } else {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Invalid action' });
+    }
+
+    await connection.query(
+      'UPDATE rooms SET status = ?, housekeeping_status = ? WHERE id = ?',
+      [newStatus, newHkStatus, room.id]
+    );
+
+    if (newStatus !== oldStatus || newHkStatus !== oldHkStatus) {
+      // Log occupancy status change in room_status_history
+      if (newStatus !== oldStatus) {
+        await connection.query(
+          'INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date) VALUES (?, ?, ?, ?, ?)',
+          [room.id, oldStatus, newStatus, resolvedUserId, businessDate]
+        );
+      }
+
+      // Req 3 (new): Fully structured audit log — all fields labelled for readability & parsability
+      const structuredDetails = JSON.stringify({
+        Room:             number,
+        Occupancy_Before: oldStatus,
+        Occupancy_After:  newStatus,
+        HK_Before:        oldHkStatus,
+        HK_After:         newHkStatus,
+        User:             performerName,
+        Business_Date:    businessDate
+      });
+      await connection.query(
+        'INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, ?, ?, ?)',
+        [resolvedUserId, 'UPDATE_ROOM_STATUS', structuredDetails, businessDate]
+      );
+    }
+
+    await connection.commit();
+    res.json({ message: logDetail });
+  } catch (err) {
+    if (connection) await connection.rollback();
+    console.error('updateRoomStatus error:', err);
     res.status(500).json({ error: 'Internal Server Error' });
   } finally {
     if (connection) connection.release();

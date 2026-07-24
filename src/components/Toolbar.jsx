@@ -7,7 +7,8 @@ export default function Toolbar({
   roomCounts, 
   searchQuery, 
   setSearchQuery,
-  requestCount
+  requestCount,
+  activeModal
 }) {
   const filters = [
     { key: 'all', label: 'All Rooms', class: 'chip-all', count: roomCounts.all },
@@ -22,7 +23,7 @@ export default function Toolbar({
     <div className="toolbar-section">
       {/* Quick Action Toolbar Buttons */}
       <div className="quick-actions">
-        <button className="btn-action" onClick={() => onActionClick('checkin')} data-tooltip="Register a guest check-in (Vacant room)">
+        <button className="btn-action" onClick={() => onActionClick('checkin')} {...(activeModal ? {} : { 'data-tooltip': "Register a guest check-in (Vacant room)" })}>
           <svg viewBox="0 0 24 24">
             <path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
             <circle cx="8.5" cy="7" r="4" />
@@ -32,7 +33,7 @@ export default function Toolbar({
           Check In
         </button>
 
-        <button className="btn-action" onClick={() => onActionClick('checkout')} data-tooltip="Settle bills & check out guest (Occupied room)">
+        <button className="btn-action" onClick={() => onActionClick('checkout')} {...(activeModal ? {} : { 'data-tooltip': "Settle bills & check out guest (Occupied room)" })}>
           <svg viewBox="0 0 24 24">
             <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
             <polyline points="14 2 14 8 20 8" />
@@ -43,7 +44,7 @@ export default function Toolbar({
           Check Out
         </button>
 
-        <button className="btn-action" onClick={() => onActionClick('shifting')} data-tooltip="Shift active guest to another room">
+        <button className="btn-action" onClick={() => onActionClick('shifting')} {...(activeModal ? {} : { 'data-tooltip': "Shift active guest to another room" })}>
           <svg viewBox="0 0 24 24">
             <polyline points="17 1 21 5 17 9" />
             <path d="M3 11V9a4 4 0 0 1 4-4h14" />
@@ -53,7 +54,7 @@ export default function Toolbar({
           Shifting
         </button>
 
-        <button className="btn-action" onClick={() => onActionClick('cash')} data-tooltip="View active business date cash transactions">
+        <button className="btn-action" onClick={() => onActionClick('cash')} {...(activeModal ? {} : { 'data-tooltip': "View active business date cash transactions" })}>
           <svg viewBox="0 0 24 24">
             <line x1="12" y1="1" x2="12" y2="23" />
             <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
@@ -61,7 +62,7 @@ export default function Toolbar({
           Cash Status
         </button>
 
-        <button className="btn-action" onClick={() => onActionClick('reports')} data-tooltip="Day End closure & Night Audit rollover">
+        <button className="btn-action" onClick={() => onActionClick('reports')} {...(activeModal ? {} : { 'data-tooltip': "Day End closure & Night Audit rollover" })}>
           <svg viewBox="0 0 24 24">
             <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
             <line x1="16" y1="2" x2="16" y2="6" />
@@ -71,7 +72,17 @@ export default function Toolbar({
           Day End
         </button>
 
-        <button className="btn-action" onClick={() => onActionClick('reservations')} data-tooltip="View upcoming future guest reservations">
+        <button className="btn-action" onClick={() => onActionClick('analytics')} {...(activeModal ? {} : { 'data-tooltip': "View Reports & Analytics Dashboard" })}>
+          <svg viewBox="0 0 24 24">
+            <path d="M3 3v18h18" />
+            <path d="M18 17V9" />
+            <path d="M13 17V5" />
+            <path d="M8 17v-3" />
+          </svg>
+          Analytics
+        </button>
+
+        <button className="btn-action" onClick={() => onActionClick('reservations')} {...(activeModal ? {} : { 'data-tooltip': "View upcoming future guest reservations" })}>
           <svg viewBox="0 0 24 24">
             <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
             <line x1="16" y1="2" x2="16" y2="6" />
@@ -82,7 +93,7 @@ export default function Toolbar({
           Upcoming Res
         </button>
 
-        <button className="btn-action" onClick={() => onActionClick('requests')} data-tooltip="View guest service, maintenance & checkout requests" style={{ position: 'relative' }}>
+        <button className="btn-action" onClick={() => onActionClick('requests')} {...(activeModal ? {} : { 'data-tooltip': "View guest service, maintenance & checkout requests" })} style={{ position: 'relative' }}>
           <svg viewBox="0 0 24 24">
             <path d="M18 8h1a4 4 0 0 1 0 8h-1"/>
             <path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z"/>
@@ -117,7 +128,7 @@ export default function Toolbar({
           )}
         </button>
 
-        <button className="btn-action" onClick={() => onActionClick('id_verify')} data-tooltip="Review and verify uploaded Guest ID documents">
+        <button className="btn-action" onClick={() => onActionClick('id_verify')} {...(activeModal ? {} : { 'data-tooltip': "Review and verify uploaded Guest ID documents" })}>
           <svg viewBox="0 0 24 24">
             <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
             <polyline points="9 12 11 14 15 10" />
@@ -125,14 +136,14 @@ export default function Toolbar({
           ID Verify
         </button>
 
-        <button className="btn-action" onClick={() => onActionClick('refresh')} data-tooltip="Re-sync dashboard with database">
+        <button className="btn-action" onClick={() => onActionClick('refresh')} {...(activeModal ? {} : { 'data-tooltip': "Re-sync dashboard with database" })}>
           <svg viewBox="0 0 24 24">
             <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67" />
           </svg>
           Refresh
         </button>
 
-        <button className="btn-action exit" onClick={() => onActionClick('exit')} data-tooltip="Close module and return to PMS shell">
+        <button className="btn-action exit" onClick={() => onActionClick('exit')} {...(activeModal ? {} : { 'data-tooltip': "Close module and return to PMS shell" })}>
           <svg viewBox="0 0 24 24">
             <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
             <polyline points="16 17 21 12 16 7" />

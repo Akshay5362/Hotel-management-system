@@ -17,11 +17,11 @@ const ASSETS_DIR = path.join(PROJECT_ROOT, 'assets');
  */
 const BRANDING_CONFIG = {
   // ─── Application Naming ─────────────────────────────────────────────────────
-  productName: 'Webline PMS',
+  productName: 'Webline PMS Plus',
   appId: 'com.webline.pms',
 
   // ─── Window Configuration ───────────────────────────────────────────────────
-  windowTitle: 'Webline PMS',
+  windowTitle: 'Webline PMS Plus',
 
   // ─── Asset Paths ────────────────────────────────────────────────────────────
   // Place future app icons here:

@@ -14,29 +14,38 @@ import UpcomingReservationsModal from './components/UpcomingReservationsModal';
 import GuestRequestsModal from './components/GuestRequestsModal';
 import IdentityVerificationModal from './components/IdentityVerificationModal';
 import RefundCheckoutModal from './components/RefundCheckoutModal';
+import AnalyticsModal from './components/AnalyticsModal';
 import { AdminAuthProvider, AdminAuthContext } from './contexts/AdminAuthContext';
 import { GuestAuthProvider, GuestAuthContext } from './contexts/GuestAuthContext';
-import { AdminProtectedRoute, GuestProtectedRoute } from './components/ProtectedRoutes';
+import { AdminProtectedRoute, GuestProtectedRoute, RoleProtectedRoute } from './components/ProtectedRoutes';
+import { ReceptionDashboard, KitchenDashboard, PantryDashboard, HousekeepingDashboard } from './components/StaffDashboards';
+import ReceptionPortal from './components/ReceptionPortal';
+import Sidebar from './components/Sidebar';
+import RoomInspectorDrawer from './components/RoomInspectorDrawer';
+import { io } from 'socket.io-client';
 
-// Starting initial room configuration directly mimicking the screenshot layout
+// Room inventory: 17 rooms — 3 Premium, 10 Executive, 4 Standard
+// Rooms 13, 15, 18 do NOT exist.
 const INITIAL_ROOMS = [
-  { id: '101', number: '101', type: 'PREMIUM', status: 'vacant', guestName: '', pax: 0, phone: '', rate: 2500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '102', number: '102', type: 'EXECUTIVE', status: 'occupied', guestName: 'RAJVEER SINGH', pax: 2, phone: '+91 9876543210', rate: 2000, deposit: 1000, checkInDate: '10-Jul-2026', user_id: null, ledger: [{ id: 1, desc: 'Room Tariff Charge', qty: 1, amount: 2000, business_date: '10-Jul-2026' }, { id: 2, desc: 'Taxes & GST (12%)', qty: 1, amount: 240, business_date: '10-Jul-2026' }] },
-  { id: '103', number: '103', type: 'EXECUTIVE', status: 'occupied', guestName: 'KATARI AKHILESH', pax: 1, phone: '+91 9123456789', rate: 2000, deposit: 2000, checkInDate: '09-Jul-2026', user_id: 3, ledger: [{ id: 1, desc: 'Room Tariff Charge (2 Nights)', qty: 2, amount: 4000, business_date: '09-Jul-2026' }, { id: 2, desc: 'Taxes & GST (12%)', qty: 1, amount: 480, business_date: '09-Jul-2026' }, { id: 3, desc: 'Room Service (Mineral Water)', qty: 2, amount: 120, business_date: '10-Jul-2026' }] },
-  { id: '104', number: '104', type: 'EXECUTIVE', status: 'vacant', guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '105', number: '105', type: 'PREMIUM', status: 'vacant', guestName: '', pax: 0, phone: '', rate: 2500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '106', number: '106', type: 'EXECUTIVE', status: 'vacant', guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '107', number: '107', type: 'EXECUTIVE', status: 'occupied', guestName: 'RAJESH', pax: 1, phone: '+91 8888888888', rate: 2000, deposit: 500, checkInDate: '11-Jul-2026', user_id: null, ledger: [{ id: 1, desc: 'Room Tariff Charge', qty: 1, amount: 2000, business_date: '11-Jul-2026' }, { id: 2, desc: 'Taxes & GST (12%)', qty: 1, amount: 240, business_date: '11-Jul-2026' }] },
-  { id: '108', number: '108', type: 'EXECUTIVE', status: 'vacant', guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '110', number: '110', type: 'EXECUTIVE', status: 'occupied', guestName: 'MR. NAVEEN SONI', pax: 2, phone: '+91 7777777777', rate: 2000, deposit: 1500, checkInDate: '10-Jul-2026', user_id: null, ledger: [{ id: 1, desc: 'Room Tariff Charge', qty: 1, amount: 2000, business_date: '10-Jul-2026' }, { id: 2, desc: 'Taxes & GST (12%)', qty: 1, amount: 240, business_date: '10-Jul-2026' }, { id: 3, desc: 'Restaurant Posting (Dinner)', qty: 1, amount: 480, business_date: '10-Jul-2026' }] },
-  { id: '111', number: '111', type: 'EXECUTIVE', status: 'vacant', guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '112', number: '112', type: 'EXECUTIVE', status: 'vacant', guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '114', number: '114', type: 'PREMIUM', status: 'vacant', guestName: '', pax: 0, phone: '', rate: 2500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '116', number: '116', type: 'STANDARD', status: 'vacant', guestName: '', pax: 0, phone: '', rate: 1500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '117', number: '117', type: 'STANDARD', status: 'occupied', guestName: 'RAGHUBEER', pax: 1, phone: '+91 9999999999', rate: 1500, deposit: 1000, checkInDate: '11-Jul-2026', user_id: null, ledger: [{ id: 1, desc: 'Room Tariff Charge', qty: 1, amount: 1500, business_date: '11-Jul-2026' }, { id: 2, desc: 'Taxes & GST (12%)', qty: 1, amount: 180, business_date: '11-Jul-2026' }] },
-  { id: '119', number: '119', type: 'STANDARD', status: 'vacant', guestName: '', pax: 0, phone: '', rate: 1500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '120', number: '120', type: 'STANDARD', status: 'dirty', guestName: '', pax: 0, phone: '', rate: 1500, deposit: 0, checkInDate: '', user_id: null, ledger: [] }
+  { id: '1',  number: '1',  type: 'PREMIUM',   status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
+  { id: '2',  number: '2',  type: 'EXECUTIVE',  status: 'occupied', guestName: 'RAJVEER SINGH', pax: 2, phone: '+91 9876543210', rate: 2000, deposit: 1000, checkInDate: '10-Jul-2026', user_id: null, ledger: [{ id: 1, desc: 'Room Tariff Charge', qty: 1, amount: 2000, business_date: '10-Jul-2026' }, { id: 2, desc: 'Taxes & GST (5%)', qty: 1, amount: 240, business_date: '10-Jul-2026' }] },
+  { id: '3',  number: '3',  type: 'EXECUTIVE',  status: 'occupied', guestName: 'KATARI AKHILESH', pax: 1, phone: '+91 9123456789', rate: 2000, deposit: 2000, checkInDate: '09-Jul-2026', user_id: 3, ledger: [{ id: 1, desc: 'Room Tariff Charge (2 Nights)', qty: 2, amount: 4000, business_date: '09-Jul-2026' }, { id: 2, desc: 'Taxes & GST (5%)', qty: 1, amount: 480, business_date: '09-Jul-2026' }] },
+  { id: '4',  number: '4',  type: 'EXECUTIVE',  status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
+  { id: '5',  number: '5',  type: 'PREMIUM',    status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
+  { id: '6',  number: '6',  type: 'EXECUTIVE',  status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
+  { id: '7',  number: '7',  type: 'EXECUTIVE',  status: 'occupied', guestName: 'RAJESH', pax: 1, phone: '+91 8888888888', rate: 2000, deposit: 500, checkInDate: '11-Jul-2026', user_id: null, ledger: [{ id: 1, desc: 'Room Tariff Charge', qty: 1, amount: 2000, business_date: '11-Jul-2026' }, { id: 2, desc: 'Taxes & GST (5%)', qty: 1, amount: 240, business_date: '11-Jul-2026' }] },
+  { id: '8',  number: '8',  type: 'EXECUTIVE',  status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
+  { id: '9',  number: '9',  type: 'EXECUTIVE',  status: 'occupied', guestName: 'MR. NAVEEN SONI', pax: 2, phone: '+91 7777777777', rate: 2000, deposit: 1500, checkInDate: '10-Jul-2026', user_id: null, ledger: [{ id: 1, desc: 'Room Tariff Charge', qty: 1, amount: 2000, business_date: '10-Jul-2026' }, { id: 2, desc: 'Taxes & GST (5%)', qty: 1, amount: 240, business_date: '10-Jul-2026' }] },
+  { id: '10', number: '10', type: 'EXECUTIVE',  status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
+  { id: '11', number: '11', type: 'EXECUTIVE',  status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
+  { id: '12', number: '12', type: 'EXECUTIVE',  status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
+  { id: '14', number: '14', type: 'PREMIUM',    status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
+  { id: '16', number: '16', type: 'STANDARD',   status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 1500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
+  { id: '17', number: '17', type: 'STANDARD',   status: 'occupied', guestName: 'RAGHUBEER', pax: 1, phone: '+91 9999999999', rate: 1500, deposit: 1000, checkInDate: '11-Jul-2026', user_id: null, ledger: [{ id: 1, desc: 'Room Tariff Charge', qty: 1, amount: 1500, business_date: '11-Jul-2026' }, { id: 2, desc: 'Taxes & GST (5%)', qty: 1, amount: 180, business_date: '11-Jul-2026' }] },
+  { id: '19', number: '19', type: 'STANDARD',   status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 1500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
+  { id: '20', number: '20', type: 'STANDARD',   status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 1500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
 ];
+
 
 function LandingPage({ onNavigate }) {
   return (
@@ -150,7 +159,11 @@ function LandingPage({ onNavigate }) {
   );
 }
 
+import AdminHousekeeping from './components/AdminHousekeeping.jsx';
+import AdminGuests from './components/AdminGuests.jsx';
+
 function AppContent() {
+  const [adminTab, setAdminTab] = useState('frontdesk');
   const [rooms, setRooms] = useState([]);
   const [filter, setFilter] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -180,10 +193,10 @@ function AppContent() {
   const [currentPath, setCurrentPath] = useState(window.location.pathname);
 
   // Custom Navigation Router
-  const navigate = (path) => {
+  const navigate = useCallback((path) => {
     window.history.pushState({}, '', path);
     setCurrentPath(path);
-  };
+  }, []);
 
   useEffect(() => {
     const handlePopState = () => {
@@ -263,7 +276,7 @@ function AppContent() {
   };
 
   // Load status from backend
-  const fetchStatus = async () => {
+  const fetchStatus = useCallback(async () => {
     const currentToken = adminToken || guestToken;
     if (!currentToken) {
       setIsLoading(false);
@@ -284,11 +297,14 @@ function AppContent() {
       clearTimeout(timeout);
 
       if (res.status === 401 || res.status === 403) {
-        localStorage.removeItem('user');
-        localStorage.removeItem('token');
-        setUser(null);
-        setToken('');
-        navigate(window.location.pathname.includes('admin') ? '/admin/login' : '/login');
+        const isAdminPath = window.location.pathname.includes('admin');
+        if (isAdminPath) {
+          adminLogout();
+          navigate('/admin/login');
+        } else {
+          guestLogout();
+          navigate('/login');
+        }
         return;
       }
 
@@ -314,7 +330,7 @@ function AppContent() {
       // Always stop loading — no matter what happens
       setIsLoading(false);
     }
-  };
+  }, [adminToken, guestToken, navigate]);
 
   // Fetch guest requests count for badge
   const [requestCount, setRequestCount] = useState(0);
@@ -332,12 +348,39 @@ function AppContent() {
     } catch (e) { /* silent */ }
   }, [adminToken]);
 
-  // Auto-refresh request count every 15 seconds for admins (near real-time)
+  // Real-time Guest Requests and Fallback Polling
   useEffect(() => {
     if (!adminUser || adminUser.role !== 'admin' || !adminToken) return;
     fetchRequestCount();
-    const interval = setInterval(fetchRequestCount, 15000);
-    return () => clearInterval(interval);
+
+    const socket = io('http://localhost:5000');
+    let fallbackInterval = null;
+
+    socket.on('connect', () => {
+      console.log('Connected to real-time Guest Requests socket');
+      if (fallbackInterval) {
+        clearInterval(fallbackInterval);
+        fallbackInterval = null;
+      }
+    });
+
+    socket.on('disconnect', () => {
+      console.log('Disconnected from socket. Falling back to 15s polling.');
+      if (!fallbackInterval) {
+        fallbackInterval = setInterval(fetchRequestCount, 15000);
+      }
+    });
+
+    socket.on('new_guest_request', () => {
+      fetchRequestCount();
+      // Dispatch an event so GuestRequestsModal can refresh if it's currently open
+      document.dispatchEvent(new CustomEvent('guest-request-refresh'));
+    });
+
+    return () => {
+      if (fallbackInterval) clearInterval(fallbackInterval);
+      socket.disconnect();
+    };
   }, [adminUser, adminToken, fetchRequestCount]);
 
   // ── AUTO-POLL: Refresh full room grid every 20 seconds for admin ───────────────────
@@ -529,6 +572,9 @@ function AppContent() {
       case 'reports':
         setActiveModal('reports');
         break;
+      case 'analytics':
+        setActiveModal('analytics');
+        break;
       case 'id_verify':
         setActiveModal('id_verify');
         break;
@@ -550,8 +596,8 @@ function AppContent() {
           'No'
         );
         if (confirmExit) {
-          setUser(null);
-          window.close();
+          adminLogout();
+          navigate('/admin/login');
         }
         break;
       default:
@@ -915,9 +961,30 @@ function AppContent() {
   }
 
   const handleAuthSuccess = (userData, userToken) => {
-    if (userData.role === 'admin') {
+    if (userData.role === 'admin' || userData.loginType === 'staff') {
       adminLogin(userData, userToken);
-      navigate('/admin/dashboard');
+      
+      // Route based on role
+      switch (userData.role) {
+        case 'ADMIN':
+        case 'admin':
+          navigate('/admin/dashboard');
+          break;
+        case 'RECEPTIONIST':
+          navigate('/reception/dashboard');
+          break;
+        case 'CHEF':
+          navigate('/kitchen/dashboard');
+          break;
+        case 'PANTRY_BOY':
+          navigate('/pantry/dashboard');
+          break;
+        case 'CLEANER':
+          navigate('/housekeeping/dashboard');
+          break;
+        default:
+          navigate('/admin/login');
+      }
     } else {
       guestLogin(userData, userToken);
       navigate('/dashboard');
@@ -988,9 +1055,17 @@ function AppContent() {
     );
   } else if (currentPath === '/admin/dashboard') {
     pageContent = (
-      <AdminProtectedRoute navigate={navigate}>
-        <div className="app-container">
-          {/* Header Panel */}
+      <RoleProtectedRoute allowedRoles={['ADMIN', 'admin']} navigate={navigate}>
+        <div className="app-layout">
+          <Sidebar
+            activeTab={adminTab}
+            activeModal={activeModal}
+            onTabChange={(tab) => setAdminTab(tab)}
+            onAction={(action) => setActiveModal(action)}
+            onNavigate={navigate}
+          />
+          <div className="app-container">
+            {/* Header Panel */}
           <header className="header">
             <div className="brand-section">
               <span className="logo-icon">🏢</span>
@@ -1031,7 +1106,7 @@ function AppContent() {
               <div className="user-badge" data-tooltip={isBackendOnline ? "System Sync Active (MySQL Connected)" : "Demo Mode (MySQL Disconnected)"}>
                 <span className="user-indicator" style={{ background: isBackendOnline ? 'var(--color-booked)' : 'var(--color-occupied)', boxShadow: isBackendOnline ? '0 0 8px var(--color-booked)' : '0 0 8px var(--color-occupied)' }}></span>
                 <span style={{ fontSize: '0.8rem', fontWeight: '600' }}>
-                  USER: {adminUser?.fullName?.toUpperCase()}
+                  USER: {(adminUser?.fullName || adminUser?.full_name)?.toUpperCase()}
                 </span>
                 <button onClick={handleAdminLogout} style={{ background: 'transparent', border: 'none', color: '#ff4d4d', marginLeft: '10px', cursor: 'pointer', fontSize: '0.75rem', fontWeight: '700' }}>
                   Logout
@@ -1049,17 +1124,92 @@ function AppContent() {
             searchQuery={searchQuery}
             setSearchQuery={setSearchQuery}
             requestCount={requestCount}
+            activeModal={activeModal}
           />
 
           {/* Main Workspace Scrollable Body */}
+          {adminTab === 'housekeeping' && <AdminHousekeeping onBack={() => setAdminTab('frontdesk')} />}
+          {adminTab === 'guests' && (
+            <div className="dashboard-body">
+              <AdminGuests token={adminToken} />
+            </div>
+          )}
+          {adminTab === 'reservations' && (
+            <div className="dashboard-body">
+              <div style={{ padding: '24px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '20px' }}>
+                  <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    📅 Upcoming Reservations
+                  </h2>
+                  <button className="btn-secondary" style={{ fontSize: '0.82rem', padding: '7px 14px' }} onClick={() => setAdminTab('frontdesk')}>
+                    ← Back to Front Office
+                  </button>
+                </div>
+                {upcomingReservations.length === 0 ? (
+                  <div style={{ textAlign: 'center', padding: '60px 20px', color: 'var(--text-muted)' }}>
+                    <div style={{ fontSize: '3rem', marginBottom: '16px' }}>📭</div>
+                    <p style={{ fontSize: '1rem', fontWeight: 600 }}>No upcoming reservations</p>
+                    <p style={{ fontSize: '0.85rem', marginTop: '6px' }}>Advance bookings from the Guest Portal will appear here.</p>
+                  </div>
+                ) : (
+                  <div style={{ overflowX: 'auto' }}>
+                    <table className="ledger-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
+                      <thead>
+                        <tr>
+                          <th style={{ textAlign: 'left', padding: '10px 14px' }}>Room #</th>
+                          <th style={{ textAlign: 'left', padding: '10px 14px' }}>Guest Name</th>
+                          <th style={{ textAlign: 'left', padding: '10px 14px' }}>Phone</th>
+                          <th style={{ textAlign: 'center', padding: '10px 14px' }}>Check-In</th>
+                          <th style={{ textAlign: 'center', padding: '10px 14px' }}>Check-Out</th>
+                          <th style={{ textAlign: 'center', padding: '10px 14px' }}>Pax</th>
+                          <th style={{ textAlign: 'right', padding: '10px 14px' }}>Amount (₹)</th>
+                          <th style={{ textAlign: 'center', padding: '10px 14px' }}>Ref Code</th>
+                          <th style={{ textAlign: 'center', padding: '10px 14px' }}>Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {upcomingReservations.map((res, i) => (
+                          <tr key={res.booking_id || i} style={{ cursor: 'default' }}>
+                            <td style={{ padding: '10px 14px', fontWeight: 700, color: 'var(--color-booked)' }}>{res.room_number}</td>
+                            <td style={{ padding: '10px 14px', fontWeight: 600 }}>{res.guest_name}</td>
+                            <td style={{ padding: '10px 14px', color: 'var(--text-muted)' }}>{res.phone || '—'}</td>
+                            <td style={{ padding: '10px 14px', textAlign: 'center' }}>{res.check_in_date}</td>
+                            <td style={{ padding: '10px 14px', textAlign: 'center' }}>{res.check_out_date}</td>
+                            <td style={{ padding: '10px 14px', textAlign: 'center' }}>{res.pax}</td>
+                            <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 600 }}>₹{(res.total_amount || 0).toLocaleString('en-IN')}</td>
+                            <td style={{ padding: '10px 14px', textAlign: 'center', fontFamily: 'monospace', fontSize: '0.8rem', color: 'var(--text-muted)' }}>{res.ref_code || res.booking_ref || '—'}</td>
+                            <td style={{ padding: '10px 14px', textAlign: 'center' }}>
+                              <span style={{
+                                background: res.status === 'confirmed' ? 'rgba(56,189,248,0.12)' : 'rgba(251,191,36,0.12)',
+                                color: res.status === 'confirmed' ? '#38bdf8' : '#fbbf24',
+                                border: `1px solid ${res.status === 'confirmed' ? 'rgba(56,189,248,0.3)' : 'rgba(251,191,36,0.3)'}`,
+                                borderRadius: '4px', padding: '2px 8px', fontSize: '0.75rem', fontWeight: 700,
+                                textTransform: 'uppercase'
+                              }}>
+                                {res.status || 'pending'}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          {(adminTab === 'frontdesk' || adminTab === 'rooms') && (
           <div className="dashboard-body">
-            <RoomGrid 
-              rooms={rooms}
-              activeFilter={filter}
-              searchQuery={searchQuery}
-              onRoomClick={handleRoomClick}
-            />
+            <div className="room-grid-wrapper">
+              <RoomGrid 
+                rooms={rooms}
+                activeFilter={filter}
+                searchQuery={searchQuery}
+                onRoomClick={handleRoomClick}
+              />
+            </div>
           </div>
+          )}
 
           {/* Bottom Metrics Information Bar */}
           <MetricsBar 
@@ -1121,9 +1271,16 @@ function AppContent() {
           />
 
           <CashStatusModal 
-            isOpen={activeModal === 'cash'}
-            onClose={() => setActiveModal(null)}
+            isOpen={activeModal === 'cash'} 
+            onClose={() => setActiveModal(null)} 
             cashLog={cashLog}
+            token={adminToken}
+            adminUser={adminUser}
+          />
+
+          <AnalyticsModal 
+            isOpen={activeModal === 'analytics'} 
+            onClose={() => setActiveModal(null)} 
           />
 
           <ReportsModal 
@@ -1152,7 +1309,37 @@ function AppContent() {
             showConfirm={showConfirm}
           />
         </div>
-      </AdminProtectedRoute>
+        <RoomInspectorDrawer 
+          selectedRoom={selectedRoom} 
+          onClose={() => setSelectedRoom(null)}
+          onActionClick={handleActionClick} 
+        />
+        </div>
+      </RoleProtectedRoute>
+    );
+  } else if (currentPath === '/reception/dashboard') {
+    pageContent = (
+      <RoleProtectedRoute allowedRoles={['RECEPTIONIST']} navigate={navigate}>
+        <ReceptionPortal />
+      </RoleProtectedRoute>
+    );
+  } else if (currentPath === '/kitchen/dashboard') {
+    pageContent = (
+      <RoleProtectedRoute allowedRoles={['CHEF']} navigate={navigate}>
+        <KitchenDashboard />
+      </RoleProtectedRoute>
+    );
+  } else if (currentPath === '/pantry/dashboard') {
+    pageContent = (
+      <RoleProtectedRoute allowedRoles={['PANTRY_BOY']} navigate={navigate}>
+        <PantryDashboard />
+      </RoleProtectedRoute>
+    );
+  } else if (currentPath === '/housekeeping/dashboard') {
+    pageContent = (
+      <RoleProtectedRoute allowedRoles={['CLEANER']} navigate={navigate}>
+        <HousekeepingDashboard />
+      </RoleProtectedRoute>
     );
   } else {
     pageContent = (

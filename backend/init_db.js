@@ -50,24 +50,28 @@ const INITIAL_ROOM_TYPES = [
   { code: 'PREMIUM', title: 'Premium Suite Room', description: 'Indulge in ultimate refinement. Our Premium Suite is an expansive heaven featuring a private living lounge, scenic architecture, a deep soaking tub, and bespoke luxury amenities.', base_rate: 2500, image: '👑' }
 ];
 
+// Room inventory: 17 rooms — 3 Premium, 10 Executive, 4 Standard
+// Rooms 13, 15, 18 are intentionally excluded.
 const INITIAL_ROOMS = [
-  { number: '101', type: 'PREMIUM', status: 'vacant' },
-  { number: '102', type: 'EXECUTIVE', status: 'occupied' },
-  { number: '103', type: 'EXECUTIVE', status: 'occupied' },
-  { number: '104', type: 'EXECUTIVE', status: 'vacant' },
-  { number: '105', type: 'PREMIUM', status: 'vacant' },
-  { number: '106', type: 'EXECUTIVE', status: 'vacant' },
-  { number: '107', type: 'EXECUTIVE', status: 'occupied' },
-  { number: '108', type: 'EXECUTIVE', status: 'vacant' },
-  { number: '110', type: 'EXECUTIVE', status: 'occupied' },
-  { number: '111', type: 'EXECUTIVE', status: 'vacant' },
-  { number: '112', type: 'EXECUTIVE', status: 'vacant' },
-  { number: '114', type: 'PREMIUM', status: 'vacant' },
-  { number: '116', type: 'STANDARD', status: 'vacant' },
-  { number: '117', type: 'STANDARD', status: 'occupied' },
-  { number: '119', type: 'STANDARD', status: 'vacant' },
-  { number: '120', type: 'STANDARD', status: 'dirty' }
+  { number: '1',  type: 'PREMIUM',   status: 'vacant' },
+  { number: '2',  type: 'EXECUTIVE', status: 'vacant' },
+  { number: '3',  type: 'EXECUTIVE', status: 'vacant' },
+  { number: '4',  type: 'EXECUTIVE', status: 'vacant' },
+  { number: '5',  type: 'PREMIUM',   status: 'vacant' },
+  { number: '6',  type: 'EXECUTIVE', status: 'vacant' },
+  { number: '7',  type: 'EXECUTIVE', status: 'vacant' },
+  { number: '8',  type: 'EXECUTIVE', status: 'vacant' },
+  { number: '9',  type: 'EXECUTIVE', status: 'vacant' },
+  { number: '10', type: 'EXECUTIVE', status: 'vacant' },
+  { number: '11', type: 'EXECUTIVE', status: 'vacant' },
+  { number: '12', type: 'EXECUTIVE', status: 'vacant' },
+  { number: '14', type: 'PREMIUM',   status: 'vacant' },
+  { number: '16', type: 'STANDARD',  status: 'vacant' },
+  { number: '17', type: 'STANDARD',  status: 'vacant' },
+  { number: '19', type: 'STANDARD',  status: 'vacant' },
+  { number: '20', type: 'STANDARD',  status: 'vacant' },
 ];
+
 
 const INITIAL_SYSTEM_SETTINGS = [
   { key_name: 'system_date', value_val: '11-Jul-2026' },
@@ -411,6 +415,25 @@ async function initialize() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
+  await dbConn.query(`
+    CREATE TABLE \`stay_extension_requests\` (
+      \`id\` INT AUTO_INCREMENT PRIMARY KEY,
+      \`booking_id\` INT NOT NULL,
+      \`guest_id\` INT NOT NULL,
+      \`room_id\` INT NOT NULL,
+      \`current_checkout_date\` VARCHAR(20) NOT NULL,
+      \`requested_checkout_date\` VARCHAR(20) NOT NULL,
+      \`status\` VARCHAR(20) DEFAULT 'Pending',
+      \`admin_id\` INT DEFAULT NULL,
+      \`remarks\` TEXT,
+      \`created_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      \`updated_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY (\`booking_id\`) REFERENCES \`bookings\`(\`id\`) ON DELETE CASCADE,
+      FOREIGN KEY (\`guest_id\`) REFERENCES \`guests\`(\`id\`) ON DELETE CASCADE,
+      FOREIGN KEY (\`room_id\`) REFERENCES \`rooms\`(\`id\`) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  `);
+
   console.log('Tables created successfully. Seeding initial data...');
 
   // A. Seed Roles
@@ -523,7 +546,7 @@ async function initialize() {
       total_amount: 2800,
       ledger: [
         { desc: 'Room Tariff Charge', qty: 1, amount: 2500, business_date: '10-Jul-2026' },
-        { desc: 'Taxes & GST (12%)', qty: 1, amount: 300, business_date: '10-Jul-2026' }
+        { desc: 'Taxes & GST (5%)', qty: 1, amount: 300, business_date: '10-Jul-2026' }
       ],
       cash: [
         { time: '09:30 AM', type: 'Advance Deposit', amount: 1000, business_date: '11-Jul-2026' }
@@ -537,7 +560,7 @@ async function initialize() {
       total_amount: 5720,
       ledger: [
         { desc: 'Room Tariff Charge (2 Nights)', qty: 2, amount: 5000, business_date: '09-Jul-2026' },
-        { desc: 'Taxes & GST (12%)', qty: 1, amount: 600, business_date: '09-Jul-2026' },
+        { desc: 'Taxes & GST (5%)', qty: 1, amount: 600, business_date: '09-Jul-2026' },
         { desc: 'Room Service (Mineral Water)', qty: 2, amount: 120, business_date: '10-Jul-2026' }
       ],
       cash: []
@@ -550,7 +573,7 @@ async function initialize() {
       total_amount: 2800,
       ledger: [
         { desc: 'Room Tariff Charge', qty: 1, amount: 2500, business_date: '11-Jul-2026' },
-        { desc: 'Taxes & GST (12%)', qty: 1, amount: 300, business_date: '11-Jul-2026' }
+        { desc: 'Taxes & GST (5%)', qty: 1, amount: 300, business_date: '11-Jul-2026' }
       ],
       cash: []
     },
@@ -562,7 +585,7 @@ async function initialize() {
       total_amount: 3280,
       ledger: [
         { desc: 'Room Tariff Charge', qty: 1, amount: 2500, business_date: '10-Jul-2026' },
-        { desc: 'Taxes & GST (12%)', qty: 1, amount: 300, business_date: '10-Jul-2026' },
+        { desc: 'Taxes & GST (5%)', qty: 1, amount: 300, business_date: '10-Jul-2026' },
         { desc: 'Restaurant Posting (Dinner)', qty: 1, amount: 480, business_date: '10-Jul-2026' }
       ],
       cash: [
@@ -577,7 +600,7 @@ async function initialize() {
       total_amount: 1680,
       ledger: [
         { desc: 'Room Tariff Charge', qty: 1, amount: 1500, business_date: '11-Jul-2026' },
-        { desc: 'Taxes & GST (12%)', qty: 1, amount: 180, business_date: '11-Jul-2026' }
+        { desc: 'Taxes & GST (5%)', qty: 1, amount: 180, business_date: '11-Jul-2026' }
       ],
       cash: [
         { time: '11:15 AM', type: 'Advance Deposit', amount: 1000, business_date: '11-Jul-2026' }

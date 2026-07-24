@@ -2,45 +2,138 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Loading Webline PMS...</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Loading Webline PMS Plus...</title>
   <style>
-    body {
+    * {
       margin: 0;
       padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
       display: flex;
       flex-direction: column;
-      justify-content: center;
       align-items: center;
+      justify-content: center;
       height: 100vh;
-      background-color: #0d1117; /* Matches main window to prevent flash */
+      background: #080b10;
       color: #ffffff;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
       overflow: hidden;
-      -webkit-app-region: drag; /* Allows moving the borderless splash screen */
+      -webkit-app-region: drag;
       user-select: none;
     }
-    h1 {
-      font-size: 24px;
-      margin-bottom: 30px;
-      font-weight: 500;
+
+    .logo-icon {
+      font-size: 3.5rem;
+      margin-bottom: 1rem;
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    .brand-name {
+      font-size: 1.6rem;
+      font-weight: 700;
+      letter-spacing: 2px;
+      color: #ffffff;
+      margin-bottom: 4px;
+    }
+
+    .brand-name span {
+      color: #38bdf8;
+    }
+
+    .brand-sub {
+      font-size: 0.75rem;
+      color: #64748b;
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      margin-bottom: 2.5rem;
+    }
+
+    /* Progress bar */
+    .progress-track {
+      width: 220px;
+      height: 3px;
+      background: rgba(255, 255, 255, 0.06);
+      border-radius: 99px;
+      overflow: hidden;
+      margin-bottom: 1.2rem;
+    }
+
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #38bdf8, #818cf8);
+      border-radius: 99px;
+      animation: fill 2.8s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+    }
+
+    .status-text {
+      font-size: 0.72rem;
+      color: #475569;
+      letter-spacing: 1px;
+      animation: fadeText 2.8s ease-in-out;
+    }
+
+    /* Bottom version tag */
+    .version {
+      position: absolute;
+      bottom: 18px;
+      font-size: 0.62rem;
+      color: #334155;
       letter-spacing: 1px;
     }
-    /* Loading Spinner Animation */
-    .spinner {
-      width: 40px;
-      height: 40px;
-      border: 4px solid rgba(255, 255, 255, 0.1);
-      border-left-color: #3498db; /* Professional accent color */
-      border-radius: 50%;
-      animation: spin 1s linear infinite;
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1;   transform: scale(1);    }
+      50%       { opacity: 0.7; transform: scale(0.95); }
     }
-    @keyframes spin {
-      to { transform: rotate(360deg); }
+
+    @keyframes fill {
+      0%   { width: 0%;   }
+      40%  { width: 55%;  }
+      80%  { width: 85%;  }
+      100% { width: 100%; }
+    }
+
+    @keyframes fadeText {
+      0%   { opacity: 0.4; }
+      50%  { opacity: 1;   }
+      100% { opacity: 0.6; }
     }
   </style>
 </head>
 <body>
-  <h1>Webline PMS</h1>
-  <div class="spinner"></div>
+  <div class="logo-icon">🏢</div>
+  <div class="brand-name">Webline PMS <span>Plus</span></div>
+  <div class="brand-sub">Hotel Property Management</div>
+
+  <div class="progress-track">
+    <div class="progress-bar"></div>
+  </div>
+  <div class="status-text" id="status">Starting services...</div>
+
+  <div class="version">Version 1.0.0 &nbsp;·&nbsp; Hotel Sky-5</div>
+
+  <script>
+    // Cycle through loading status messages
+    const messages = [
+      'Starting services...',
+      'Connecting to database...',
+      'Loading front office...',
+      'Almost ready...',
+    ];
+    let i = 0;
+    const statusEl = document.getElementById('status');
+    const interval = setInterval(() => {
+      i++;
+      if (i < messages.length) {
+        statusEl.textContent = messages[i];
+      } else {
+        clearInterval(interval);
+      }
+    }, 800);
+  </script>
 </body>
 </html>

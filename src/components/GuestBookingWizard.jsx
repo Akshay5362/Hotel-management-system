@@ -306,7 +306,7 @@ export default function GuestBookingWizard({
     });
   }
 
-  const taxesAmount = Math.round((baseRate - loyaltyDiscount + servicesTotal) * 0.12);
+  const taxesAmount = Math.round((baseRate - loyaltyDiscount + servicesTotal) * 0.05);
   const totalStayPrice = (baseRate - loyaltyDiscount) + servicesTotal + taxesAmount;
 
   const handleTransitionToPayment = () => {
@@ -1410,7 +1410,7 @@ export default function GuestBookingWizard({
                     ))}
 
                     <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      <span>Taxes & GST (12% of Tariff + Services)</span>
+                      <span>Taxes & GST (5% of Tariff + Services)</span>
                       <span>₹ {taxesAmount}</span>
                     </div>
 
@@ -1517,7 +1517,7 @@ export default function GuestBookingWizard({
                         </div>
                       ))}
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                        <span>GST &amp; Taxes (12%)</span>
+                        <span>GST &amp; Taxes (5%)</span>
                         <span>₹ {taxesAmount.toLocaleString()}</span>
                       </div>
                       <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '8px', marginTop: '2px', fontSize: '1rem', fontWeight: 'bold', color: '#fff' }}>

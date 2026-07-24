@@ -1,0 +1,273 @@
+﻿diff --git a/src/components/GuestDashboard.jsx b/src/components/GuestDashboard.jsx
+index d8c7824..cb3c585 100644
+--- a/src/components/GuestDashboard.jsx
++++ b/src/components/GuestDashboard.jsx
+@@ -7,6 +7,7 @@ import GuestBilling from './GuestBilling';
+ import GuestNotifications from './GuestNotifications';
+ import GuestRoomService from './GuestRoomService';
+ import GuestMaintenance from './GuestMaintenance';
++import GuestFeedback from './GuestFeedback';
+ 
+ export default function GuestDashboard({ user, token, rooms, systemDate, onLogout, showAlert, fetchStatus, onUserUpdate }) {
+   const [wizardStep, setWizardStep] = useState(1); // 1: Room Selection, 2: Guest Details, 3: ID Verification, 4: Extra Services, 5: Payment, 6: Confirmation
+@@ -124,9 +125,9 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
+   // Auto-load on tab switch + always sync room status from server
+   useEffect(() => {
+     fetchStatus(); // Sync room status from server on every tab switch
+-    if (dashTab === 'bill') loadBill();
++    if (isOccupied) loadBill(); // ALWAYS load bill so Overview has latest balance
+     if (dashTab === 'notifications') loadNotifications();
+-  }, [dashTab]);
++  }, [dashTab, isOccupied, fetchStatus, loadBill, loadNotifications]);
+ 
+   // Auto-load notifications on mount if occupied (for badge count)
+   // Also call fetchStatus on initial mount so stale room data is refreshed immediately
+@@ -159,9 +160,10 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
+     if (!token) return;
+     const interval = setInterval(() => {
+       fetchStatus();
++      if (isOccupied) loadBill(); // Also fetch latest bill automatically
+     }, 30000);
+     return () => clearInterval(interval);
+-  }, [token, fetchStatus]);
++  }, [token, fetchStatus, isOccupied, loadBill]);
+ 
+   // When the guest goes from occupied ΓåÆ not occupied (admin checked them out),
+   // immediately load their history so the post-checkout screen appears.
+@@ -263,7 +265,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
+     try {
+       await apiFetch('/guest/service', { method: 'POST', body: JSON.stringify({ serviceDesc, amount, qty }) });
+       showAlert(`Γ£à "${serviceDesc}" request submitted! It will be delivered shortly.`, 'Service Requested');
+-      if (dashTab === 'bill') await loadBill();
++      await loadBill();
+     } catch (e) {
+       showAlert(e.message, 'Service Error');
+     } finally {
+@@ -297,6 +299,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
+       showAlert(`≡ƒôà ${data.message}`, 'Stay Extended!');
+       setExtendDate('');
+       await fetchStatus();
++      await loadBill();
+     } catch (e) {
+       showAlert(e.message, 'Extend Stay Error');
+     } finally {
+@@ -318,7 +321,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
+       }
+       showAlert('≡ƒì╜∩╕Å Your food order has been placed! Estimated delivery: 20-30 minutes.', 'Order Placed');
+       setFoodCart({});
+-      if (dashTab === 'bill') await loadBill();
++      await loadBill();
+     } catch (e) {
+       showAlert(e.message, 'Order Error');
+     } finally {
+@@ -699,209 +702,9 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
+             {/* ΓöÇΓöÇ OVERVIEW TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+             {dashTab === 'overview' && (
+               <GuestActiveStayOverview
+-                activeBooking={activeBooking}
+-                activeReservation={activeReservation}
+-                setDashTab={setDashTab}
+-                handleRequestCheckout={handleRequestCheckout}
+-                isRequestingCheckout={isRequestingCheckout}
+-                fetchStatus={fetchStatus}
+-              />
+-            )}
+-            {/* ΓöÇΓöÇ ROOM SERVICE TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+-            {dashTab === 'service' && (
+-              <GuestRoomService
+-                serviceCategory={serviceCategory}
+-                setServiceCategory={setServiceCategory}
+-                handleServiceRequest={handleServiceRequest}
+-                isSubmittingService={isSubmittingService}
+-              />
+-            )}
+-            {/* ΓöÇΓöÇ FOOD ORDER TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+-            {dashTab === 'food' && (
+-              <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+-                <div>
+-                  <h2 style={{ fontFamily: 'var(--font-heading)', color: '#fff', fontWeight: '800', fontSize: '1.3rem', marginBottom: '4px' }}>≡ƒì╜∩╕Å In-Room Dining</h2>
+-                  <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>Order from our kitchen menu. Delivery in 20ΓÇô30 minutes to your room. <span style={{ color: '#fbbf24' }}>Dial 9</span> to order by phone.</p>
+-                </div>
+-
+-                {FOOD_MENU.map(cat => (
+-                  <div key={cat.category} className="glass" style={{ borderRadius: '12px', padding: '20px', border: '1px solid rgba(255,255,255,0.06)' }}>
+-                    <div style={{ marginBottom: '14px' }}>
+-                      <h3 style={{ color: '#fff', fontWeight: '700', fontSize: '1rem', margin: 0 }}>{cat.category}</h3>
+-                      {cat.note && (
+-                        <p style={{ color: '#38bdf8', fontSize: '0.74rem', fontWeight: '600', margin: '3px 0 0', letterSpacing: '0.3px' }}>
+-                          ΓÅ░ {cat.note}
+-                        </p>
+-                      )}
+-                    </div>
+-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '10px' }}>
+-                      {cat.items.map(item => {
+-                        const qty = foodCart[item.key] || 0;
+-                        return (
+-                          <div key={item.key} style={{
+-                            background: qty > 0 ? 'rgba(251,146,60,0.06)' : 'rgba(255,255,255,0.03)',
+-                            borderRadius: '10px', padding: '12px 14px',
+-                            border: qty > 0 ? '1px solid rgba(251,146,60,0.3)' : '1px solid rgba(255,255,255,0.05)',
+-                            display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
+-                            gap: '10px', transition: 'all 0.2s', position: 'relative', overflow: 'hidden',
+-                            minHeight: '110px'
+-                          }}>
+-                            {/* Food photo ΓÇö absolutely positioned in top-right corner */}
+-                            {item.photo && (
+-                              <img
+-                                src={item.photo}
+-                                alt={item.name}
+-                                onError={e => { e.target.style.display = 'none'; }}
+-                                style={{
+-                                  position: 'absolute', top: '8px', right: '8px',
+-                                  width: '62px', height: '62px',
+-                                  borderRadius: '50%',
+-                                  objectFit: 'cover',
+-                                  border: qty > 0 ? '2px solid rgba(251,146,60,0.5)' : '2px solid rgba(255,255,255,0.12)',
+-                                  boxShadow: '0 2px 10px rgba(0,0,0,0.5)',
+-                                  transition: 'border-color 0.2s',
+-                                  zIndex: 1
+-                                }}
+-                              />
+-                            )}
+-
+-                            {/* Text content ΓÇö padded right to avoid overlap with image */}
+-                            <div style={{ paddingRight: item.photo ? '74px' : '0' }}>
+-                              <p style={{ fontWeight: '700', color: '#fff', fontSize: '0.88rem', margin: 0, lineHeight: '1.3' }}>{item.name}</p>
+-                              {item.desc && (
+-                                <p style={{ color: 'var(--text-muted)', fontSize: '0.72rem', margin: '3px 0 6px', lineHeight: '1.35', opacity: 0.85 }}>{item.desc}</p>
+-                              )}
+-                              <p style={{ color: '#fbbf24', fontWeight: '800', fontSize: '0.85rem', margin: 0 }}>Γé╣ {item.price}</p>
+-                            </div>
+-
+-                            {/* +/- buttons pinned to bottom-right */}
+-                            <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '8px', zIndex: 2 }}>
+-                              <button
+-                                onClick={() => setFoodCart(prev => ({ ...prev, [item.key]: Math.max(0, (prev[item.key] || 0) - 1) }))}
+-                                style={{ width: '30px', height: '30px', borderRadius: '50%', background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.15)', color: '#fff', cursor: 'pointer', fontWeight: '700', fontSize: '1.1rem', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.15s' }}
+-                                onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.2)'}
+-                                onMouseLeave={e => e.currentTarget.style.background = 'rgba(255,255,255,0.1)'}
+-                              >ΓêÆ</button>
+-                              <span style={{ minWidth: '24px', textAlign: 'center', fontWeight: '800', color: qty > 0 ? '#fb923c' : 'var(--text-muted)', fontSize: '1rem' }}>{qty}</span>
+-                              <button
+-                                onClick={() => setFoodCart(prev => ({ ...prev, [item.key]: (prev[item.key] || 0) + 1 }))}
+-                                style={{ width: '30px', height: '30px', borderRadius: '50%', background: qty > 0 ? 'rgba(251,146,60,0.3)' : 'rgba(251,146,60,0.15)', border: '1px solid rgba(251,146,60,0.5)', color: '#fb923c', cursor: 'pointer', fontWeight: '700', fontSize: '1.1rem', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.15s' }}
+-                                onMouseEnter={e => e.currentTarget.style.background = 'rgba(251,146,60,0.4)'}
+-                                onMouseLeave={e => e.currentTarget.style.background = qty > 0 ? 'rgba(251,146,60,0.3)' : 'rgba(251,146,60,0.15)'}
+-                              >+</button>
+-                            </div>
+-                          </div>
+-                        );
+-                      })}
+-                    </div>
+-                  </div>
+-                ))}
+-
+-                {/* Order Summary sticky bar */}
+-                <div style={{ position: 'sticky', bottom: 0, background: 'rgba(8,11,16,0.95)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '12px', padding: '16px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
+-                  <div>
+-                    <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', margin: 0 }}>Order Total</p>
+-                    <p style={{ fontWeight: '800', color: '#fff', fontSize: '1.2rem', margin: 0 }}>Γé╣ {foodCartTotal.toLocaleString('en-IN')}</p>
+-                    <p style={{ color: 'var(--text-muted)', fontSize: '0.75rem', margin: '2px 0 0' }}>{Object.values(foodCart).reduce((a, b) => a + b, 0)} items ┬╖ Added to room folio</p>
+-                  </div>
+-                  <button
+-                    onClick={handlePlaceFoodOrder}
+-                    disabled={isPlacingOrder || foodCartTotal === 0}
+-                    style={{ background: foodCartTotal === 0 ? 'rgba(255,255,255,0.05)' : 'linear-gradient(135deg, #fb923c 0%, #f97316 100%)', border: 'none', borderRadius: '10px', padding: '12px 28px', color: '#fff', fontWeight: '800', fontSize: '0.95rem', cursor: foodCartTotal === 0 ? 'not-allowed' : 'pointer', transition: 'all 0.2s', boxShadow: foodCartTotal > 0 ? '0 4px 16px rgba(251,146,60,0.3)' : 'none' }}
+-                  >
+-                    {isPlacingOrder ? 'ΓÅ│ Placing Order...' : '≡ƒì╜∩╕Å Place Order'}
+-                  </button>
+-                </div>
+-              </div>
+-            )}
+-
+-
+-            {/* ΓöÇΓöÇ MAINTENANCE TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+-            {dashTab === 'maintenance' && (
+-              <GuestMaintenance
+-                maintenanceIssue={maintenanceIssue}
+-                setMaintenanceIssue={setMaintenanceIssue}
+-                handleMaintenanceSubmit={handleMaintenanceSubmit}
+-                isSubmittingMaintenance={isSubmittingMaintenance}
+-              />
+-            )}
+-            {/* ΓöÇΓöÇ MY BILL TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+-            {dashTab === 'bill' && (
+-              <GuestBilling 
++                user={user}
+                 liveBill={liveBill}
+-                billLoading={billLoading}
+-                loadBill={loadBill}
+-              />
+-            )}
+-            {/* ΓöÇΓöÇ NOTIFICATIONS TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+-            {dashTab === 'notifications' && (
+-              <GuestNotifications 
+                 notifications={notifications}
+-                notifLoading={notifLoading}
+-                loadNotifications={loadNotifications}
+-                handleMarkRead={handleMarkRead}
+-                activeBooking={activeBooking}
+-                setWizardStep={setWizardStep}
+-                setDashTab={setDashTab}
+-                setReuploadFile={setReuploadFile}
+-                setReuploadError={setReuploadError}
+-                setReuploadSuccess={setReuploadSuccess}
+-                setShowIdReupload={setShowIdReupload}
+-              />
+-            )}
+-            {/* ΓöÇΓöÇ EXTEND STAY TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+-            {dashTab === 'extend' && (
+-              <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+-                <div>
+-                  <h2 style={{ fontFamily: 'var(--font-heading)', color: '#fff', fontWeight: '800', fontSize: '1.3rem', marginBottom: '4px' }}>≡ƒôà Extend Your Stay</h2>
+-                  <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>Wish to stay longer? Select a new checkout date and we'll update your reservation.</p>
+-                </div>
+-                <div className="glass" style={{ borderRadius: '12px', padding: '28px', border: '1px solid rgba(255,255,255,0.07)', maxWidth: '500px' }}>
+-                  <div style={{ marginBottom: '20px', padding: '16px', background: 'rgba(56,189,248,0.06)', border: '1px solid rgba(56,189,248,0.2)', borderRadius: '8px' }}>
+-                    <p style={{ color: 'var(--text-muted)', fontSize: '0.78rem', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>CURRENT CHECKOUT DATE</p>
+-                    <p style={{ fontWeight: '800', color: '#38bdf8', fontSize: '1.1rem' }}>{activeReservation?.expected_check_out_date?.split('T')[0] || 'ΓÇö'}</p>
+-                  </div>
+-
+-                  <form onSubmit={handleExtendStay} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+-                    <div>
+-                      <label style={{ display: 'block', color: 'var(--text-secondary)', fontSize: '0.82rem', marginBottom: '8px', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.5px' }}>New Checkout Date</label>
+-                      <input
+-                        type="date"
+-                        value={extendDate}
+-                        onChange={e => setExtendDate(e.target.value)}
+-                        min={activeReservation?.expected_check_out_date?.split('T')[0] || new Date().toISOString().split('T')[0]}
+-                        style={{ width: '100%', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '8px', padding: '12px 14px', color: '#fff', fontSize: '0.95rem', fontFamily: 'inherit', boxSizing: 'border-box' }}
+-                      />
+-                    </div>
+-                    <button
+-                      type="submit"
+-                      disabled={isExtending || !extendDate}
+-                      style={{ background: isExtending || !extendDate ? 'rgba(255,255,255,0.05)' : 'linear-gradient(135deg, #38bdf8 0%, #0284c7 100%)', border: 'none', borderRadius: '8px', padding: '12px 24px', color: '#fff', fontWeight: '800', fontSize: '0.95rem', cursor: 'pointer', boxShadow: extendDate ? '0 4px 16px rgba(56,189,248,0.25)' : 'none' }}
+-                    >
+-                      {isExtending ? 'ΓÅ│ Extending...' : '≡ƒôà Confirm Extension'}
+-                    </button>
+-                  </form>
+-
+-                  <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '14px', lineHeight: '1.4' }}>
+-                    Γä╣∩╕Å Extending your stay is subject to room availability. Additional charges will be applied as per your room tariff.
+-                  </p>
+-                </div>
+-              </div>
+-            )}
+-
+-          </div>
+-        </main>
+-      )}
+-
+-      {/* ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+-          PHASE 3: POST-CHECKOUT SCREEN (no active stay + has booking history)
+-      ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ */}
+-      {!historyLoading && !activeReservation && hasCheckedOut && (
+-        <main style={{ flex: 1, overflow: 'auto', padding: '0' }}>
+-          {/* Top Tab Nav */}
+-          <div style={{ borderBottom: '1px solid rgba(255,255,255,0.06)', background: 'rgba(0,0,0,0.4)', padding: '0 2rem', display: 'flex', gap: '4px' }}>
+-            {[
+-              { id: 'feedback', icon: 'Γ¡É', label: 'Leave a Review' },
+               { id: 'history', icon: '≡ƒôï', label: 'My Stays' },
+             ].map(tab => (
+               <button key={tab.id} onClick={() => setPostCheckoutTab(tab.id)} style={{

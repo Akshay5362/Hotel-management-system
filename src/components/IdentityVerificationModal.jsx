@@ -16,6 +16,7 @@ export default function IdentityVerificationModal({ isOpen, onClose, token, room
   const [rejectionReason, setRejectionReason] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [imgError, setImgError] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
@@ -69,6 +70,27 @@ export default function IdentityVerificationModal({ isOpen, onClose, token, room
       ));
       setSelectedDoc(prev => ({ ...prev, id_verification_status: status, id_rejection_reason: status === 'Rejected' ? rejectionReason : null }));
       setRejectionReason('');
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleDeleteDocument = async () => {
+    setIsSubmitting(true);
+    try {
+      const res = await fetch(`http://localhost:5000/api/admin/guest-documents/${selectedDoc.id}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Deletion failed');
+      
+      alert('Identity document deleted successfully.');
+      setShowDeleteConfirm(false);
+      setSelectedDoc(null);
+      fetchDocuments();
     } catch (err) {
       alert(err.message);
     } finally {
@@ -328,6 +350,17 @@ export default function IdentityVerificationModal({ isOpen, onClose, token, room
                       </div>
                     </div>
                   )}
+
+                  {/* Delete Document Action */}
+                  <div style={{ marginTop: '16px', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '16px', display: 'flex', justifyContent: 'center' }}>
+                    <button
+                      onClick={() => setShowDeleteConfirm(true)}
+                      disabled={isSubmitting}
+                      style={{ width: '100%', padding: '10px', background: 'transparent', border: '1px solid rgba(239, 68, 68, 0.5)', borderRadius: '8px', color: '#f87171', fontWeight: '700', cursor: 'pointer', fontSize: '0.88rem', transition: 'all 0.2s' }}
+                    >
+                      🗑️ Delete Document
+                    </button>
+                  </div>
                 </div>
               </>
             ) : (
@@ -341,6 +374,34 @@ export default function IdentityVerificationModal({ isOpen, onClose, token, room
           </div>
         </div>
       </div>
+
+      {/* Delete Confirmation Modal */}
+      {showDeleteConfirm && (
+        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.8)', zIndex: 100000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: '#1e1e1e', padding: '24px', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.1)', maxWidth: '400px', textAlign: 'center', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)' }}>
+            <h3 style={{ margin: '0 0 12px 0', color: '#fff', fontSize: '1.2rem' }}>Delete Identity Document</h3>
+            <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginBottom: '24px', lineHeight: '1.5' }}>
+              Are you sure you want to permanently delete this identity document? This action cannot be undone.
+            </p>
+            <div style={{ display: 'flex', gap: '12px', justifyContent: 'center' }}>
+              <button
+                onClick={() => setShowDeleteConfirm(false)}
+                disabled={isSubmitting}
+                style={{ flex: 1, padding: '10px', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', color: '#fff', cursor: 'pointer', fontWeight: '600' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeleteDocument}
+                disabled={isSubmitting}
+                style={{ flex: 1, padding: '10px', background: '#ef4444', border: 'none', borderRadius: '8px', color: '#fff', fontWeight: '700', cursor: 'pointer' }}
+              >
+                {isSubmitting ? 'Deleting...' : 'Delete'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

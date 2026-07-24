@@ -1,8 +1,11 @@
 import React, { useState } from 'react';
+import { generateInvoicePDF } from '../utils/invoiceUtils';
 
 export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAddLedgerItem, onModifyClick, onRefundClick, showAlert, showConfirm }) {
   const [newDesc, setNewDesc] = useState('');
   const [newAmount, setNewAmount] = useState('');
+  const [showInvoiceMenu, setShowInvoiceMenu] = useState(false);
+  const [isGeneratingInvoice, setIsGeneratingInvoice] = useState(false);
 
   if (!isOpen || !room) return null;
 
@@ -36,6 +39,16 @@ export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAdd
     const confirmed = await showConfirm(msg, 'Settle & Checkout');
     if (confirmed) {
       onCheckOut(room.number, balance);
+    }
+  };
+
+  const handleInvoiceAction = async (action) => {
+    setIsGeneratingInvoice(true);
+    try {
+      await generateInvoicePDF(room, action);
+    } finally {
+      setIsGeneratingInvoice(false);
+      setShowInvoiceMenu(false);
     }
   };
 
@@ -154,6 +167,36 @@ export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAdd
             </button>
           </div>
           <div style={{ display: 'flex', gap: '10px' }}>
+            <div style={{ position: 'relative' }}>
+              <button 
+                className="btn-secondary"
+                onClick={() => setShowInvoiceMenu(!showInvoiceMenu)}
+                disabled={isGeneratingInvoice}
+                style={{ position: 'relative' }}
+              >
+                {isGeneratingInvoice ? 'Generating...' : '📄 Invoice ▼'}
+              </button>
+              {showInvoiceMenu && (
+                <div style={{ position: 'absolute', bottom: '100%', right: 0, marginBottom: '8px', background: '#1e293b', border: '1px solid #334155', borderRadius: '6px', padding: '5px 0', zIndex: 50, minWidth: '150px', boxShadow: '0 -10px 15px -3px rgba(0, 0, 0, 0.5)' }}>
+                  <button 
+                    onClick={() => handleInvoiceAction('print')} 
+                    style={{ display: 'block', width: '100%', padding: '8px 20px', background: 'transparent', border: 'none', color: '#fff', textAlign: 'left', cursor: 'pointer', fontSize: '0.85rem' }}
+                    onMouseEnter={(e) => e.target.style.background = 'rgba(255,255,255,0.1)'}
+                    onMouseLeave={(e) => e.target.style.background = 'transparent'}
+                  >
+                    🖨️ Print Invoice
+                  </button>
+                  <button 
+                    onClick={() => handleInvoiceAction('download')} 
+                    style={{ display: 'block', width: '100%', padding: '8px 20px', background: 'transparent', border: 'none', color: '#fff', textAlign: 'left', cursor: 'pointer', fontSize: '0.85rem' }}
+                    onMouseEnter={(e) => e.target.style.background = 'rgba(255,255,255,0.1)'}
+                    onMouseLeave={(e) => e.target.style.background = 'transparent'}
+                  >
+                    📥 Download PDF
+                  </button>
+                </div>
+              )}
+            </div>
             <button className="btn-secondary" onClick={onClose}>Close</button>
             <button className="btn-danger" onClick={handleCheckOut}>Settle &amp; Check Out</button>
           </div>

@@ -1,5 +1,6 @@
 import pool from '../db.js';
 import crypto from 'crypto';
+import bcrypt from 'bcryptjs';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'hotel-pms-super-secret-key-12345!';
 
@@ -142,38 +143,105 @@ export const signIn = async (req, res) => {
   const cleanUsername = username.trim().toLowerCase();
 
   try {
-    const passwordHash = hashPassword(password);
-
+    // ── Step 1: Fetch user WITHOUT comparing password in SQL ──────────────────
+    // Including u.password so we can verify it in application code.
     const [users] = await pool.query(
-      `SELECT u.id, u.username, u.fullName, u.phone, r.name as role, g.loyalty_tier, g.loyalty_points 
+      `SELECT u.id, u.username, u.fullName, u.phone, u.password,
+              r.name as role, g.loyalty_tier, g.loyalty_points
        FROM users u
-       LEFT JOIN roles r ON u.role_id = r.id 
+       LEFT JOIN roles r ON u.role_id = r.id
        LEFT JOIN guests g ON g.user_id = u.id
-       WHERE (u.username = ? OR u.phone = ? OR g.email = ?) AND u.password = ?`,
-      [cleanUsername, cleanUsername, cleanUsername, passwordHash]
+       WHERE (u.username = ? OR u.phone = ? OR g.email = ?)`,
+      [cleanUsername, cleanUsername, cleanUsername]
     );
 
     if (users.length === 0) {
+      // ── Step 1.5: Fallback to staff table ──────────────────────────────────
+      const [staffs] = await pool.query(
+        `SELECT * FROM staff WHERE (username = ? OR email = ? OR phone = ?) AND deleted = 0 LIMIT 1`,
+        [cleanUsername, cleanUsername, cleanUsername]
+      );
+
+      if (staffs.length > 0) {
+        const staff = staffs[0];
+        
+        if (staff.status === 'Inactive') {
+          return res.status(403).json({ error: 'Your account is inactive. Please contact an administrator.' });
+        }
+        
+        const passwordMatch = await bcrypt.compare(password, staff.password_hash);
+        if (!passwordMatch) {
+          return res.status(400).json({ error: 'Invalid username or password' });
+        }
+        
+        // Update last_login
+        pool.query('UPDATE staff SET last_login = NOW() WHERE id = ?', [staff.id]).catch(() => {});
+        
+        const safeStaff = {
+          id: staff.id,
+          username: staff.username,
+          full_name: staff.full_name,
+          role: staff.role,
+          department: staff.department,
+          shift: staff.shift,
+          loginType: 'staff'
+        };
+        
+        // Use existing generateToken which uses id and role
+        const tokenPayload = {
+          id: staff.id,
+          role: staff.role,
+          type: 'staff'
+        };
+        const token = generateToken(tokenPayload);
+        
+        return res.json({
+          message: 'Logged in successfully',
+          user: safeStaff,
+          token
+        });
+      }
+
       return res.status(400).json({ error: 'Invalid username or password' });
     }
 
     const user = users[0];
-    const token = generateToken(user);
+
+    // ── Step 2: Verify password in application code ───────────────────────────
+    // Supports both bcrypt hashes ($2b$...) and legacy SHA-256 hex strings.
+    const storedHash = user.password;
+    let passwordValid = false;
+
+    if (storedHash && storedHash.startsWith('$2')) {
+      // bcrypt hash — use bcrypt.compare (handles the random salt correctly)
+      passwordValid = await bcrypt.compare(password, storedHash);
+    } else {
+      // Legacy SHA-256 — existing admin/guest accounts
+      const sha256Hash = hashPassword(password);
+      passwordValid = storedHash === sha256Hash;
+    }
+
+    if (!passwordValid) {
+      return res.status(400).json({ error: 'Invalid username or password' });
+    }
+
+    // ── Step 3: Build token (password hash never leaves the server) ───────────
+    const { password: _omit, ...safeUser } = user;
+    const token = generateToken(safeUser);
 
     // Fetch system date for audit log
     const [settings] = await pool.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
     const businessDate = settings[0]?.value_val || '11-Jul-2026';
 
-    // Insert Audit Log entry
     await pool.query(
       `INSERT INTO audit_logs (user_id, action, details, business_date)
        VALUES (?, 'LOGIN', ?, ?)`,
-      [user.id, `User logged in: ${user.username} (${user.role})`, businessDate]
+      [safeUser.id, `User logged in: ${safeUser.username} (${safeUser.role})`, businessDate]
     );
 
     res.json({
       message: 'Logged in successfully',
-      user,
+      user: safeUser,
       token
     });
   } catch (error) {
@@ -205,8 +273,12 @@ export const authenticate = async (req, res, next) => {
 };
 
 export const requireAdmin = (req, res, next) => {
-  if (!req.user || req.user.role !== 'admin') {
+  if (!req.user) {
     return res.status(403).json({ error: 'Forbidden: Admin access required' });
+  }
+  // Allow 'admin' from the users table, OR any authenticated staff member from the staff table
+  if (req.user.role !== 'admin' && req.user.type !== 'staff') {
+    return res.status(403).json({ error: 'Forbidden: Admin or Staff access required' });
   }
   next();
 };

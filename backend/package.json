@@ -15,6 +15,7 @@
     "init-db-DANGER": "node init_db.js"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
@@ -23,6 +24,7 @@
     "pdf-parse": "^2.4.5",
     "razorpay": "^2.9.8",
     "sharp": "^0.35.3",
+    "socket.io": "^4.8.3",
     "tesseract.js": "^7.0.0"
   },
   "devDependencies": {

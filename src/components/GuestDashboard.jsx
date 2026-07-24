@@ -1,12 +1,19 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import PaymentPanel from './PaymentPanel';
 import GuestBookingWizard from './GuestBookingWizard';
-import GuestActiveReservation from './GuestActiveReservation';
 import GuestActiveStayOverview from './GuestActiveStayOverview';
 import GuestBilling from './GuestBilling';
 import GuestNotifications from './GuestNotifications';
 import GuestRoomService from './GuestRoomService';
 import GuestMaintenance from './GuestMaintenance';
+import GuestFeedback from './GuestFeedback';
+import GuestProfile from './GuestProfile';
+import GuestLoyalty from './GuestLoyalty';
+import GuestBookingHistory from './GuestBookingHistory';
+import { 
+  Star, ClipboardList, Send, CheckCircle, AlertTriangle, Calendar, Bell, 
+  Utensils, Coffee, Paperclip, Upload, Plus, Minus, Info, Settings, Clock, Check,
+  Hotel, Wallet, X, Wrench
+} from 'lucide-react';
 
 export default function GuestDashboard({ user, token, rooms, systemDate, onLogout, showAlert, fetchStatus, onUserUpdate }) {
   const [wizardStep, setWizardStep] = useState(1); // 1: Room Selection, 2: Guest Details, 3: ID Verification, 4: Extra Services, 5: Payment, 6: Confirmation
@@ -14,7 +21,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
   // STEP 6: Confirmation State
   const [confirmedBooking, setConfirmedBooking] = useState(null);
 
-  // ─── PHASE 2: Guest Stay Dashboard State ───────────────────────────────────
+  // ΓöÇΓöÇΓöÇ PHASE 2: Guest Stay Dashboard State ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   const [dashTab, setDashTab] = useState('overview'); // overview|service|maintenance|bill|notifications|extend|food
   const [isCheckingIn, setIsCheckingIn] = useState(false);
 
@@ -58,7 +65,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
   const [isReuploading, setIsReuploading] = useState(false);
   const [reuploadSuccess, setReuploadSuccess] = useState(false);
 
-  // ─── PHASE 3: Post-Checkout State ──────────────────────────────────────────
+  // ΓöÇΓöÇΓöÇ PHASE 3: Post-Checkout State ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   const [guestHistory, setGuestHistory] = useState(null); // { guest, bookings }
   const [historyLoading, setHistoryLoading] = useState(false);
   // Feedback form state
@@ -83,7 +90,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
   const latestCheckedOutBooking = guestHistory?.bookings?.find(b => b.booking_status === 'Checked Out');
 
 
-  // ─── Phase 2 API Helpers ────────────────────────────────────────────────────
+  // ΓöÇΓöÇΓöÇ Phase 2 API Helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   const apiFetch = useCallback(async (path, opts = {}) => {
     const res = await fetch(`http://localhost:5000/api${path}`, {
       ...opts,
@@ -124,9 +131,9 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
   // Auto-load on tab switch + always sync room status from server
   useEffect(() => {
     fetchStatus(); // Sync room status from server on every tab switch
-    if (dashTab === 'bill') loadBill();
+    if (isOccupied) loadBill(); // ALWAYS load bill so Overview has latest balance
     if (dashTab === 'notifications') loadNotifications();
-  }, [dashTab]);
+  }, [dashTab, isOccupied, fetchStatus, loadBill, loadNotifications]);
 
   // Auto-load notifications on mount if occupied (for badge count)
   // Also call fetchStatus on initial mount so stale room data is refreshed immediately
@@ -146,24 +153,34 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
       // Auto-set feedback booking to the latest checked-out booking if no feedback yet
       const latest = data.bookings?.find(b => b.booking_status === 'Checked Out' && !b.feedback_id);
       if (latest) setFeedbackBookingId(latest.id);
+      // Sync user context: loyalty_tier and loyalty_points may have changed since login
+      // This keeps the header badge in sync with the card without a separate API call.
+      if (data.guest && onUserUpdate) {
+        onUserUpdate({
+          ...user,
+          loyalty_tier:   data.guest.loyalty_tier,
+          loyalty_points: data.guest.loyalty_points,
+        });
+      }
     } catch (e) {
       console.error('History load error:', e);
     } finally {
       setHistoryLoading(false);
     }
-  }, [apiFetch]);
+  }, [apiFetch, onUserUpdate, user]);
 
-  // ─── Auto-refresh room status so admin checkout is immediately detected ────
+  // ΓöÇΓöÇΓöÇ Auto-refresh room status so admin checkout is immediately detected ΓöÇΓöÇΓöÇΓöÇ
   // Polls fetchStatus every 30s while the guest is on the portal
   useEffect(() => {
     if (!token) return;
     const interval = setInterval(() => {
       fetchStatus();
+      if (isOccupied) loadBill(); // Also fetch latest bill automatically
     }, 30000);
     return () => clearInterval(interval);
   }, [token, fetchStatus]);
 
-  // When the guest goes from occupied → not occupied (admin checked them out),
+  // When the guest goes from occupied ΓåÆ not occupied (admin checked them out),
   // immediately load their history so the post-checkout screen appears.
   const prevIsOccupied = React.useRef(isOccupied);
   useEffect(() => {
@@ -198,7 +215,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
       });
       setFeedbackSubmitted(true);
       await loadGuestHistory(); // Refresh to reflect submitted status
-      showAlert(`⭐ ${data.message}`, 'Review Submitted!');
+      showAlert(`${data.message}`, 'Review Submitted!');
     } catch (e) {
       showAlert(e.message, 'Feedback Error');
     } finally {
@@ -226,14 +243,14 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
     setIsCheckingIn(true);
     try {
       const data = await apiFetch('/guest/checkin-request', { method: 'POST' });
-      showAlert(`✅ ${data.message}`, 'Check-In Successful');
+      showAlert(`${data.message}`, 'Check-In Successful');
       await fetchStatus();
     } catch (e) {
       // If backend returns a cash-pending specific error, show a friendlier message
       if (e.message && e.message.includes('Cash payment not yet confirmed')) {
         showAlert(
           'Your cash payment has not been confirmed by the reception yet. Please visit the front desk and pay your advance, then the staff will unlock your check-in.',
-          '💵 Cash Payment Required'
+          'Cash Payment Required'
         );
       } else {
         showAlert(e.message, 'Check-In Error');
@@ -262,7 +279,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
     setIsSubmittingService(true);
     try {
       await apiFetch('/guest/service', { method: 'POST', body: JSON.stringify({ serviceDesc, amount, qty }) });
-      showAlert(`✅ "${serviceDesc}" request submitted! It will be delivered shortly.`, 'Service Requested');
+      showAlert(`"${serviceDesc}" request submitted! It will be delivered shortly.`, 'Service Requested');
       if (dashTab === 'bill') await loadBill();
     } catch (e) {
       showAlert(e.message, 'Service Error');
@@ -278,7 +295,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
     setIsSubmittingMaintenance(true);
     try {
       await apiFetch('/guest/maintenance', { method: 'POST', body: JSON.stringify({ issue: maintenanceIssue }) });
-      showAlert('🔧 Maintenance report submitted. Our team will attend shortly.', 'Report Received');
+      showAlert(`Maintenance report submitted. Our team will attend shortly.`, 'Report Received');
       setMaintenanceIssue('');
     } catch (e) {
       showAlert(e.message, 'Maintenance Error');
@@ -294,7 +311,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
     setIsExtending(true);
     try {
       const data = await apiFetch('/guest/extend-stay', { method: 'POST', body: JSON.stringify({ newCheckOutDate: extendDate }) });
-      showAlert(`📅 ${data.message}`, 'Stay Extended!');
+      showAlert(`${data.message}`, 'Stay Extended!');
       setExtendDate('');
       await fetchStatus();
     } catch (e) {
@@ -316,7 +333,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
           await apiFetch('/guest/service', { method: 'POST', body: JSON.stringify({ serviceDesc: `Food Order: ${item.name}`, amount: item.price, qty }) });
         }
       }
-      showAlert('🍽️ Your food order has been placed! Estimated delivery: 20-30 minutes.', 'Order Placed');
+      showAlert(`Your food order has been placed! Estimated delivery: 20-30 minutes.`, 'Order Placed');
       setFoodCart({});
       if (dashTab === 'bill') await loadBill();
     } catch (e) {
@@ -331,7 +348,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
     setIsRequestingCheckout(true);
     try {
       const data = await apiFetch('/guest/checkout-request', { method: 'POST' });
-      showAlert(`📋 ${data.message}`, 'Checkout Requested');
+      showAlert(`${data.message}`, 'Checkout Requested');
     } catch (e) {
       showAlert(e.message, 'Checkout Error');
     } finally {
@@ -350,7 +367,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
   // Food menu data
   const FOOD_MENU = [
     {
-      category: '🥞 Breakfast Combos',
+      category: '🥐 Breakfast Combos',
       note: 'Served with Chai / Black Tea / Coffee / Lemon Water',
       items: [
         { key: 'aloo_paratha', name: 'Aloo Paratha', price: 120, photo: '/food/aloo_paratha.png', desc: '1 piece stuffed whole wheat flatbread with fresh curd, pickle & drink of your choice' },
@@ -380,7 +397,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
       ]
     },
     {
-      category: '🥢 Indo-Chinese',
+      category: '🍜 Indo-Chinese',
       items: [
         { key: 'chilli_potato', name: 'Chilli Potato', price: 199, photo: '/food/chilli_potato.png', desc: 'Crispy potato strips tossed in a tangy Indo-Chinese sauce with onions, capsicum & aromatic seasonings' },
         { key: 'honey_chilli_potato', name: 'Honey Chilli Potato', price: 229, photo: '/food/honey_chilli_potato.png', desc: 'Crispy potato strips glazed with sweet & spicy honey chilli sauce, finished with sesame seeds' },
@@ -396,7 +413,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
       ]
     },
     {
-      category: '🫕 Vegetarian Mains',
+      category: '🥦 Vegetarian Mains',
       note: '12 PM – 10:30 PM',
       items: [
         { key: 'dal_tadka', name: 'Dal Tadka', price: 199, photo: '/food/dal_tadka.png', desc: 'Yellow lentils cooked to perfection with fragrant tempering of cumin, garlic & traditional Indian spices' },
@@ -412,18 +429,18 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
         { key: 'egg_curry', name: 'Egg Curry', price: 179, photo: '/food/egg_curry.png', desc: 'Two hard-boiled eggs simmered in rich onion & tomato gravy, delicately spiced with aromatic Indian spices' },
         { key: 'chicken_curry', name: 'Chicken Curry', price: 399, photo: '/food/chicken_curry.png', desc: 'Tender chicken pieces in rich onion & tomato gravy, delicately seasoned with aromatic Indian spices' },
         { key: 'butter_chicken', name: 'Butter Chicken', price: 599, photo: '/food/butter_chicken.png', desc: 'Tender chicken pieces in rich, creamy tomato & butter gravy — a classic North Indian favourite' },
-        { key: 'chili_chicken', name: 'Chili Chicken', price: 289, photo: '/food/chili_chicken.png', desc: 'Tender chicken pieces sautéed with onions, capsicum & a blend of savory spices' },
+        { key: 'chili_chicken', name: 'Chili Chicken', price: 289, photo: '/food/chili_chicken.png', desc: 'Tender chicken pieces saut├⌐ed with onions, capsicum & a blend of savory spices' },
       ]
     },
     {
-      category: '👨‍🍳 Chef\'s Combos',
+      category: '≡ƒæ¿ΓÇì🍳 Chef\'s Combos',
       items: [
         { key: 'veg_combo', name: 'Veg Combo', price: 299, photo: '/food/veg_combo.png', desc: 'Paneer Butter Masala + Jeera Rice + 2 Butter Rotis + Pickle — a wholesome complete meal' },
         { key: 'non_veg_combo', name: 'Non-Veg Combo', price: 449, photo: '/food/non_veg_combo.png', desc: 'Butter Chicken + Jeera Rice + 2 Tawa Rotis + Pickle — tender chicken in creamy gravy' },
       ]
     },
     {
-      category: '🫓 Breads',
+      category: '🥖 Breads',
       items: [
         { key: 'tawa_roti', name: 'Tawa Roti', price: 25, photo: '/food/tawa_roti.png', desc: 'Freshly prepared whole wheat flatbread, cooked on a traditional tawa until soft & lightly golden' },
         { key: 'tawa_butter_roti', name: 'Tawa Butter Roti', price: 30, photo: '/food/tawa_roti.png', desc: 'Whole wheat flatbread cooked on traditional tawa, finished with a touch of butter' },
@@ -454,7 +471,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
       ]
     },
     {
-      category: '🍮 Desserts',
+      category: '🍨 Desserts',
       items: [
         { key: 'gulab_jamun', name: 'Gulab Jamun (2 pcs)', price: 109, photo: '/food/gulab_jamun.png', desc: 'Soft, golden-fried milk dumplings soaked in fragrant cardamom & rose-infused sugar syrup, served warm' },
         { key: 'kulfi_stick', name: 'Kulfi (Stick)', price: 99, photo: '/food/kulfi_icecream.png', desc: 'Traditional Indian frozen dessert infused with saffron & cardamom — rich, creamy & refreshing' },
@@ -483,7 +500,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
       {/* Header Panel */}
       <header className="header glass" style={{ borderBottom: '1px solid var(--border-color)', height: '70px', padding: '0 2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div className="brand-section" style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <span className="logo-icon">🏨</span>
+          <span className="logo-icon"><Hotel size={24} /></span>
           <h1 className="brand-name" style={{ fontFamily: 'var(--font-heading)', fontWeight: 800, fontSize: '1.3rem' }}>
             HOTEL SKY-5 <span style={{ color: 'var(--color-vacant)' }}>GUEST PORTAL</span>
           </h1>
@@ -493,7 +510,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
           <div style={{ fontSize: '0.88rem', color: 'var(--text-secondary)', display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
             <div>Welcome, <strong style={{ color: '#fff' }}>{user.fullName}</strong></div>
             <div style={{ fontSize: '0.75rem', marginTop: '2px', display: 'flex', alignItems: 'center', gap: '4px' }}>
-              <span>🎖️</span>
+              <span><Star size={18} /></span>
               <span style={{ 
                 color: user.loyalty_tier === 'Platinum' ? '#e5e4e2' : 
                        user.loyalty_tier === 'Gold' ? '#ffd700' : 
@@ -509,7 +526,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
               style={{ position: 'relative', background: 'transparent', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', padding: '8px 10px', cursor: 'pointer', color: '#fff', fontSize: '1.1rem' }}
               title="Notifications"
             >
-              🔔
+              <Bell size={18} />
               {unreadCount > 0 && (
                 <span style={{ position: 'absolute', top: '-4px', right: '-4px', background: '#ef4444', color: '#fff', borderRadius: '50%', width: '16px', height: '16px', fontSize: '0.65rem', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: '800' }}>{unreadCount}</span>
               )}
@@ -521,27 +538,27 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
         </div>
       </header>
 
-      {/* ═══════════════════════════════════════════════════════════════════════
+      {/* ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
           INITIALIZATION LOADING STATE
-      ═══════════════════════════════════════════════════════════════════════ */}
+      ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ */}
       {(historyLoading || (activeReservation && !activeBooking)) && (
         <main style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '16px' }}>
-          <div style={{ fontSize: '3rem', animation: 'pulse 1.5s infinite' }}>⏳</div>
+          <div style={{ fontSize: '3rem', animation: 'pulse 1.5s infinite' }}><Clock size={18} /></div>
           <p style={{ color: 'var(--text-muted)', fontSize: '0.95rem', fontWeight: '600', letterSpacing: '0.5px' }}>
             Loading your dashboard...
           </p>
         </main>
       )}
 
-      {/* ═══════════════════════════════════════════════════════════════════════
+      {/* ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
           PHASE 2: GUEST CHECK-IN LANDING (status === 'booked') 
-      ═══════════════════════════════════════════════════════════════════════ */}
+      ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ */}
       {activeBooking && activeBooking.status === 'booked' && wizardStep !== 6 && (
         <main style={{ flex: 1, padding: '2rem', maxWidth: '900px', width: '100%', margin: '0 auto' }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
             {/* Status Banner */}
             <div style={{ background: 'linear-gradient(135deg, rgba(251,191,36,0.1) 0%, rgba(245,158,11,0.05) 100%)', border: '1px solid rgba(251,191,36,0.3)', borderRadius: '12px', padding: '16px 20px', display: 'flex', alignItems: 'center', gap: '12px' }}>
-              <span style={{ fontSize: '1.5rem' }}>⏳</span>
+              <span style={{ fontSize: '1.5rem' }}><Clock size={18} /></span>
               <div>
                 <p style={{ fontWeight: '700', color: '#fbbf24', margin: 0, fontSize: '0.95rem' }}>Reservation Confirmed — Awaiting Check-In</p>
                 <p style={{ color: 'var(--text-muted)', margin: '2px 0 0', fontSize: '0.82rem' }}>You have an upcoming reservation. When you arrive at the hotel, click "Check In Now" below.</p>
@@ -551,7 +568,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
             {/* Booking Details Card */}
             <div className="glass" style={{ borderRadius: '16px', padding: '28px', border: '1px solid rgba(255,255,255,0.07)' }}>
               <h2 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.3rem', fontWeight: '800', color: '#fff', marginBottom: '24px', display: 'flex', alignItems: 'center', gap: '10px' }}>
-                🔑 Your Reservation Details
+                <Info size={18} /> Your Reservation Details
               </h2>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '16px', marginBottom: '28px' }}>
                 {[
@@ -578,7 +595,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                 {paymentStatusInfo?.cashPendingConfirmation && (
                   <div style={{ width: '100%', maxWidth: '520px', background: 'rgba(239,68,68,0.07)', border: '1px solid rgba(239,68,68,0.25)', borderRadius: '12px', padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                      <span style={{ fontSize: '1.8rem' }}>💵</span>
+                      <span style={{ fontSize: '1.8rem' }}><Wallet size={18} /></span>
                       <div>
                         <p style={{ fontWeight: '800', color: '#ef4444', margin: 0, fontSize: '0.95rem' }}>Cash Payment Pending Confirmation</p>
                         <p style={{ color: 'var(--text-muted)', margin: '4px 0 0', fontSize: '0.8rem', lineHeight: '1.5' }}>
@@ -589,7 +606,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                       </div>
                     </div>
                     <div style={{ display: 'flex', gap: '8px', alignItems: 'center', background: 'rgba(251,191,36,0.06)', border: '1px solid rgba(251,191,36,0.15)', borderRadius: '8px', padding: '10px 14px' }}>
-                      <span style={{ fontSize: '0.9rem' }}>ℹ️</span>
+                      <span style={{ fontSize: '0.9rem' }}><Info size={18} /></span>
                       <p style={{ fontSize: '0.75rem', color: '#94a3b8', margin: 0, lineHeight: '1.4' }}>
                         This page refreshes every 20 seconds. You’ll also receive a notification once the staff confirms your payment.
                       </p>
@@ -612,12 +629,12 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                         alignSelf: 'center'
                       }}
                     >
-                      🔒 Check In Locked — Awaiting Payment
+                      ≡ƒöÆ Check In Locked — Awaiting Payment
                     </button>
                   </div>
                 )}
 
-                {/* Case B: Payment confirmed OR no payment pending → normal Check In Now */}
+                {/* Case B: Payment confirmed OR no payment pending ΓåÆ normal Check In Now */}
                 {!paymentStatusInfo?.cashPendingConfirmation && (
                   <button
                     onClick={handleSelfCheckIn}
@@ -638,35 +655,35 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                       boxShadow: '0 4px 20px rgba(34,197,94,0.3)'
                     }}
                   >
-                    {isCheckingIn ? '⏳ Checking In...' : '✅ Check In Now'}
+                    {isCheckingIn ? <><Clock size={18} /> Checking In...</> : <><CheckCircle size={18} /> Check In Now</>}
                   </button>
                 )}
               </div>
               <p style={{ textAlign: 'center', fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '14px' }}>
                 {paymentStatusInfo?.cashPendingConfirmation
-                  ? '💵 Pay your advance deposit at the reception desk. Check-in will unlock once confirmed.'
-                  : 'ℹ️ Clicking "Check In Now" will confirm your arrival and activate your room. Make sure you are physically at the hotel reception.'}
+                  ? <><Wallet size={18} /> Pay your advance deposit at the reception desk. Check-in will unlock once confirmed.</>
+                  : <><Info size={18} /> Clicking "Check In Now" will confirm your arrival and activate your room. Make sure you are physically at the hotel reception.</>}
               </p>
             </div>
           </div>
         </main>
       )}
 
-      {/* ═══════════════════════════════════════════════════════════════════════
+      {/* ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
           PHASE 2: GUEST STAY DASHBOARD (status === 'occupied') 
-      ═══════════════════════════════════════════════════════════════════════ */}
+      ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ */}
       {isOccupied && (
         <main style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
           {/* Tab Navigation */}
           <div style={{ borderBottom: '1px solid var(--border-color)', background: 'rgba(0,0,0,0.3)', padding: '0 2rem', display: 'flex', gap: '4px', overflowX: 'auto' }}>
             {[
-              { id: 'overview', icon: '🏠', label: 'Overview' },
-              { id: 'service', icon: '🛎️', label: 'Room Service' },
-              { id: 'food', icon: '🍽️', label: 'Food Order' },
-              { id: 'maintenance', icon: '🔧', label: 'Maintenance' },
-              { id: 'bill', icon: '📄', label: 'My Bill' },
-              { id: 'notifications', icon: '🔔', label: `Notifications${unreadCount > 0 ? ` (${unreadCount})` : ''}` },
-              { id: 'extend', icon: '📅', label: 'Extend Stay' },
+              { id: 'overview', icon: <Hotel size={18} />, label: 'Overview' },
+              { id: 'service', icon: <Bell size={18} />, label: 'Room Service' },
+              { id: 'food', icon: <Utensils size={18} />, label: 'Food Order' },
+              { id: 'maintenance', icon: <Wrench size={18} />, label: 'Maintenance' },
+              { id: 'bill', icon: <ClipboardList size={18} />, label: 'My Bill' },
+              { id: 'notifications', icon: <Bell size={18} />, label: `Notifications${unreadCount > 0 ? ` (${unreadCount})` : ''}` },
+              { id: 'extend', icon: <Calendar size={18} />, label: 'Extend Stay' },
             ].map(tab => (
               <button
                 key={tab.id}
@@ -696,18 +713,22 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
           {/* Tab Content */}
           <div style={{ flex: 1, overflow: 'auto', padding: '2rem', maxWidth: '1200px', width: '100%', margin: '0 auto' }}>
 
-            {/* ── OVERVIEW TAB ─────────────────────────────────────────────── */}
+            {/* ΓöÇΓöÇ OVERVIEW TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
             {dashTab === 'overview' && (
               <GuestActiveStayOverview
+                user={user}
                 activeBooking={activeBooking}
                 activeReservation={activeReservation}
                 setDashTab={setDashTab}
                 handleRequestCheckout={handleRequestCheckout}
                 isRequestingCheckout={isRequestingCheckout}
                 fetchStatus={fetchStatus}
+                liveBill={liveBill}
+                guestHistory={guestHistory}
+                notifications={notifications}
               />
             )}
-            {/* ── ROOM SERVICE TAB ──────────────────────────────────────────── */}
+            {/* ΓöÇΓöÇ ROOM SERVICE TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
             {dashTab === 'service' && (
               <GuestRoomService
                 serviceCategory={serviceCategory}
@@ -716,11 +737,11 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                 isSubmittingService={isSubmittingService}
               />
             )}
-            {/* ── FOOD ORDER TAB ────────────────────────────────────────────── */}
+            {/* ΓöÇΓöÇ FOOD ORDER TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
             {dashTab === 'food' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
                 <div>
-                  <h2 style={{ fontFamily: 'var(--font-heading)', color: '#fff', fontWeight: '800', fontSize: '1.3rem', marginBottom: '4px' }}>🍽️ In-Room Dining</h2>
+                  <h2 style={{ fontFamily: 'var(--font-heading)', color: '#fff', fontWeight: '800', fontSize: '1.3rem', marginBottom: '4px' }}><Utensils size={18} /> In-Room Dining</h2>
                   <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>Order from our kitchen menu. Delivery in 20–30 minutes to your room. <span style={{ color: '#fbbf24' }}>Dial 9</span> to order by phone.</p>
                 </div>
 
@@ -730,7 +751,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                       <h3 style={{ color: '#fff', fontWeight: '700', fontSize: '1rem', margin: 0 }}>{cat.category}</h3>
                       {cat.note && (
                         <p style={{ color: '#38bdf8', fontSize: '0.74rem', fontWeight: '600', margin: '3px 0 0', letterSpacing: '0.3px' }}>
-                          ⏰ {cat.note}
+                          ΓÅ░ {cat.note}
                         </p>
                       )}
                     </div>
@@ -809,14 +830,14 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                     disabled={isPlacingOrder || foodCartTotal === 0}
                     style={{ background: foodCartTotal === 0 ? 'rgba(255,255,255,0.05)' : 'linear-gradient(135deg, #fb923c 0%, #f97316 100%)', border: 'none', borderRadius: '10px', padding: '12px 28px', color: '#fff', fontWeight: '800', fontSize: '0.95rem', cursor: foodCartTotal === 0 ? 'not-allowed' : 'pointer', transition: 'all 0.2s', boxShadow: foodCartTotal > 0 ? '0 4px 16px rgba(251,146,60,0.3)' : 'none' }}
                   >
-                    {isPlacingOrder ? '⏳ Placing Order...' : '🍽️ Place Order'}
+                    {isPlacingOrder ? <><Clock size={18} /> Placing Order...</> : <><Utensils size={18} /> Place Order</>}
                   </button>
                 </div>
               </div>
             )}
 
 
-            {/* ── MAINTENANCE TAB ───────────────────────────────────────────── */}
+            {/* ΓöÇΓöÇ MAINTENANCE TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
             {dashTab === 'maintenance' && (
               <GuestMaintenance
                 maintenanceIssue={maintenanceIssue}
@@ -825,7 +846,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                 isSubmittingMaintenance={isSubmittingMaintenance}
               />
             )}
-            {/* ── MY BILL TAB ───────────────────────────────────────────────── */}
+            {/* ΓöÇΓöÇ MY BILL TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
             {dashTab === 'bill' && (
               <GuestBilling 
                 liveBill={liveBill}
@@ -833,7 +854,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                 loadBill={loadBill}
               />
             )}
-            {/* ── NOTIFICATIONS TAB ─────────────────────────────────────────── */}
+            {/* ΓöÇΓöÇ NOTIFICATIONS TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
             {dashTab === 'notifications' && (
               <GuestNotifications 
                 notifications={notifications}
@@ -849,11 +870,11 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                 setShowIdReupload={setShowIdReupload}
               />
             )}
-            {/* ── EXTEND STAY TAB ───────────────────────────────────────────── */}
+            {/* ΓöÇΓöÇ EXTEND STAY TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
             {dashTab === 'extend' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
                 <div>
-                  <h2 style={{ fontFamily: 'var(--font-heading)', color: '#fff', fontWeight: '800', fontSize: '1.3rem', marginBottom: '4px' }}>📅 Extend Your Stay</h2>
+                  <h2 style={{ fontFamily: 'var(--font-heading)', color: '#fff', fontWeight: '800', fontSize: '1.3rem', marginBottom: '4px' }}><Calendar size={18} /> Extend Your Stay</h2>
                   <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>Wish to stay longer? Select a new checkout date and we'll update your reservation.</p>
                 </div>
                 <div className="glass" style={{ borderRadius: '12px', padding: '28px', border: '1px solid rgba(255,255,255,0.07)', maxWidth: '500px' }}>
@@ -878,12 +899,12 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                       disabled={isExtending || !extendDate}
                       style={{ background: isExtending || !extendDate ? 'rgba(255,255,255,0.05)' : 'linear-gradient(135deg, #38bdf8 0%, #0284c7 100%)', border: 'none', borderRadius: '8px', padding: '12px 24px', color: '#fff', fontWeight: '800', fontSize: '0.95rem', cursor: 'pointer', boxShadow: extendDate ? '0 4px 16px rgba(56,189,248,0.25)' : 'none' }}
                     >
-                      {isExtending ? '⏳ Extending...' : '📅 Confirm Extension'}
+                      {isExtending ? <><Clock size={18} /> Extending...</> : <><Calendar size={18} /> Confirm Extension</>}
                     </button>
                   </form>
 
                   <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '14px', lineHeight: '1.4' }}>
-                    ℹ️ Extending your stay is subject to room availability. Additional charges will be applied as per your room tariff.
+                    <Info size={18} /> Extending your stay is subject to room availability. Additional charges will be applied as per your room tariff.
                   </p>
                 </div>
               </div>
@@ -893,16 +914,16 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
         </main>
       )}
 
-      {/* ═══════════════════════════════════════════════════════════════════════
+      {/* ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
           PHASE 3: POST-CHECKOUT SCREEN (no active stay + has booking history)
-      ═══════════════════════════════════════════════════════════════════════ */}
+      ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ */}
       {!historyLoading && !activeReservation && hasCheckedOut && (
         <main style={{ flex: 1, overflow: 'auto', padding: '0' }}>
           {/* Top Tab Nav */}
           <div style={{ borderBottom: '1px solid rgba(255,255,255,0.06)', background: 'rgba(0,0,0,0.4)', padding: '0 2rem', display: 'flex', gap: '4px' }}>
             {[
-              { id: 'feedback', icon: '⭐', label: 'Leave a Review' },
-              { id: 'history', icon: '📋', label: 'My Stays' },
+              { id: 'feedback', icon: <Star size={16} />, label: 'Leave a Review' },
+              { id: 'history', icon: <ClipboardList size={18} />, label: 'My Stays' },
             ].map(tab => (
               <button key={tab.id} onClick={() => setPostCheckoutTab(tab.id)} style={{
                 background: 'transparent', border: 'none',
@@ -917,8 +938,26 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
 
           <div style={{ padding: '2rem', maxWidth: '860px', margin: '0 auto' }}>
 
-            {/* ── FEEDBACK TAB ─────────────────────────────────────────────── */}
+            {/* ΓöÇΓöÇ FEEDBACK TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
             {postCheckoutTab === 'feedback' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '32px' }}>
+                <div style={{ background: 'rgba(15, 23, 42, 0.6)', backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)', borderRadius: '16px', border: '1px solid rgba(255, 255, 255, 0.08)', padding: '40px', boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)', textAlign: 'center', animation: 'fadeIn 0.5s ease-out' }}>
+                  <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: 'rgba(16, 185, 129, 0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 24px', border: '1px solid rgba(16, 185, 129, 0.3)' }}>
+                    <span style={{ fontSize: '32px', color: '#10b981' }}>✓</span>
+                  </div>
+                  <h2 style={{ fontSize: '1.8rem', fontWeight: '800', color: '#fff', marginBottom: '12px', fontFamily: 'var(--font-heading)' }}>Thank You For Staying With Us</h2>
+                  <p style={{ color: 'var(--text-secondary)', fontSize: '1.1rem', marginBottom: '32px' }}>Your stay has been successfully completed.</p>
+                  <div style={{ background: 'rgba(0, 0, 0, 0.3)', borderRadius: '12px', padding: '24px', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: '16px', marginBottom: '32px', maxWidth: '400px', margin: '0 auto' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', color: '#fff' }}><span style={{ color: '#10b981', fontSize: '1.2rem' }}>✓</span> Checkout completed</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', color: '#fff' }}><span style={{ color: '#10b981', fontSize: '1.2rem' }}>✓</span> Final invoice available</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', color: '#fff' }}><span style={{ color: '#10b981', fontSize: '1.2rem' }}>✓</span> Thank you for choosing Hotel Sky-5</div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '16px', justifyContent: 'center', flexWrap: 'wrap', marginTop: '32px' }}>
+                    <button onClick={() => setPostCheckoutTab('history')} className="btn-ripple" style={{ padding: '12px 24px', borderRadius: '8px', background: 'var(--primary)', color: '#fff', border: 'none', fontWeight: '600', cursor: 'pointer', transition: 'all 0.2s' }}>Download Invoice</button>
+                    <button className="btn-ripple" style={{ padding: '12px 24px', borderRadius: '8px', background: 'rgba(255,255,255,0.05)', color: '#fff', border: '1px solid rgba(255,255,255,0.1)', fontWeight: '600', cursor: 'pointer', transition: 'all 0.2s' }}>Contact Reception</button>
+                    <button onClick={onLogout} className="btn-ripple" style={{ padding: '12px 24px', borderRadius: '8px', background: 'rgba(239, 68, 68, 0.1)', color: '#ef4444', border: '1px solid rgba(239, 68, 68, 0.2)', fontWeight: '600', cursor: 'pointer', transition: 'all 0.2s' }}>Logout</button>
+                  </div>
+                </div>
               <GuestFeedback
                 latestCheckedOutBooking={latestCheckedOutBooking}
                 feedbackSubmitted={feedbackSubmitted}
@@ -932,14 +971,15 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                 isSubmittingFeedback={isSubmittingFeedback}
                 setPostCheckoutTab={setPostCheckoutTab}
               />
+              </div>
             )}
 
-            {/* ── MY STAYS HISTORY TAB ─────────────────────────────────────── */}
+            {/* ΓöÇΓöÇ MY STAYS HISTORY TAB ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
             {postCheckoutTab === 'history' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <h2 style={{ fontFamily: 'var(--font-heading)', fontWeight: '800', color: '#fff', margin: 0, fontSize: '1.2rem' }}>
-                    📋 Your Stay History
+                    <ClipboardList size={18} /> Your Stay History
                   </h2>
                   <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
                     {guestHistory?.totalStays || 0} stay{guestHistory?.totalStays !== 1 ? 's' : ''} total
@@ -968,7 +1008,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                     background: 'linear-gradient(135deg, #38bdf8, #6366f1)', border: 'none', borderRadius: '12px',
                     padding: '14px 32px', color: '#fff', fontWeight: '800', fontSize: '1rem', cursor: 'pointer'
                   }}>
-                    🏨 Book Your Next Stay
+                    <Hotel size={24} /> Book Your Next Stay
                   </button>
                   <p style={{ margin: '8px 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>Looking forward to welcoming you again at Hotel Sky-5</p>
                 </div>
@@ -978,9 +1018,9 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
         </main>
       )}
 
-      {/* ═══════════════════════════════════════════════════════════════════════
+      {/* ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
           ORIGINAL BOOKING WIZARD (show when no active stay AND no prior history)
-      ═══════════════════════════════════════════════════════════════════════ */}
+      ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ */}
       {!historyLoading && !activeReservation && !hasCheckedOut && (
         <GuestBookingWizard
           user={user}
@@ -1006,9 +1046,9 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
         />
       )}
 
-      {/* ═══════════════════════════════════════════════════════════════════════
+      {/* ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
           ID RE-UPLOAD MODAL (for occupied guests with rejected documents)
-      ═══════════════════════════════════════════════════════════════════════ */}
+      ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ */}
       {showIdReupload && (
         <div className="modal-overlay" style={{ zIndex: 3000 }}>
           <div className="glass" style={{
@@ -1018,17 +1058,17 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div>
-                <h3 style={{ color: '#f87171', fontWeight: '800', fontSize: '1.1rem', margin: 0 }}>📤 Re-upload Identity Document</h3>
+                <h3 style={{ color: '#f87171', fontWeight: '800', fontSize: '1.1rem', margin: 0 }}><Upload size={18} /> Re-upload Identity Document</h3>
                 <p style={{ color: 'var(--text-muted)', fontSize: '0.78rem', margin: '4px 0 0' }}>
                   Upload a clear, legible photo of your government ID to complete verification.
                 </p>
               </div>
-              <button onClick={() => setShowIdReupload(false)} style={{ background: 'transparent', border: 'none', color: '#fff', fontSize: '1.4rem', cursor: 'pointer', lineHeight: 1 }}>×</button>
+              <button onClick={() => setShowIdReupload(false)} style={{ background: 'transparent', border: 'none', color: '#fff', fontSize: '1.4rem', cursor: 'pointer', lineHeight: 1 }}><X size={24} /></button>
             </div>
 
             {reuploadSuccess ? (
               <div style={{ textAlign: 'center', padding: '20px' }}>
-                <p style={{ fontSize: '2rem', marginBottom: '8px' }}>✅</p>
+                <p style={{ fontSize: '2rem', marginBottom: '8px' }}><CheckCircle size={18} /></p>
                 <p style={{ color: '#4ade80', fontWeight: '700', fontSize: '1rem' }}>Document re-uploaded successfully!</p>
                 <p style={{ color: 'var(--text-muted)', fontSize: '0.82rem', marginTop: '6px' }}>The front desk will review your document shortly.</p>
                 <button onClick={() => setShowIdReupload(false)} style={{ marginTop: '16px', padding: '8px 24px', background: 'rgba(34,197,94,0.15)', border: '1px solid rgba(34,197,94,0.4)', borderRadius: '8px', color: '#4ade80', fontWeight: '700', cursor: 'pointer', fontSize: '0.85rem' }}>
@@ -1067,7 +1107,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                 <div>
                   <label style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-secondary)', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' }}>Document Image / PDF</label>
                   <label style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px', padding: '20px', border: '2px dashed rgba(239,68,68,0.35)', borderRadius: '10px', cursor: 'pointer', background: 'rgba(239,68,68,0.04)', transition: 'all 0.2s' }}>
-                    <span style={{ fontSize: '2rem' }}>📎</span>
+                    <span style={{ fontSize: '2rem' }}><Paperclip size={32} /></span>
                     <span style={{ color: '#f87171', fontSize: '0.84rem', fontWeight: '600' }}>
                       {reuploadFile ? reuploadFile.name : 'Click to choose file'}
                     </span>
@@ -1090,7 +1130,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
 
                 {reuploadError && (
                   <div style={{ padding: '10px 14px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '8px', color: '#f87171', fontSize: '0.82rem' }}>
-                    ⚠️ {reuploadError}
+                    <AlertTriangle size={18} /> {reuploadError}
                   </div>
                 )}
 
@@ -1128,7 +1168,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                     fontWeight: '800', fontSize: '0.95rem', cursor: 'pointer', width: '100%', transition: 'all 0.2s'
                   }}
                 >
-                  {isReuploading ? '⏳ Uploading...' : '📤 Submit Re-upload'}
+                  {isReuploading ? <><Clock size={18} /> Uploading...</> : <><Upload size={18} /> Submit Re-upload</>}
                 </button>
               </>
             )}

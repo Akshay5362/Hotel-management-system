@@ -1,6 +1,6 @@
 {
   "name": "webline-pms",
-  "productName": "Webline PMS",
+  "productName": "Webline PMS Plus",
   "author": {
     "name": "Webline",
     "email": "info@webline.com"
@@ -14,51 +14,100 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+
     "backend:dev": "cd backend && node server.js",
+
     "electron:start": "cross-env NODE_ENV=development electron .",
-    "electron:wait": "wait-on http://localhost:5173 http://localhost:5000/api/health --timeout 60000 && npm run electron:start",
-    "electron:dev": "concurrently --kill-others --names \"VITE,BACKEND,ELECTRON\" --prefix-colors \"cyan.bold,yellow.bold,magenta.bold\" --prefix \"[{name}]\" \"npm run dev\" \"npm run backend:dev\" \"npm run electron:wait\"",
-    "electron:prod": "npm run build && cross-env NODE_ENV=production electron .",
-    "electron:build": "npm run build && electron-builder"
+    "electron:local": "cross-env NODE_ENV=development electron .",
+    "electron:wait":  "wait-on http://localhost:5173 http://localhost:5000/api/health --timeout 60000 && npm run electron:start",
+    "electron:dev":   "concurrently --kill-others --names \"VITE,BACKEND,ELECTRON\" --prefix-colors \"cyan.bold,yellow.bold,magenta.bold\" --prefix \"[{name}]\" \"npm run dev\" \"npm run backend:dev\" \"npm run electron:wait\"",
+
+    "electron:prod":  "npm run build && cross-env NODE_ENV=production electron .",
+    "electron:build": "npm run build && electron-builder --win"
   },
   "build": {
     "appId": "com.webline.pms",
-    "productName": "Webline PMS",
+    "productName": "Webline PMS Plus",
+    "copyright": "Copyright © 2026 Webline",
     "directories": {
-      "output": "release"
+      "output": "C:\\WeblinePMSBuild",
+      "buildResources": "assets"
     },
     "files": [
       "dist/**/*",
+      "!dist/win-unpacked/**",
+      "!dist/*.exe",
+      "!dist/*.yml",
+      "!dist/builder-debug.yml",
       "electron/**/*",
       "package.json"
     ],
+    "extraResources": [
+      {
+        "from": "backend",
+        "to": "backend",
+        "filter": [
+          "**/*",
+          "!node_modules/**",
+          "!*.test.*",
+          "!test_*.mjs",
+          "!test*.js",
+          "!check_*.mjs",
+          "!migrate_*.js",
+          "!seed_*.js",
+          "!cleanup.js",
+          "!update_passwords.js",
+          "!list_dbs.mjs",
+          "!patch.diff",
+          "!missing_chunk*.txt"
+        ]
+      },
+      {
+        "from": "backend/node_modules",
+        "to": "backend/node_modules",
+        "filter": [
+          "**/*",
+          "!.bin/**",
+          "!nodemon/**"
+        ]
+      }
+    ],
     "win": {
-      "target": ["nsis"],
+      "target": "nsis",
       "icon": "assets/icons/icon.ico",
-      "publisherName": "Webline"
+      "artifactName": "${productName} Setup ${version}.${ext}",
+      "signtoolOptions": {
+        "publisherName": "Webline"
+      }
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Webline PMS",
-      "installerIcon": "assets/icons/installer-icon.bmp"
+      "shortcutName": "Webline PMS Plus",
+      "deleteAppDataOnUninstall": false
     }
   },
   "dependencies": {
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "jspdf":            "^4.2.1",
+    "jspdf-autotable":  "^5.0.8",
+    "lucide-react":     "^1.25.0",
+    "react":            "^18.3.1",
+    "react-dom":        "^18.3.1",
+    "recharts":         "^3.10.0",
+    "socket.io-client": "^4.8.3",
+    "xlsx":             "^0.18.5"
   },
   "devDependencies": {
-    "@types/react": "^18.3.3",
-    "@types/react-dom": "^18.3.0",
+    "@types/react":         "^18.3.3",
+    "@types/react-dom":     "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
-    "concurrently": "^10.0.3",
-    "cross-env": "^10.1.0",
-    "electron": "^43.1.1",
-    "electron-builder": "^26.15.3",
-    "vite": "^5.3.1",
-    "wait-on": "^9.0.10"
+    "concurrently":         "^10.0.3",
+    "cross-env":            "^10.1.0",
+    "electron":             "^43.1.1",
+    "electron-builder":     "^26.15.3",
+    "vite":                 "^5.3.1",
+    "wait-on":              "^9.0.10"
   }
 }

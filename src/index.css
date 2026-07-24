@@ -207,7 +207,8 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 0 1rem;
+  flex-wrap: wrap;
+  padding: 0.5rem 1rem;
   background: rgba(13, 17, 23, 0.5);
   border-bottom: 1px solid var(--border-color);
   overflow: visible;
@@ -217,45 +218,42 @@ body {
 .quick-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
 .btn-action {
-  display: flex;
-  flex-direction: column;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 66px;
-  height: 54px;
+  height: 36px;
+  padding: 0 14px;
   border: 1px solid var(--border-color);
   background: rgba(255, 255, 255, 0.03);
   color: var(--text-secondary);
-  border-radius: 8px;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  font-weight: 600;
   cursor: pointer;
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-  font-size: 0.68rem;
-  font-weight: 500;
-  gap: 2px;
+  gap: 8px;
+}
+
+.btn-action:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.2);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
 }
 
 .btn-action svg {
-  width: 20px;
-  height: 20px;
+  width: 16px;
+  height: 16px;
   stroke: var(--text-muted);
   stroke-width: 2;
   fill: none;
   transition: all 0.2s;
-}
-
-.btn-action:hover {
-  background: rgba(56, 189, 248, 0.08);
-  border-color: var(--color-vacant);
-  color: var(--text-main);
-  transform: translateY(-2px);
-}
-
-.btn-action:hover svg {
-  stroke: var(--color-vacant);
 }
 
 .btn-action.active {
@@ -336,17 +334,37 @@ body {
 /* Dashboard Workspace Grid */
 .dashboard-body {
   padding: 2rem;
-  overflow-y: auto;
   background: radial-gradient(circle at top right, rgba(56, 189, 248, 0.03), transparent 40%),
               radial-gradient(circle at bottom left, rgba(129, 140, 248, 0.02), transparent 40%);
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+
+.room-grid-wrapper {
+  flex: 1;
+  padding-right: 10px;
+}
+
+.right-details-panel {
+  width: 420px;
+  flex-shrink: 0;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  backdrop-filter: var(--glass-blur);
+  padding: 1.5rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
 }
 
 .room-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 1.25rem;
-  max-width: 1600px;
-  margin: 0 auto;
+  max-width: 100%;
 }
 
 /* Room Card design system */
@@ -384,22 +402,25 @@ body {
 /* Color Status Configurations */
 .room-card.status-vacant {
   background: var(--grad-vacant);
+  opacity: 0.85; /* Dim vacant rooms */
 }
 .room-card.status-vacant:hover {
   box-shadow: var(--glow-vacant), 0 10px 20px rgba(0, 0, 0, 0.3);
+  opacity: 1;
 }
 .room-card.status-vacant::after {
-  border-color: rgba(56, 189, 248, 0.4);
+  border-color: rgba(56, 189, 248, 0.2);
 }
 
 .room-card.status-occupied {
   background: var(--grad-occupied);
+  box-shadow: 0 4px 15px rgba(248, 113, 113, 0.15); /* Stronger default shadow */
 }
 .room-card.status-occupied:hover {
-  box-shadow: var(--glow-occupied), 0 10px 20px rgba(0, 0, 0, 0.3);
+  box-shadow: var(--glow-occupied), 0 10px 25px rgba(248, 113, 113, 0.4);
 }
 .room-card.status-occupied::after {
-  border-color: rgba(248, 113, 113, 0.4);
+  border-color: rgba(248, 113, 113, 0.6);
 }
 
 .room-card.status-dirty {
@@ -480,10 +501,19 @@ body {
 
 .room-status-label {
   font-size: 0.65rem;
-  font-weight: 500;
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  font-weight: 700;
+  letter-spacing: 1px;
   color: rgba(255, 255, 255, 0.7);
+}
+
+/* Typography Truncation Helper */
+.text-truncate {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+  max-width: 100%;
 }
 
 /* Dimmed visual effect when filtering */
@@ -544,7 +574,7 @@ body {
 .metric-card.occupancy { border-left: 3px solid #c084fc; }
 .metric-card.vacant { border-left: 3px solid #38bdf8; }
 .metric-card.occupied { border-left: 3px solid #f87171; }
-.metric-card.checkout { border-left: 3px solid #fb923c; }
+.metric-card.checkout { border-left: #fb923c; }
 .metric-card.clean { border-left: 3px solid #4ade80; }
 
 .sync-status {
@@ -639,7 +669,68 @@ body {
   background: rgba(255, 255, 255, 0.02);
 }
 
-/* Modals Forms styling */
+.menu-group:last-child {
+  margin-bottom: 2rem;
+}
+
+/* Slide-Over Drawer Styles */
+.slide-over-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(2px);
+  z-index: 1000;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+}
+
+.slide-over-overlay.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.slide-over-drawer {
+  position: fixed;
+  top: 0;
+  right: -450px;
+  width: 420px;
+  height: 100vh;
+  background: var(--bg-sidebar);
+  border-left: 1px solid var(--border-color);
+  box-shadow: -5px 0 25px rgba(0,0,0,0.5);
+  z-index: 1001;
+  transition: right 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.slide-over-drawer.open {
+  right: 0;
+}
+
+.drawer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1.25rem 1.5rem;
+  border-bottom: 1px solid var(--border-color);
+  background: rgba(255,255,255,0.02);
+}
+
+.drawer-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
 .form-group {
   margin-bottom: 1.15rem;
 }
@@ -943,3 +1034,102 @@ input:focus, select:focus, textarea:focus {
   box-shadow: 0 4px 12px rgba(139, 92, 246, 0.1);
 }
 
+
+/* Sidebar Layout Additions */
+.app-layout {
+  display: flex;
+  flex-direction: row;
+  min-height: 100vh;
+}
+
+.app-container {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0; /* Critical for preventing flex grid blowout */
+  min-height: 100vh;
+}
+
+.sidebar-container {
+  width: 70px;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border-color);
+  backdrop-filter: var(--glass-blur);
+  display: flex;
+  flex-direction: column;
+  transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  overflow: hidden;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  flex-shrink: 0;
+  z-index: 100;
+}
+
+.sidebar-container:hover {
+  width: 260px;
+}
+.sidebar-header {
+  padding: 1.5rem;
+  font-size: 1.2rem;
+  font-weight: 800;
+  color: var(--text-main);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  white-space: nowrap;
+  min-width: 260px; /* Ensure content doesn't squash during transition */
+}
+.sidebar-header span {
+  color: var(--color-vacant);
+}
+.sidebar-menu {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.5rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: 1.15rem;
+  padding: 0.85rem 1.5rem;
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-weight: 600;
+  font-size: 0.9rem;
+  font-family: inherit;
+  transition: all 0.2s;
+  border: none;
+  border-left: 3px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  min-width: 260px;
+  width: 100%;
+  text-align: left;
+}
+.sidebar-item:hover, .sidebar-item.active {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-main);
+}
+.sidebar-item:hover {
+  border-left: 3px solid rgba(56, 189, 248, 0.5);
+}
+.sidebar-item.active {
+  border-left: 3px solid var(--color-vacant);
+  background: linear-gradient(90deg, rgba(56, 189, 248, 0.1) 0%, transparent 100%);
+}
+.sidebar-icon {
+  margin-right: 14px;
+  font-size: 1.25rem;
+}
+
+@keyframes slideInRight {
+  from { opacity: 0; transform: translateX(30px); }
+  to   { opacity: 1; transform: translateX(0);    }
+}

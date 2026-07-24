@@ -63,3 +63,11 @@ desktop.ini
 # Testing
 # ========================
 coverage/
+
+
+# Electron build output
+release/
+win-unpacked/
+win-unpacked.tmp/
+dist-electron/
+*.exe

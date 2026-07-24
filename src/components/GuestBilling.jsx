@@ -8,15 +8,15 @@ export default function GuestBilling({ liveBill, billLoading, loadBill }) {
           <h2 style={{ fontFamily: 'var(--font-heading)', color: '#fff', fontWeight: '800', fontSize: '1.3rem', marginBottom: '4px' }}>📄 Live Folio Statement</h2>
           <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>Real-time billing record for your current stay.</p>
         </div>
-        <button onClick={loadBill} style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', padding: '8px 14px', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: '0.82rem' }}>
-          🔄 Refresh
+        <button onClick={() => loadBill()} disabled={billLoading} style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', padding: '8px 14px', color: 'var(--text-secondary)', cursor: billLoading ? 'not-allowed' : 'pointer', fontSize: '0.82rem', opacity: billLoading ? 0.7 : 1 }}>
+          {billLoading ? '⏳ Refreshing...' : '🔄 Refresh'}
         </button>
       </div>
 
-      {billLoading ? (
+      {billLoading && !liveBill ? (
         <div style={{ textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>Loading bill...</div>
       ) : liveBill ? (
-        <div className="glass" style={{ borderRadius: '12px', padding: '24px', border: '1px solid rgba(255,255,255,0.07)' }}>
+        <div className="glass" style={{ borderRadius: '12px', padding: '24px', border: '1px solid rgba(255,255,255,0.07)', opacity: billLoading ? 0.6 : 1, transition: 'opacity 0.2s' }}>
           {/* Folio header */}
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '20px', flexWrap: 'wrap', gap: '10px' }}>
             <div>

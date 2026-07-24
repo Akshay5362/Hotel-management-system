@@ -19,6 +19,5 @@ export const apiFetch = async (path, options = {}) => {
   if (!response.ok) {
     throw new Error(data.error || data.message || 'API Request failed');
   }
-
   return data;
 };

@@ -25,7 +25,7 @@ export default function RoomCard({ room, onClick, isDimmed }) {
       <div className="room-details">
         {room.status === 'occupied' ? (
           <>
-            <span className="guest-name" title={room.guestName}>
+            <span className="guest-name text-truncate" title={room.guestName}>
               👤 {room.guestName}
             </span>
             <span className="room-status-label" style={{ fontSize: '0.6rem', color: 'rgba(255,255,255,0.8)' }}>
@@ -34,14 +34,14 @@ export default function RoomCard({ room, onClick, isDimmed }) {
           </>
         ) : room.status === 'dirty' ? (
           <>
-            <span className="guest-name" style={{ color: 'rgba(255,255,255,0.7)', fontSize: '0.8rem' }}>
+            <span className="guest-name text-truncate" style={{ color: 'rgba(255,255,255,0.7)', fontSize: '0.8rem' }}>
               ⚠️ Needs Cleaning
             </span>
             <span className="room-status-label">{getStatusLabel(room.status)}</span>
           </>
         ) : (
           <>
-            <span className="guest-name" style={{ color: 'rgba(255,255,255,0.4)', fontSize: '0.8rem', fontWeight: '400' }}>
+            <span className="guest-name text-truncate" style={{ color: 'rgba(255,255,255,0.4)', fontSize: '0.8rem', fontWeight: '400' }}>
               [ Empty ]
             </span>
             <span className="room-status-label">{getStatusLabel(room.status)}</span>
