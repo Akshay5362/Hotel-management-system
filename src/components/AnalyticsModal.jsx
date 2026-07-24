@@ -1,3 +1,4 @@
+import { API_BASE_URL } from '../config/apiConfig';
 import React, {  useState, useEffect, useContext , useRef, useMemo, useCallback } from 'react';
 import { 
   LineChart, Line, BarChart, Bar, PieChart, Pie, Cell, 
@@ -263,7 +264,7 @@ export default function AnalyticsModal({ isOpen, onClose }) {
       else if (activeTab === 'payments') endpoint = 'payments';
 
       if (endpoint) {
-        const res = await fetch(`http://localhost:5000/api/reports/${endpoint}?${params}`, {
+        const res = await fetch(`${API_BASE_URL}/api/reports/${endpoint}?${params}`, {
           headers: { 'Authorization': `Bearer ${adminToken}` }
         });
         const data = await res.json();

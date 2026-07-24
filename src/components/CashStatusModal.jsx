@@ -1,3 +1,4 @@
+import { API_BASE_URL } from '../config/apiConfig';
 import React, { useState, useEffect, useCallback } from 'react';
 
 const RECEIVERS = ['Owner', 'Manager', 'Area Manager', 'Other'];
@@ -72,7 +73,7 @@ export default function CashStatusModal({ isOpen, onClose, cashLog, token, admin
     if (!token) return;
     setSubsLoading(true);
     try {
-      const res = await fetch('http://localhost:5000/api/cash/submissions', {
+      const res = await fetch(`${API_BASE_URL}/api/cash/submissions`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       const data = await res.json();
@@ -134,7 +135,7 @@ export default function CashStatusModal({ isOpen, onClose, cashLog, token, admin
   const handleConfirmSubmit = async () => {
     setIsSubmitting(true);
     try {
-      const res = await fetch('http://localhost:5000/api/cash/submit', {
+      const res = await fetch(`${API_BASE_URL}/api/cash/submit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ amount: Number(submitAmount), receiverName: receiver, remarks })

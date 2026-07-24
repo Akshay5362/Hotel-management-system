@@ -93,6 +93,10 @@ async function initialize() {
   console.log(`Connected to database ${dbName}. Initializing tables...`);
 
   // Drop tables in correct key constraint order
+  await dbConn.query(`DROP TABLE IF EXISTS \`feedback\`;`);
+  await dbConn.query(`DROP TABLE IF EXISTS \`stay_extension_requests\`;`);
+  await dbConn.query(`DROP TABLE IF EXISTS \`razorpay_transactions\`;`);
+  await dbConn.query(`DROP TABLE IF EXISTS \`cash_submissions\`;`);
   await dbConn.query(`DROP TABLE IF EXISTS \`room_status_history\`;`);
   await dbConn.query(`DROP TABLE IF EXISTS \`booking_history\`;`);
   await dbConn.query(`DROP TABLE IF EXISTS \`maintenance\`;`);
@@ -434,6 +438,40 @@ async function initialize() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
   `);
 
+  // 21. Razorpay Transactions Table
+  await dbConn.query(`DROP TABLE IF EXISTS \`razorpay_transactions\`;`);
+  await dbConn.query(`
+    CREATE TABLE \`razorpay_transactions\` (
+      \`id\` INT AUTO_INCREMENT PRIMARY KEY,
+      \`order_id\` VARCHAR(100) NOT NULL,
+      \`payment_id\` VARCHAR(100),
+      \`signature\` VARCHAR(255),
+      \`amount\` INT NOT NULL,
+      \`status\` VARCHAR(20) NOT NULL,
+      \`booking_id\` INT DEFAULT NULL,
+      \`created_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(\`order_id\`),
+      FOREIGN KEY (\`booking_id\`) REFERENCES \`bookings\`(\`id\`) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  // 22. Cash Submissions Table
+  await dbConn.query(`DROP TABLE IF EXISTS \`cash_submissions\`;`);
+  await dbConn.query(`
+    CREATE TABLE \`cash_submissions\` (
+      \`id\`                INT AUTO_INCREMENT PRIMARY KEY,
+      \`receipt_id\`        VARCHAR(30)  NOT NULL UNIQUE,
+      \`business_date\`     VARCHAR(20)  NOT NULL,
+      \`submitted_at\`      DATETIME     NOT NULL,
+      \`receptionist_name\` VARCHAR(255) NOT NULL,
+      \`receiver_name\`     VARCHAR(255) NOT NULL,
+      \`amount\`            INT          NOT NULL,
+      \`remaining_cash\`    INT          NOT NULL,
+      \`remarks\`           TEXT,
+      \`created_at\`        TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
   console.log('Tables created successfully. Seeding initial data...');
 
   // A. Seed Roles
@@ -518,11 +556,11 @@ async function initialize() {
 
   // H. Sample guests configuration
   const guestsToCreate = [
-    { number: '102', full_name: 'RAJVEER SINGH', phone: '+91 9876543210', email: 'rajveer@gmail.com', address: 'Delhi, India', govId: '1234-5678-9012', idType: 'Aadhaar Card', userId: null, loyalty_tier: 'Bronze', loyalty_points: 120 },
-    { number: '103', full_name: 'KATARI AKHILESH', phone: '+91 9123456789', email: 'akhilesh@gmail.com', address: 'Mumbai, India', govId: 'A1234567', idType: 'Passport', userId: guestUserId, loyalty_tier: 'Gold', loyalty_points: 1500 },
-    { number: '107', full_name: 'RAJESH', phone: '+91 8888888888', email: 'rajesh@gmail.com', address: 'Bangalore, India', govId: 'XY789012', idType: 'Driver License', userId: null, loyalty_tier: 'Silver', loyalty_points: 450 },
-    { number: '110', full_name: 'MR. NAVEEN SONI', phone: '+91 7777777777', email: 'naveen@gmail.com', address: 'Jaipur, India', govId: '9988-7766-5544', idType: 'Aadhaar Card', userId: null, loyalty_tier: 'Platinum', loyalty_points: 3200 },
-    { number: '117', full_name: 'RAGHUBEER', phone: '+91 9999999999', email: 'raghubeer@gmail.com', address: 'Pune, India', govId: 'ZZ554433', idType: 'Voter ID', userId: null, loyalty_tier: 'Bronze', loyalty_points: 0 }
+    { number: '2', full_name: 'RAJVEER SINGH', phone: '+91 9876543210', email: 'rajveer@gmail.com', address: 'Delhi, India', govId: '1234-5678-9012', idType: 'Aadhaar Card', userId: null, loyalty_tier: 'Bronze', loyalty_points: 120 },
+    { number: '3', full_name: 'KATARI AKHILESH', phone: '+91 9123456789', email: 'akhilesh@gmail.com', address: 'Mumbai, India', govId: 'A1234567', idType: 'Passport', userId: guestUserId, loyalty_tier: 'Gold', loyalty_points: 1500 },
+    { number: '7', full_name: 'RAJESH', phone: '+91 8888888888', email: 'rajesh@gmail.com', address: 'Bangalore, India', govId: 'XY789012', idType: 'Driver License', userId: null, loyalty_tier: 'Silver', loyalty_points: 450 },
+    { number: '9', full_name: 'MR. NAVEEN SONI', phone: '+91 7777777777', email: 'naveen@gmail.com', address: 'Jaipur, India', govId: '9988-7766-5544', idType: 'Aadhaar Card', userId: null, loyalty_tier: 'Platinum', loyalty_points: 3200 },
+    { number: '17', full_name: 'RAGHUBEER', phone: '+91 9999999999', email: 'raghubeer@gmail.com', address: 'Pune, India', govId: 'ZZ554433', idType: 'Voter ID', userId: null, loyalty_tier: 'Bronze', loyalty_points: 0 }
   ];
 
   // Map to store inserted guest IDs
@@ -539,7 +577,7 @@ async function initialize() {
   // I. Create Bookings, Invoices & corresponding Ledger Items / Cash Logs
   const activeBookings = [
     {
-      number: '102',
+      number: '2',
       check_in_date: '10-Jul-2026',
       adults: 2,
       advance_amount: 1000,
@@ -553,7 +591,7 @@ async function initialize() {
       ]
     },
     {
-      number: '103',
+      number: '3',
       check_in_date: '09-Jul-2026',
       adults: 1,
       advance_amount: 2000,
@@ -566,7 +604,7 @@ async function initialize() {
       cash: []
     },
     {
-      number: '107',
+      number: '7',
       check_in_date: '11-Jul-2026',
       adults: 1,
       advance_amount: 500,
@@ -578,7 +616,7 @@ async function initialize() {
       cash: []
     },
     {
-      number: '110',
+      number: '9',
       check_in_date: '10-Jul-2026',
       adults: 2,
       advance_amount: 1500,
@@ -593,7 +631,7 @@ async function initialize() {
       ]
     },
     {
-      number: '117',
+      number: '17',
       check_in_date: '11-Jul-2026',
       adults: 1,
       advance_amount: 1000,
@@ -669,7 +707,7 @@ async function initialize() {
 
   // Insert general cash checkout logs (without booking association if past checkout)
   const generalCashLogs = [
-    { time: '12:05 PM', room: '105', guest: 'AMIT ROY', type: 'Checkout Settlement', amount: 2800, business_date: '11-Jul-2026' }
+    { time: '12:05 PM', room: '5', guest: 'AMIT ROY', type: 'Checkout Settlement', amount: 2800, business_date: '11-Jul-2026' }
   ];
   for (const log of generalCashLogs) {
     await dbConn.query(

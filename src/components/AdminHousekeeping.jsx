@@ -1,7 +1,8 @@
+import { API_BASE_URL } from '../config/apiConfig';
 import React, { useState, useEffect } from 'react';
 import { io } from 'socket.io-client';
 
-const API_URL = 'http://localhost:5000/api';
+const API_URL = `${API_BASE_URL}/api`;
 let socket;
 
 export default function AdminHousekeeping({ onBack }) {
@@ -34,7 +35,7 @@ export default function AdminHousekeeping({ onBack }) {
 
   useEffect(() => {
     fetchRooms();
-    socket = io('http://localhost:5000');
+    socket = io(`${API_BASE_URL}`);
     socket.on('housekeeping_update', (data) => {
       fetchRooms();
     });

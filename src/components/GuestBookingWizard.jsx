@@ -1,3 +1,4 @@
+import { API_BASE_URL } from '../config/apiConfig';
 import React, { useState } from 'react';
 import PaymentPanel from './PaymentPanel';
 
@@ -342,7 +343,7 @@ export default function GuestBookingWizard({
     try {
       const activeExtraGuests = extraGuests.slice(0, numGuests - 1);
 
-      const res = await fetch(`http://localhost:5000/api/rooms/${selectedRoomNumber}/book`, {
+      const res = await fetch(`${API_BASE_URL}/api/rooms/${selectedRoomNumber}/book`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',

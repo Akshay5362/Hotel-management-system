@@ -1,3 +1,4 @@
+import { API_BASE_URL } from '../config/apiConfig';
 import React, { useState, useEffect, useCallback } from 'react';
 import GuestBookingWizard from './GuestBookingWizard';
 import GuestActiveStayOverview from './GuestActiveStayOverview';
@@ -92,7 +93,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
 
   // ΓöÇΓöÇΓöÇ Phase 2 API Helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   const apiFetch = useCallback(async (path, opts = {}) => {
-    const res = await fetch(`http://localhost:5000/api${path}`, {
+    const res = await fetch(`${API_BASE_URL}/api${path}`, {
       ...opts,
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}`, ...(opts.headers || {}) }
     });
@@ -1148,7 +1149,7 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                       fd.append('idDocument', reuploadFile);
                       fd.append('governmentId', reuploadGovId.trim());
                       fd.append('idType', reuploadIdType);
-                      const res = await fetch('http://localhost:5000/api/guest/upload-id', {
+                      const res = await fetch(`${API_BASE_URL}/api/guest/upload-id`, {
                         method: 'POST',
                         headers: { 'Authorization': `Bearer ${token}` },
                         body: fd

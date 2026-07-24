@@ -317,12 +317,12 @@ export const runDayEnd = async (req, res) => {
       const bookingId = bookings[0]?.id || null;
 
       const [existingTariff] = await connection.query(
-        "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Room Tariff%Rollover%'",
+        "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND COALESCE(booking_id, 0) = COALESCE(?, 0) AND `desc` LIKE 'Room Tariff%Rollover%'",
         [room.number, nextDate, bookingId]
       );
       
       const [existingTax] = await connection.query(
-        "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Taxes & GST%'",
+        "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND COALESCE(booking_id, 0) = COALESCE(?, 0) AND `desc` LIKE 'Taxes & GST%'",
         [room.number, nextDate, bookingId]
       );
 

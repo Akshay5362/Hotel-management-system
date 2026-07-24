@@ -1,3 +1,4 @@
+import { API_BASE_URL } from './config/apiConfig';
 import React, { useState, useEffect, useCallback } from 'react';
 import Toolbar from './components/Toolbar';
 import RoomGrid from './components/RoomGrid';
@@ -288,7 +289,7 @@ function AppContent() {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
 
-      const res = await fetch(`http://localhost:5000/api/status?_t=${new Date().getTime()}`, { 
+      const res = await fetch(`${API_BASE_URL}/api/status?_t=${new Date().getTime()}`, { 
         signal: controller.signal,
         headers: {
           'Authorization': `Bearer ${currentToken}`
@@ -338,7 +339,7 @@ function AppContent() {
     const currentToken = adminToken;
     if (!currentToken) return;
     try {
-      const res = await fetch('http://localhost:5000/api/admin/guest-requests', {
+      const res = await fetch(`${API_BASE_URL}/api/admin/guest-requests`, {
         headers: { Authorization: `Bearer ${currentToken}` }
       });
       if (res.ok) {
@@ -353,7 +354,7 @@ function AppContent() {
     if (!adminUser || adminUser.role !== 'admin' || !adminToken) return;
     fetchRequestCount();
 
-    const socket = io('http://localhost:5000');
+    const socket = io(`${API_BASE_URL}`);
     let fallbackInterval = null;
 
     socket.on('connect', () => {
@@ -446,7 +447,7 @@ function AppContent() {
     try {
       const currentToken = adminToken;
       if (currentToken) {
-        const res = await fetch('http://localhost:5000/api/status', {
+        const res = await fetch(`${API_BASE_URL}/api/status`, {
           headers: { 'Authorization': `Bearer ${currentToken}` }
         });
         if (res.ok) {
@@ -521,7 +522,7 @@ function AppContent() {
           try {
             const currentToken = adminToken;
             if (currentToken) {
-              const res = await fetch('http://localhost:5000/api/status', {
+              const res = await fetch(`${API_BASE_URL}/api/status`, {
                 headers: { 'Authorization': `Bearer ${currentToken}` }
               });
               if (res.ok) {
@@ -613,7 +614,7 @@ function AppContent() {
         checkInDate: formatDateString(guestData.checkInDate)
       };
 
-      const res = await fetch(`http://localhost:5000/api/rooms/${roomNumber}/checkin`, {
+      const res = await fetch(`${API_BASE_URL}/api/rooms/${roomNumber}/checkin`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
@@ -647,7 +648,7 @@ function AppContent() {
       // ─ Step 1: If cash payment is pending, confirm it now (admin receiving cash = confirmation) ─
       if (room.booking_id) {
         try {
-          await fetch(`http://localhost:5000/api/payments/booking/${room.booking_id}/confirm-cash`, {
+          await fetch(`${API_BASE_URL}/api/payments/booking/${room.booking_id}/confirm-cash`, {
             method: 'PUT',
             headers: { 'Authorization': `Bearer ${adminToken}` }
           });
@@ -658,7 +659,7 @@ function AppContent() {
       }
 
       // ─ Step 2: Admin check-in (room status -> occupied) ────────────────────────
-      const res = await fetch(`http://localhost:5000/api/rooms/${roomNumber}/checkin`, {
+      const res = await fetch(`${API_BASE_URL}/api/rooms/${roomNumber}/checkin`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
@@ -691,7 +692,7 @@ function AppContent() {
   // Check-Out core action
   const checkOutGuest = async (roomNumber, balancePaid) => {
     try {
-      const res = await fetch(`http://localhost:5000/api/rooms/${roomNumber}/checkout`, {
+      const res = await fetch(`${API_BASE_URL}/api/rooms/${roomNumber}/checkout`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
@@ -736,7 +737,7 @@ function AppContent() {
         expectedCheckOutDate: formatDateString(modifiedData.expectedCheckOutDate)
       };
 
-      const res = await fetch(`http://localhost:5000/api/rooms/${roomNumber}/checkin`, {
+      const res = await fetch(`${API_BASE_URL}/api/rooms/${roomNumber}/checkin`, {
         method: 'PUT',
         headers: { 
           'Content-Type': 'application/json',
@@ -786,7 +787,7 @@ function AppContent() {
   // Clean dirty room
   const cleanRoom = async (roomNumber) => {
     try {
-      const res = await fetch(`http://localhost:5000/api/rooms/${roomNumber}/clean`, {
+      const res = await fetch(`${API_BASE_URL}/api/rooms/${roomNumber}/clean`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${adminToken}`
@@ -810,7 +811,7 @@ function AppContent() {
   // Shift guest room
   const shiftGuest = async (fromRoomNumber, toRoomNumber) => {
     try {
-      const res = await fetch('http://localhost:5000/api/rooms/shift', {
+      const res = await fetch(`${API_BASE_URL}/api/rooms/shift`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
@@ -838,7 +839,7 @@ function AppContent() {
   // Add bill posting ledger item
   const addLedgerItem = async (roomNumber, desc, amount) => {
     try {
-      const res = await fetch(`http://localhost:5000/api/rooms/${roomNumber}/ledger`, {
+      const res = await fetch(`${API_BASE_URL}/api/rooms/${roomNumber}/ledger`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
@@ -876,7 +877,7 @@ function AppContent() {
   // Run Day End audit
   const runDayEnd = async (auditReport) => {
     try {
-      const res = await fetch('http://localhost:5000/api/dayend', {
+      const res = await fetch(`${API_BASE_URL}/api/dayend`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',

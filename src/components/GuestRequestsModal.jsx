@@ -1,3 +1,4 @@
+import { API_BASE_URL } from '../config/apiConfig';
 import React, { useEffect, useState, useCallback } from 'react';
 
 const TYPE_CONFIG = {
@@ -18,7 +19,7 @@ export default function GuestRequestsModal({ isOpen, onClose, token, onRequestRe
     if (!token) return;
     if (!silent) setLoading(true);
     try {
-      const res = await fetch('http://localhost:5000/api/admin/guest-requests', {
+      const res = await fetch(`${API_BASE_URL}/api/admin/guest-requests`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       if (res.ok) {
@@ -38,11 +39,11 @@ export default function GuestRequestsModal({ isOpen, onClose, token, onRequestRe
     if (!token || resolvingId) return;
     setResolvingId(id);
     try {
-      let url = `http://localhost:5000/api/admin/guest-requests/${id}/resolve`;
+      let url = `${API_BASE_URL}/api/admin/guest-requests/${id}/resolve`;
       let body = {};
       
       if (id.startsWith('ext_')) {
-        url = `http://localhost:5000/api/admin/guest-requests/extension/${id}/resolve`;
+        url = `${API_BASE_URL}/api/admin/guest-requests/extension/${id}/resolve`;
         body = { action }; // 'approve' or 'reject'
       }
 

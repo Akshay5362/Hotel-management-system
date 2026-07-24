@@ -1,8 +1,9 @@
+import { API_BASE_URL } from '../config/apiConfig';
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { exportToExcel } from '../utils/exportUtils';
 
 // ── API helper (mirrors the one in ReceptionPortal) ──────────────────────────
-const API_BASE = 'http://localhost:5000/api';
+const API_BASE = `${API_BASE_URL}/api`;
 async function apiCall(method, endpoint, body, token) {
   const opts = {
     method,

@@ -21,7 +21,11 @@ async function run() {
     }
 
     // 1. Run OCR on raw image
-    const rawRes = await Tesseract.recognize(filePath, 'eng', { logger: () => {} });
+    const rawRes = await Tesseract.recognize(filePath, 'eng', { 
+      logger: () => {},
+      langPath: path.join(__dirname, '..'),
+      cachePath: path.join(__dirname, '..')
+    });
     const rawText = rawRes.data.text || '';
     let confidence = rawRes.data.confidence || 0;
 
@@ -42,7 +46,11 @@ async function run() {
         .toFile(preprocessedPath);
 
       // 3. Run OCR on preprocessed image
-      const preRes = await Tesseract.recognize(preprocessedPath, 'eng', { logger: () => {} });
+      const preRes = await Tesseract.recognize(preprocessedPath, 'eng', { 
+        logger: () => {},
+        langPath: path.join(__dirname, '..'),
+        cachePath: path.join(__dirname, '..')
+      });
       preText = preRes.data.text || '';
       confidence = preRes.data.confidence || 0;
 

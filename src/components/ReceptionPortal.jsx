@@ -1,3 +1,4 @@
+import { API_BASE_URL } from '../config/apiConfig';
 /**
  * ReceptionPortal.jsx
  * ─────────────────────────────────────────────────────────────────────────────
@@ -30,7 +31,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AdminAuthContext } from '../contexts/AdminAuthContext';
 
-const API = 'http://localhost:5000/api';
+const API = `${API_BASE_URL}/api`;
 
 // ── Status styling ───────────────────────────────────────────────────────────
 const STATUS_STYLE = {

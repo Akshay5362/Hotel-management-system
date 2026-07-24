@@ -1,3 +1,4 @@
+import { API_BASE_URL } from '../config/apiConfig';
 ﻿import React, { useState, useEffect, useCallback } from 'react';
 
 /**
@@ -78,7 +79,7 @@ export default function RefundCheckoutModal({ isOpen, onClose, room, token, onRe
     if (!token) return;
     try {
       setLoadingPolicy(true);
-      const res = await fetch('http://localhost:5000/api/refund-policy', {
+      const res = await fetch(`${API_BASE_URL}/api/refund-policy`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       if (res.ok) {
@@ -110,7 +111,7 @@ export default function RefundCheckoutModal({ isOpen, onClose, room, token, onRe
     if (vals.slice(0,3).some(v => v < 0 || v > 100)) { showAlert('Percentages must be between 0–100.', 'Validation Error'); return; }
     try {
       setSavingPolicy(true);
-      const res = await fetch('http://localhost:5000/api/refund-policy', {
+      const res = await fetch(`${API_BASE_URL}/api/refund-policy`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ noStayPct: vals[0], partialStayPct: vals[1], fullStayPct: vals[2], partialHours: vals[3] })
@@ -130,7 +131,7 @@ export default function RefundCheckoutModal({ isOpen, onClose, room, token, onRe
     if (!confirmed) return;
     try {
       setProcessing(true);
-      const res = await fetch(`http://localhost:5000/api/rooms/${room.number}/refund-checkout`, {
+      const res = await fetch(`${API_BASE_URL}/api/rooms/${room.number}/refund-checkout`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ refundAmount: finalRefund, reason })

@@ -15,7 +15,7 @@ function formatTime(date) {
 
 export const checkIn = async (req, res) => {
   const { number } = req.params;
-  const { guestName, phone, pax, deposit, checkInDate } = req.body;
+  const { guestName, phone, pax, deposit, checkInDate, paymentMethod = 'Cash', transactionId = null } = req.body;
 
   // Input Validation
   if (!number || typeof number !== 'string' || number.trim() === '') {

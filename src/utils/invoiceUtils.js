@@ -1,3 +1,4 @@
+import { API_BASE_URL } from '../config/apiConfig';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 
@@ -5,7 +6,7 @@ export const generateInvoicePDF = async (room, action = 'download') => {
   try {
     const token = localStorage.getItem('adminToken') || localStorage.getItem('token');
     // Fetch unique sequential invoice number
-    const res = await fetch(`http://localhost:5000/api/invoices/generate/${room.booking_id}`, {
+    const res = await fetch(`${API_BASE_URL}/api/invoices/generate/${room.booking_id}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
