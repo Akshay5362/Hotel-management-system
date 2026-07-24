@@ -112,8 +112,8 @@ process.on('exit', (code) => {
 });
 
 // ─── Environment ──────────────────────────────────────────────────────────────
-const isDev = !app.isPackaged;
-L('ENV', `isDev = ${isDev}  (based on app.isPackaged)`);
+const isDev = !app.isPackaged && process.env.NODE_ENV !== 'production';
+L('ENV', `isDev = ${isDev}  (based on app.isPackaged & NODE_ENV)`);
 
 // ─── Path placeholders ────────────────────────────────────────────────────────
 const DEV_URL = 'http://localhost:5173';
@@ -499,7 +499,8 @@ app.whenReady().then(async () => {
   // Resolve all paths
   let APP_ROOT;
   try {
-    APP_ROOT     = app.getAppPath();
+    const rawPath = app.getAppPath();
+    APP_ROOT     = rawPath.endsWith('electron') ? path.dirname(rawPath) : rawPath;
     PRELOAD_PATH = path.join(APP_ROOT, 'electron', 'preload.js');
     SPLASH_PATH  = path.join(APP_ROOT, 'electron', 'splash.html');
     PROD_ENTRY   = path.join(APP_ROOT, 'dist', 'index.html');

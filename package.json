@@ -23,7 +23,8 @@
     "electron:build": "npm run build && electron-builder --win",
     "test": "vitest run",
     "test:smoke": "vitest run backend/tests/smoke",
-    "test:functional": "vitest run backend/tests/functional"
+    "test:functional": "vitest run backend/tests/functional",
+    "test:e2e": "playwright test"
   },
   "build": {
     "appId": "com.webline.pms",
@@ -100,6 +101,7 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",

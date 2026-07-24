@@ -9,7 +9,7 @@ function hashPassword(pass) {
 }
 
 export function generateToken(user) {
-  const payload = JSON.stringify({ id: user.id, role: user.role });
+  const payload = JSON.stringify({ id: user.id, role: user.role, type: user.type });
   const base64Payload = Buffer.from(payload).toString('base64url');
   const signature = crypto.createHmac('sha256', JWT_SECRET).update(base64Payload).digest('base64url');
   return `${base64Payload}.${signature}`;

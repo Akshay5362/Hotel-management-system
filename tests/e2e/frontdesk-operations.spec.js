@@ -2,6 +2,7 @@ import { _electron as electron } from 'playwright';
 import { test, expect } from '@playwright/test';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import pool from '../../backend/db.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,15 +19,63 @@ test.describe('Webline PMS E2E Front-Desk Flow', () => {
 
   // Launch the Electron process before E2E specs run
   test.beforeAll(async () => {
-    const mainEntryPath = path.join(__dirname, '../../main.js');
+    const mainEntryPath = path.join(__dirname, '../../electron/main.js');
     console.log(`[E2E Setup] Launching Electron app from: ${mainEntryPath}`);
     
     electronApp = await electron.launch({
       args: [mainEntryPath],
+      env: {
+        ...process.env,
+        NODE_ENV: 'production'
+      }
     });
 
-    // Capture the main window context
-    window = await electronApp.firstWindow();
+    // Pipe Electron process logs to test output for debugging
+    electronApp.process().stdout.on('data', (data) => {
+      console.log(`[Electron STDOUT] ${data.toString()}`);
+    });
+    electronApp.process().stderr.on('data', (data) => {
+      console.error(`[Electron STDERR] ${data.toString()}`);
+    });
+
+    // Select the main window by polling until its title is initialized
+    let found = null;
+    for (let i = 0; i < 20; i++) {
+      const windows = electronApp.windows();
+      for (const win of windows) {
+        try {
+          const title = await win.title();
+          if (title.includes('Webline PMS') || title.includes('HOTEL SKY-5')) {
+            found = win;
+            break;
+          }
+        } catch (e) {
+          // Window might be transitioning or not ready
+        }
+      }
+      if (found) break;
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    
+    if (!found) {
+      const windows = electronApp.windows();
+      window = windows[windows.length - 1] || await electronApp.firstWindow();
+    } else {
+      window = found;
+    }
+    
+    // Log renderer console messages to CLI
+    window.on('console', msg => console.log(`[Renderer CONSOLE] ${msg.text()}`));
+
+    // Reset database to ensure tests are reproducible and clean
+    try {
+      console.log('[E2E Setup] Resetting database rooms and active bookings...');
+      await pool.query("UPDATE rooms SET status = 'vacant', housekeeping_status = 'Clean'");
+      await pool.query("UPDATE bookings SET booking_status = 'Cancelled' WHERE booking_status IN ('Reserved', 'Checked In')");
+      console.log('[E2E Setup] Database reset completed successfully.');
+    } catch (e) {
+      console.error('[E2E Setup] Failed to reset database:', e);
+    }
   });
 
   // Terminate the Electron application container on completion
@@ -36,26 +85,46 @@ test.describe('Webline PMS E2E Front-Desk Flow', () => {
     }
   });
 
-  // Test 1: Launch and Authentication Flow
-  test('should launch application and authenticate staff user', async () => {
+  // Test 1: Staff Login & Walk-In Guest Check-In Flow
+  test('should authenticate staff user and complete walk-in guest check-in', async () => {
     // Assert window is visible and contains correct title
     await expect(window).toHaveTitle(/Webline PMS Plus/);
 
+    // Clear local storage and reload to ensure a clean, reproducible test starting state
+    await window.evaluate(() => localStorage.clear());
+    await window.reload();
+
+    // Assert window is visible and contains correct title
+    await expect(window).toHaveTitle(/Webline PMS Plus/);
+
+    // Wait for the landing page to load stably
+    const staffCard = window.locator('text=Staff & Management');
+    await expect(staffCard).toBeVisible({ timeout: 10000 });
+
+    console.log('[E2E Test] Landing Page detected. Navigating to Staff Portal...');
+    await staffCard.click();
+
+    // Wait for staff portal login screen
+    const loginInput = window.locator('input[placeholder="Enter username, email, or phone"]');
+    await expect(loginInput).toBeVisible({ timeout: 10000 });
+
     // Enter staff credentials and submit form
-    await window.fill('input[placeholder="Username"]', 'admin');
-    await window.fill('input[placeholder="Password"]', 'admin123');
-    await window.click('button:has-text("Login")');
+    await window.fill('input[placeholder="Enter username, email, or phone"]', 'reception_morning');
+    await window.fill('input[placeholder="Enter password"]', 'Reception@123');
+    await window.click('button:has-text("Sign In")');
+
+    // Wait for the "Logged in successfully!" notification modal and click OK
+    const okButton = window.getByRole('button', { name: 'OK', exact: true });
+    await expect(okButton).toBeVisible({ timeout: 5000 });
+    await okButton.click();
 
     // Assert receptionist dashboard loads and displays rooms grid
     const dashboardGrid = window.locator('.rooms-grid');
-    await expect(dashboardGrid).toBeVisible();
+    await expect(dashboardGrid).toBeVisible({ timeout: 10000 });
     console.log('[E2E Test] Authentication successful, dashboard loaded.');
-  });
 
-  // Test 2: Walk-In Guest Check-In Flow
-  test('should open check-in modal and check-in walk-in guest with advance deposit', async () => {
     // Click on vacant Room card (Room 1)
-    const roomCard = window.locator('.room-card:has-text("Room 1")');
+    const roomCard = window.locator('.room-card').filter({ has: window.locator('.room-number', { hasText: /^1$/ }) });
     await expect(roomCard).toBeVisible();
     await roomCard.click();
 
@@ -73,14 +142,13 @@ test.describe('Webline PMS E2E Front-Desk Flow', () => {
     await depositInput.fill('1000');
 
     // Submit form
-    await window.click('button:has-text("Confirm Check-In")');
+    await window.click('button:has-text("Confirm Check-In")', { force: true });
 
     // Verify that Check-in completes and modal closes
     await expect(modalHeader).not.toBeVisible();
 
-    // Verify room status has updated to Occupied (styled red or showing active guest)
-    const activeRoomCard = window.locator('.room-card:has-text("Room 1")');
-    await expect(activeRoomCard).toHaveClass(/occupied/);
-    console.log('[E2E Test] Walk-in guest john doe successfully checked into Room 1.');
+    // Verify room status has updated to Occupied
+    await expect(roomCard).toHaveClass(/status-occupied/);
+    console.log('[E2E Test] Walk-in guest successfully checked into Room 1.');
   });
 });

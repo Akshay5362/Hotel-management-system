@@ -208,7 +208,7 @@ function CheckInModal({ room, rooms, token, onClose, onSuccess, isWalkIn = false
   const hasDirtyRooms = dirtyRooms.length > 0;
 
   return (
-    <Modal title={isWalkIn ? '🚶 Walk-In Guest Check-In' : `🔑 Check-In — Room ${room?.number}`} onClose={onClose}>
+    <Modal title={isWalkIn ? '🚶 Walk-In Guest Check-In' : `Room Check-In - Room ${room?.number}`} onClose={onClose}>
       <ErrorBox msg={error} />
       <div style={{ display: 'flex', flexDirection: 'column', gap: '13px' }}>
         {isWalkIn && (
@@ -263,7 +263,7 @@ function CheckInModal({ room, rooms, token, onClose, onSuccess, isWalkIn = false
         )}
         <div>
           <label style={labelStyle}>Guest Name *</label>
-          <input style={inputStyle} type="text" placeholder="Full name" value={form.guestName}
+          <input style={inputStyle} type="text" placeholder="Enter guest's full name" value={form.guestName}
             onChange={e => setForm(f => ({ ...f, guestName: e.target.value }))} autoFocus />
         </div>
         <div>
@@ -273,9 +273,13 @@ function CheckInModal({ room, rooms, token, onClose, onSuccess, isWalkIn = false
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
           <div>
-            <label style={labelStyle}>Pax (Guests)</label>
-            <input style={inputStyle} type="number" min="1" max="10" value={form.pax}
-              onChange={e => setForm(f => ({ ...f, pax: e.target.value }))} />
+            <label style={labelStyle}>Pax (Guests Count)</label>
+            <select style={inputStyle} value={form.pax} onChange={e => setForm(f => ({ ...f, pax: e.target.value }))}>
+              <option value="1">1 Person</option>
+              <option value="2">2 Persons</option>
+              <option value="3">3 Persons</option>
+              <option value="4">4 Persons</option>
+            </select>
           </div>
           <div>
             <label style={labelStyle}>Deposit (₹)</label>
@@ -825,10 +829,24 @@ function RoomCard({ room, onAction }) {
   );
   if (room.status === 'booked')   inlineActions.push({ id: 'noshow', icon: '❌', label: 'No Show', color: '#f43f5e' });
 
+  const handleCardClick = () => {
+    if (room.status === 'vacant') {
+      onAction('checkin', room);
+    } else if (room.status === 'occupied') {
+      onAction('checkout', room);
+    } else if (room.status === 'booked') {
+      onAction('checkin', room);
+    } else if (room.status === 'dirty') {
+      onAction('mark_clean', room);
+    }
+  };
+
   return (
     <div
+      className={`room-card status-${room.status}`}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => { setHovered(false); setMenuOpen(false); }}
+      onClick={handleCardClick}
       style={{
         background: s.bg, border: `1px solid ${hovered ? s.text : s.border}`,
         borderRadius: '12px', padding: '14px', cursor: 'pointer',
@@ -840,7 +858,7 @@ function RoomCard({ room, onAction }) {
     >
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div>
-          <div style={{ fontSize: '1.35rem', fontWeight: 800, color: '#fff', lineHeight: 1 }}>{room.number}</div>
+          <div className="room-number" style={{ fontSize: '1.35rem', fontWeight: 800, color: '#fff', lineHeight: 1 }}>{room.number}</div>
           <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px', marginTop: '2px' }}>{room.type}</div>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -1481,7 +1499,7 @@ export default function ReceptionPortal() {
       setRooms(data.rooms || []);
       setReservations(data.upcomingReservations || []);
       setSystemDate(data.systemDate || '—');
-    } catch (e) {} finally { setLoading(false); setSyncing(false); }
+    } catch (e) { console.error('fetchData error:', e); } finally { setLoading(false); setSyncing(false); }
   }, [adminToken]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
@@ -1703,7 +1721,7 @@ export default function ReceptionPortal() {
             </div>
 
             {/* Room Grid */}
-            <div style={{ padding: '14px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(175px, 1fr))', gap: '12px' }}>
+            <div className="rooms-grid" style={{ padding: '14px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(175px, 1fr))', gap: '12px' }}>
               {filteredRooms.map(room => (
                 <RoomCard key={room.number} room={room} onAction={handleRoomAction} />
               ))}
