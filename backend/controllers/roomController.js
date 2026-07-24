@@ -338,10 +338,9 @@ export const checkOut = async (req, res) => {
 
     // Log CHECKED_OUT event in booking_history
     await connection.query(
-      `INSERT INTO booking_history (booking_id, action, old_room_id, new_room_id, changed_by, business_date, notes)
-       VALUES (?, 'CHECKED_OUT', ?, ?, ?, ?, ?)`,
-      [activeBooking.id, room.id, room.id, resolvedUserId, businessDate,
-       `Checkout settled. Balance paid: ₹${parsedBalancePaid}. Payment status: ${finalPaymentStatus}.`]
+      `INSERT INTO booking_history (booking_id, action, old_room_id, new_room_id, changed_by, business_date)
+       VALUES (?, 'CHECKED_OUT', ?, ?, ?, ?)`,
+      [activeBooking.id, room.id, room.id, resolvedUserId, businessDate]
     );
 
     // Notify the guest about checkout completion and request feedback

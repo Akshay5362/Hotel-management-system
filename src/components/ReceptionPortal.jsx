@@ -904,10 +904,11 @@ function RoomCard({ room, onAction }) {
       </div>
 
       {/* Inline action buttons on hover */}
-      {hovered && inlineActions.length > 0 && (
-        <div style={{
+      {inlineActions.length > 0 && (
+        <div className="room-card-actions" style={{
           position: 'absolute', bottom: '8px', left: '8px', right: '8px',
-          display: 'flex', gap: '4px', flexWrap: 'wrap',
+          display: hovered ? 'flex' : 'none',
+          gap: '4px', flexWrap: 'wrap',
         }}>
           {inlineActions.map(a => (
             <button key={a.id}

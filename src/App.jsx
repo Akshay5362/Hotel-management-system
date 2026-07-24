@@ -191,15 +191,23 @@ function AppContent() {
   const { guestUser, guestToken, login: guestLogin, logout: guestLogout, updateUser: updateGuestUser } = React.useContext(GuestAuthContext);
   const { adminUser, adminToken, login: adminLogin, logout: adminLogout, updateUser: updateAdminUser } = React.useContext(AdminAuthContext);
 
-  const [currentPath, setCurrentPath] = useState(window.location.pathname);
+  const [currentPath, setCurrentPath] = useState(() => {
+    if (window.location.protocol === 'file:') {
+      return '/';
+    }
+    return window.location.pathname;
+  });
 
   // Custom Navigation Router
   const navigate = useCallback((path) => {
-    window.history.pushState({}, '', path);
+    if (window.location.protocol !== 'file:') {
+      window.history.pushState({}, '', path);
+    }
     setCurrentPath(path);
   }, []);
 
   useEffect(() => {
+    if (window.location.protocol === 'file:') return;
     const handlePopState = () => {
       setCurrentPath(window.location.pathname);
     };

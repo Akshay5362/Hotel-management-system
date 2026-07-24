@@ -336,7 +336,7 @@ function createWindow() {
   }, 15000);
 
   // Renderer lifecycle
-  mainWindow.webContents.on('did-start-loading',  () => L('RENDERER', 'did-start-loading'));
+  mainWindow.webContents.on('did-start-loading',  () => L('RENDERER', `did-start-loading url: ${mainWindow.webContents.getURL()}`));
   mainWindow.webContents.on('dom-ready',           () => L('RENDERER', 'dom-ready'));
   mainWindow.webContents.on('did-finish-load',     () => L('RENDERER', 'did-finish-load ✓'));
   mainWindow.webContents.on('did-fail-load', (e, code, desc, url) => {
