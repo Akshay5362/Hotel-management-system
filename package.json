@@ -14,16 +14,16 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-
     "backend:dev": "cd backend && node server.js",
-
     "electron:start": "cross-env NODE_ENV=development electron .",
     "electron:local": "cross-env NODE_ENV=development electron .",
-    "electron:wait":  "wait-on http://localhost:5173 http://localhost:5000/api/health --timeout 60000 && npm run electron:start",
-    "electron:dev":   "concurrently --kill-others --names \"VITE,BACKEND,ELECTRON\" --prefix-colors \"cyan.bold,yellow.bold,magenta.bold\" --prefix \"[{name}]\" \"npm run dev\" \"npm run backend:dev\" \"npm run electron:wait\"",
-
-    "electron:prod":  "npm run build && cross-env NODE_ENV=production electron .",
-    "electron:build": "npm run build && electron-builder --win"
+    "electron:wait": "wait-on http://localhost:5173 http://localhost:5000/api/health --timeout 60000 && npm run electron:start",
+    "electron:dev": "concurrently --kill-others --names \"VITE,BACKEND,ELECTRON\" --prefix-colors \"cyan.bold,yellow.bold,magenta.bold\" --prefix \"[{name}]\" \"npm run dev\" \"npm run backend:dev\" \"npm run electron:wait\"",
+    "electron:prod": "npm run build && cross-env NODE_ENV=production electron .",
+    "electron:build": "npm run build && electron-builder --win",
+    "test": "vitest run",
+    "test:smoke": "vitest run backend/tests/smoke",
+    "test:functional": "vitest run backend/tests/functional"
   },
   "build": {
     "appId": "com.webline.pms",
@@ -90,24 +90,25 @@
     }
   },
   "dependencies": {
-    "jspdf":            "^4.2.1",
-    "jspdf-autotable":  "^5.0.8",
-    "lucide-react":     "^1.25.0",
-    "react":            "^18.3.1",
-    "react-dom":        "^18.3.1",
-    "recharts":         "^3.10.0",
+    "jspdf": "^4.2.1",
+    "jspdf-autotable": "^5.0.8",
+    "lucide-react": "^1.25.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^3.10.0",
     "socket.io-client": "^4.8.3",
-    "xlsx":             "^0.18.5"
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
-    "@types/react":         "^18.3.3",
-    "@types/react-dom":     "^18.3.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
-    "concurrently":         "^10.0.3",
-    "cross-env":            "^10.1.0",
-    "electron":             "^43.1.1",
-    "electron-builder":     "^26.15.3",
-    "vite":                 "^5.3.1",
-    "wait-on":              "^9.0.10"
+    "concurrently": "^10.0.3",
+    "cross-env": "^10.1.0",
+    "electron": "^43.1.1",
+    "electron-builder": "^26.15.3",
+    "vite": "^5.3.1",
+    "vitest": "^4.1.10",
+    "wait-on": "^9.0.10"
   }
 }
