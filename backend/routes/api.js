@@ -1,6 +1,7 @@
 import express from 'express';
 import { checkIn, checkOut, clean, addLedgerItem, shift, bookRoom, modifyCheckIn, guestRequestCheckIn, guestAddService, guestReportMaintenance, guestExtendStay, getGuestBill, getGuestNotifications, markNotificationRead, guestRequestCheckout, guestSubmitFeedback, getGuestHistory, getGuestHistoryAdmin, uploadIdentity, getRefundPolicy, updateRefundPolicy, processRefundCheckout, getPublicRooms, adminExtendStay, adminLateCheckout, adminNoShow, updateRoomStatus } from '../controllers/roomController.js';
 import { getStatus, runDayEnd, getGuestRequests, resolveGuestRequest, resolveExtensionRequest, getGuestDocuments, verifyGuestDocument, deleteGuestDocument, searchGuests, listGuests, searchGuestsStaff } from '../controllers/auditController.js';
+import { getBusinessDateInfo, updateBusinessDate } from '../controllers/settingsController.js';
 import { submitCash, getCashSubmissions } from '../controllers/cashController.js';
 import { staffLogin, getAllStaff, getStaffById, createStaff, updateStaff, updateStaffStatus, deleteStaff } from '../controllers/staffController.js';
 import { uploadIDDocument } from '../middleware/uploadMiddleware.js';
@@ -10,6 +11,7 @@ import reportsRoutes from './reportsRoutes.js';
 import invoiceRoutes from './invoiceRoutes.js';
 import housekeepingRoutes from './housekeepingRoutes.js';
 import staffRoutes from './staffRoutes.js';
+import reservationRoutes from './reservationRoutes.js';
 
 const router = express.Router();
 
@@ -26,6 +28,10 @@ router.post('/staff/auth/login', staffLogin);
 // Audit & status routes
 router.get('/status', authenticate, getStatus);
 router.post('/dayend', authenticate, requireAdmin, runDayEnd);
+
+// Settings routes
+router.get('/settings/business-date', authenticate, getBusinessDateInfo);
+router.post('/settings/business-date', authenticate, requireAdmin, updateBusinessDate);
 
 // Room routes (Admin)
 router.post('/rooms/:number/checkin', authenticate, requireAdmin, checkIn);
@@ -93,5 +99,8 @@ router.get('/cash/submissions', authenticate, getCashSubmissions);
 
 // ── Staff Management Module ──────────────────────────────────────────────────
 router.use('/staff', authenticate, requireAdmin, staffRoutes);
+
+// ── Reservation Module ───────────────────────────────────────────────────────
+router.use('/reservations', reservationRoutes);
 
 export default router;

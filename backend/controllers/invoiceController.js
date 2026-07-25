@@ -37,7 +37,7 @@ export const getOrGenerateInvoiceNumber = async (req, res) => {
 
     // Get current business date
     const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
-    const businessDate = settings[0]?.value_val || new Date().toISOString().split('T')[0];
+    const businessDate = settings[0]?.value_val || '25-Jul-2026';
 
     // 3. Create a draft invoice record to reserve the number
     // Fetch booking details to populate totals

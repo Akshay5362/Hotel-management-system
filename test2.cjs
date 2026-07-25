@@ -1,0 +1,1 @@
+const pool = require('./backend/db.js').default; async function test() { const [s] = await pool.query('SELECT value_val FROM system_settings WHERE key_name = \'system_date\''); console.log('System Date:', s[0].value_val); process.exit(0); } test();

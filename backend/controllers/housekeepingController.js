@@ -84,7 +84,7 @@ export const updateHousekeepingStatus = async (req, res) => {
     const [settings] = await db.query(
       "SELECT value_val FROM system_settings WHERE key_name = 'system_date'"
     );
-    const businessDate = settings[0]?.value_val || new Date().toISOString().split('T')[0];
+    const businessDate = settings[0]?.value_val || '25-Jul-2026';
 
     // Build update — only housekeeping_status is changed, occupancy status is never touched
     let updateFields = 'housekeeping_status = ?';

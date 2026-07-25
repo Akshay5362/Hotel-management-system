@@ -1,0 +1,1 @@
+const pool = require('./backend/db.js').default; async function test() { const [res] = await pool.query('SELECT * FROM reservations WHERE room_number = \'16\' OR room_id = 16'); console.log('Res:', res); const [rooms] = await pool.query('SELECT id, number, status FROM rooms WHERE number = \'16\' OR id = 16'); console.log('Rooms:', rooms); process.exit(0); } test();

@@ -1,3 +1,4 @@
+import { processCheckIn } from '../services/checkInService.js';
 import pool from '../db.js';
 import fs from 'fs';
 import path from 'path';
@@ -15,219 +16,40 @@ function formatTime(date) {
 
 export const checkIn = async (req, res) => {
   const { number } = req.params;
-  const { guestName, phone, pax, deposit, checkInDate } = req.body;
-
+  const { guestName, phone, pax, deposit, checkInDate, manual_override, paymentMethod, transactionId } = req.body;
   // Input Validation
-  if (!number || typeof number !== 'string' || number.trim() === '') {
-    return res.status(400).json({ error: 'Room number is required' });
-  }
-  if (!guestName || typeof guestName !== 'string' || guestName.trim() === '') {
-    return res.status(400).json({ error: 'Guest name is required' });
-  }
+  if (!number || typeof number !== "string" || number.trim() === "") return res.status(400).json({ error: "Room number is required" });
+  if (!guestName || typeof guestName !== "string" || guestName.trim() === "") return res.status(400).json({ error: "Guest name is required" });
   const parsedPax = parseInt(pax, 10);
-  if (isNaN(parsedPax) || parsedPax <= 0) {
-    return res.status(400).json({ error: 'Pax must be a positive integer' });
-  }
+  if (isNaN(parsedPax) || parsedPax <= 0) return res.status(400).json({ error: "Pax must be a positive integer" });
   const parsedDeposit = parseInt(deposit, 10);
-  if (isNaN(parsedDeposit) || parsedDeposit < 0) {
-    return res.status(400).json({ error: 'Deposit must be a non-negative integer' });
-  }
-  if (phone && phone.length > 50) {
-    return res.status(400).json({ error: 'Phone number cannot exceed 50 characters' });
-  }
-
-  // staff logins carry ids from staff table, not users -- use NULL to avoid FK violation.
-  const resolvedUserId = req.user?.type === 'staff' ? null : (req.user?.id || null);
-
+  if (isNaN(parsedDeposit) || parsedDeposit < 0) return res.status(400).json({ error: "Deposit must be a non-negative integer" });
+  const resolvedUserId = req.user?.type === "staff" ? null : (req.user?.id || null);
   let connection;
   try {
     connection = await pool.getConnection();
     await connection.beginTransaction();
-
-    // Check if room exists and is vacant or booked
-    const [roomRows] = await connection.query(`
-      SELECT r.*, rt.base_rate as rate, rt.code as type
-      FROM rooms r
-      JOIN room_types rt ON r.room_type_id = rt.id
-      WHERE r.number = ?
-      FOR UPDATE
-    `, [number]);
-    if (roomRows.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ error: `Room ${number} not found` });
-    }
-
-    const room = roomRows[0];
-    if (room.status !== 'vacant' && room.status !== 'booked') {
-      await connection.rollback();
-      return res.status(400).json({ error: `Room ${number} is not vacant or booked` });
-    }
-
-    // Req 3: Block dirty rooms from auto-assignment unless override flag is set
-    const { manual_override } = req.body;
-    if (room.housekeeping_status === 'Dirty') {
-      if (!manual_override) {
-        await connection.rollback();
-        return res.status(400).json({
-          error: `Room ${number} has pending housekeeping (Dirty). Complete cleaning before check-in.`,
-          code: 'ROOM_DIRTY'
-        });
-      }
-      // Req 1 (new): Manual override is restricted to Admin/Manager roles only
-      const userRole = (req.user?.role || '').toUpperCase();
-      const canOverride = userRole === 'ADMIN' || userRole === 'MANAGER' || userRole === 'admin';
-      if (!canOverride) {
-        await connection.rollback();
-        return res.status(403).json({
-          error: `Room ${number} is Dirty. Manual override for dirty rooms requires Manager or Admin access. Please contact your supervisor.`,
-          code: 'OVERRIDE_FORBIDDEN'
-        });
-      }
-    }
-
-    const guestNameUpper = guestName.trim().toUpperCase();
-    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
-    const businessDate = settings[0]?.value_val || '11-Jul-2026';
-
-    let guestId;
-    let bookingId;
-
-    // 1. Check for ANY existing active booking (Reserved or Checked In)
-    const [existingBookings] = await connection.query(
-      "SELECT id, booking_status, guest_id FROM bookings WHERE room_id = ? AND booking_status IN ('Reserved', 'Checked In') LIMIT 1",
-      [room.id]
-    );
-
-    if (existingBookings.length > 0) {
-      const existing = existingBookings[0];
-      if (existing.booking_status === 'Checked In') {
-        await connection.rollback();
-        return res.status(400).json({ error: `Room ${number} is already Checked In (Booking ID: ${existing.id}).` });
-      } else if (existing.booking_status === 'Reserved') {
-        // Automatically check them into this existing reservation
-        guestId = existing.guest_id;
-        bookingId = existing.id;
-
-        // Update booking details to Checked In
-        await connection.query(
-          `UPDATE bookings 
-           SET booking_status = 'Checked In', check_in_date = ?, advance_amount = ?, adults = ?
-           WHERE id = ?`,
-          [checkInDate || businessDate, parsedDeposit, parsedPax, bookingId]
-        );
-      }
-    }
-
-    if (!bookingId) {
-      // Create or select guest profile
-      const [guestRows] = await connection.query('SELECT id FROM guests WHERE full_name = ? AND phone = ?', [guestNameUpper, phone || '']);
-      if (guestRows.length > 0) {
-        guestId = guestRows[0].id;
-      } else {
-        const [newGuestRes] = await connection.query(
-          'INSERT INTO guests (full_name, phone) VALUES (?, ?)',
-          [guestNameUpper, phone || '']
-        );
-        guestId = newGuestRes.insertId;
-      }
-
-      // Create Checked In booking
-      const bookingNumber = 'BKG-' + Math.floor(100000 + Math.random() * 900000);
-      const [newBookingRes] = await connection.query(
-        `INSERT INTO bookings (booking_number, guest_id, room_id, check_in_date, adults, booking_status, payment_status, total_amount, advance_amount, created_by)
-         VALUES (?, ?, ?, ?, ?, 'Checked In', 'Partial', ?, ?, ?)`,
-        [bookingNumber, guestId, room.id, checkInDate || businessDate, parsedPax, room.rate, parsedDeposit, resolvedUserId]
-      );
-      bookingId = newBookingRes.insertId;
-
-      // Add initial ledger entries (Room Tariff Charge and Taxes)
-      const tariffAmount = room.rate;
-      const taxesAmount = Math.round(tariffAmount * 0.05);
-
-      await connection.query(
-        'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-        [number, 'Room Tariff Charge', tariffAmount, businessDate, bookingId]
-      );
-      await connection.query(
-        'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-        [number, 'Taxes & GST (5%)', taxesAmount, businessDate, bookingId]
-      );
-    }
-
-    // Insert payment/cash log transaction if deposit paid
-    if (parsedDeposit > 0) {
-      if (paymentMethod !== 'Cash') {
-        // Link razorpay transaction
-        await connection.query(
-          "UPDATE razorpay_transactions SET booking_id = ? WHERE id = ?",
-          [bookingId, transactionId]
-        );
-        // Log Payment transaction as Razorpay
-        await connection.query(
-          `INSERT INTO payments (booking_id, amount, payment_method, payment_type, business_date)
-           VALUES (?, ?, 'Razorpay', 'Advance Deposit', ?)`,
-          [bookingId, parsedDeposit, businessDate]
-        );
-      } else {
-        const timeStr = formatTime(new Date());
-        await connection.query(
-          `INSERT INTO cash_logs (time, room, guest, type, amount, business_date, booking_id)
-           VALUES (?, ?, ?, 'Advance Deposit', ?, ?, ?)`,
-          [timeStr, number, guestNameUpper, parsedDeposit, businessDate, bookingId]
-        );
-
-        // Log Payment transaction as Cash
-        await connection.query(
-          `INSERT INTO payments (booking_id, amount, payment_method, payment_type, business_date)
-           VALUES (?, ?, 'Cash', 'Advance Deposit', ?)`,
-          [bookingId, parsedDeposit, businessDate]
-        );
-      }
-    }
-
-    // Update Room Status History
-    await connection.query(
-      `INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date)
-       VALUES (?, ?, 'occupied', ?, ?)`,
-      [room.id, room.status, resolvedUserId, businessDate]
-    );
-
-    // Insert Audit Log entry
-    await connection.query(
-      `INSERT INTO audit_logs (user_id, action, details, business_date)
-       VALUES (?, 'CHECK_IN', ?, ?)`,
-      [resolvedUserId, `Checked in guest ${guestNameUpper} into Room ${number}. Booking ID: ${bookingId}`, businessDate]
-    );
-
-    // Update room status to occupied
-    await connection.query(
-      `UPDATE rooms SET status = 'occupied' WHERE id = ?`,
-      [room.id]
-    );
-
-    // Increment todayCheckins count
-    await connection.query(
-      `UPDATE system_settings 
-       SET value_val = CAST(CAST(value_val AS UNSIGNED) + 1 AS CHAR)
-       WHERE key_name = 'today_checkins'`
-    );
-
+    const { bookingId } = await processCheckIn(connection, {
+      roomNumber: number,
+      guestName,
+      phone,
+      pax: parsedPax,
+      deposit: parsedDeposit,
+      paymentMethod,
+      transactionId,
+      manualOverride: manual_override,
+      checkInDate,
+      resolvedUserId,
+      isGuestSelfCheckIn: false
+    });
     await connection.commit();
-    res.json({ message: `Successfully checked in to Room ${number}` });
+    res.json({ message: `Successfully checked in to Room ${number}`, bookingId });
   } catch (error) {
-    if (connection) {
-      try {
-        await connection.rollback();
-      } catch (rollbackError) {
-        console.error('Rollback failed:', rollbackError);
-      }
-    }
-    console.error('Error during checkin controller:', error);
-    res.status(500).json({ error: error.message, stack: error.stack });
+    if (connection) { try { await connection.rollback(); } catch (e) {} }
+    console.error("Error during checkin controller:", error);
+    res.status(error.status || 500).json({ error: error.message || "Internal Server Error", code: error.code });
   } finally {
-    if (connection) {
-      connection.release();
-    }
+    if (connection) connection.release();
   }
 };
 
@@ -1136,30 +958,21 @@ export const modifyCheckIn = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 // GUEST PORTAL PHASE 2 — Guest-Facing Controllers
-// ─────────────────────────────────────────────────────────────
-
-/** Guest self check-in — auto-approves if today >= booking check_in_date */
 export const guestRequestCheckIn = async (req, res) => {
   const resolvedUserId = req.user?.id;
-  if (!resolvedUserId) return res.status(401).json({ error: 'Unauthorized' });
-
+  if (!resolvedUserId) return res.status(401).json({ error: "Unauthorized" });
   let connection;
   try {
     connection = await pool.getConnection();
     await connection.beginTransaction();
-
-    // Find the guest profile for this user
-    const [guestRows] = await connection.query('SELECT id FROM guests WHERE user_id = ?', [resolvedUserId]);
+    const [guestRows] = await connection.query("SELECT id FROM guests WHERE user_id = ?", [resolvedUserId]);
     if (guestRows.length === 0) {
       await connection.rollback();
-      return res.status(404).json({ error: 'Guest profile not found' });
+      return res.status(404).json({ error: "Guest profile not found" });
     }
     const guestId = guestRows[0].id;
-
-    // Find their Reserved booking
     const [bookingRows] = await connection.query(
-      `SELECT b.*, r.number as room_number, r.id as room_id_val
-       FROM bookings b
+      `SELECT b.*, r.number as room_number FROM bookings b
        JOIN rooms r ON b.room_id = r.id
        WHERE b.guest_id = ? AND b.booking_status = 'Reserved'
        ORDER BY b.id DESC LIMIT 1`,
@@ -1167,69 +980,38 @@ export const guestRequestCheckIn = async (req, res) => {
     );
     if (bookingRows.length === 0) {
       await connection.rollback();
-      return res.status(404).json({ error: 'No upcoming reservation found' });
+      return res.status(404).json({ error: "No upcoming reservation found" });
     }
     const booking = bookingRows[0];
-
-    // ── Payment Guard: block self check-in if cash not yet confirmed ────────
     const [pendingPayment] = await connection.query(
-      `SELECT id, amount, payment_method FROM payments
-       WHERE booking_id    = ?
-         AND payment_method = 'Cash'
-         AND payment_status = 'Pending'
-       LIMIT 1`,
+      `SELECT id, amount FROM payments WHERE booking_id = ? AND payment_method = 'Cash' AND payment_status = 'Pending' LIMIT 1`,
       [booking.id]
     );
     if (pendingPayment.length > 0) {
       await connection.rollback();
       return res.status(403).json({
-        error: 'Cash payment not yet confirmed.',
-        message: `Your advance cash payment of ₹${pendingPayment[0].amount} has not been confirmed by the reception yet. Please visit the front desk with your cash, and once the staff confirms receipt your Check In will be enabled.`,
-        code: 'CASH_PAYMENT_PENDING'
+        error: "Cash payment not yet confirmed.",
+        message: `Your advance cash payment of ₹${pendingPayment[0].amount} has not been confirmed. Please visit the front desk.`,
+        code: "CASH_PAYMENT_PENDING"
       });
     }
-
-    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
-    const businessDate = settings[0]?.value_val || new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
-
-    // Update booking to Checked In
-    await connection.query(
-      "UPDATE bookings SET booking_status = 'Checked In' WHERE id = ?",
-      [booking.id]
-    );
-    // Update room to occupied
-    await connection.query(
-      "UPDATE rooms SET status = 'occupied' WHERE id = ?",
-      [booking.room_id_val]
-    );
-    // Log status history
-    await connection.query(
-      `INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date)
-       VALUES (?, 'booked', 'occupied', ?, ?)`,
-      [booking.room_id_val, resolvedUserId, businessDate]
-    );
-    // Create welcome notification for guest
-    await connection.query(
-      `INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)`,
-      [resolvedUserId, '🏨 Welcome to Hotel Sky-5!', `You have successfully checked in to Room ${booking.room_number}. Enjoy your stay! If you need anything, use your Guest Dashboard.`]
-    );
-    await connection.query(
-      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'GUEST_CHECKIN', ?, ?)`,
-      [resolvedUserId, `Guest self check-in for Room ${booking.room_number}, Booking ID: ${booking.id}`, businessDate]
-    );
-
+    await processCheckIn(connection, {
+      roomNumber: booking.room_number,
+      guestId: guestId,
+      resolvedUserId,
+      isGuestSelfCheckIn: true
+    });
     await connection.commit();
     res.json({ message: `Successfully checked in to Room ${booking.room_number}`, roomNumber: booking.room_number });
   } catch (error) {
     if (connection) { try { await connection.rollback(); } catch (e) {} }
-    console.error('guestRequestCheckIn error:', error);
-    res.status(500).json({ error: 'Internal Server Error' });
+    console.error("guestRequestCheckIn error:", error);
+    res.status(error.status || 500).json({ error: error.message || "Internal Server Error" });
   } finally {
     if (connection) connection.release();
   }
 };
 
-/** Guest adds a service request (room service / housekeeping) — creates ledger item + admin notification */
 export const guestAddService = async (req, res) => {
   const resolvedUserId = req.user?.id;
   if (!resolvedUserId) return res.status(401).json({ error: 'Unauthorized' });

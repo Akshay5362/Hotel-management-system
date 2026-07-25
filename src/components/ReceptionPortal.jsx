@@ -29,6 +29,7 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AdminAuthContext } from '../contexts/AdminAuthContext';
+import ReservationModule from './ReservationModule';
 
 const API = 'http://localhost:5000/api';
 
@@ -1483,7 +1484,13 @@ export default function ReceptionPortal() {
     } catch (e) {} finally { setLoading(false); setSyncing(false); }
   }, [adminToken]);
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  useEffect(() => { 
+    fetchData(); 
+    const handleDateChange = () => fetchData(true);
+    window.addEventListener('businessDateChanged', handleDateChange);
+    return () => window.removeEventListener('businessDateChanged', handleDateChange);
+  }, [fetchData]);
+  
   useEffect(() => {
     const id = setInterval(() => fetchData(true), 30000);
     return () => clearInterval(id);
@@ -1735,14 +1742,11 @@ export default function ReceptionPortal() {
         {/* ── Tab: Reservations ────────────────────────────────────────── */}
         {activeTab === 'reservations' && (
           <div className="dashboard-body">
-            <div style={{ padding: '18px 22px' }}>
-              <h2 style={{ fontSize: '1.1rem', fontWeight: 700, marginBottom: '16px', display: 'flex', alignItems: 'center', gap: '10px' }}>
-                📅 Reservations
-                <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)' }}>({reservations.length} upcoming)</span>
-              </h2>
-              <ReservationsPanel reservations={reservations} rooms={rooms} token={adminToken}
-                onActionSuccess={msg => { showToast(msg); fetchData(true); }} />
-            </div>
+            <ReservationModule 
+              token={adminToken}
+              user={adminUser}
+              fetchStatus={() => fetchData(true)}
+            />
           </div>
         )}
 

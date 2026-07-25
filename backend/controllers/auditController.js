@@ -1,6 +1,7 @@
 import pool from '../db.js';
 import fs from 'fs';
 import path from 'path';
+import { RoomStatusService } from '../services/roomStatusService.js';
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -21,6 +22,30 @@ function formatPmsDate(d) {
   return `${dd}-${mon}-${yyyy}`;
 }
 
+/** Convert any date format ("25-Jul-2026", "2026-07-25", ISO string) → "YYYY-MM-DD" */
+function parseToComparableDate(dateStr) {
+  if (!dateStr) return null;
+  const str = String(dateStr).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
+    return str;
+  }
+  const months = { jan:'01', feb:'02', mar:'03', apr:'04', may:'05', jun:'06', jul:'07', aug:'08', sep:'09', oct:'10', nov:'11', dec:'12' };
+  const parts = str.split('-');
+  if (parts.length === 3) {
+    const day = parts[0].padStart(2, '0');
+    const mon = months[parts[1].toLowerCase()];
+    const yr = parts[2];
+    if (mon && yr) {
+      return `${yr}-${mon}-${day}`;
+    }
+  }
+  const parsed = new Date(str);
+  if (!isNaN(parsed.getTime())) {
+    return parsed.toISOString().split('T')[0];
+  }
+  return str;
+}
+
 /** Add one calendar day to a date */
 function addDay(d) {
   const next = new Date(d);
@@ -33,102 +58,7 @@ function addDay(d) {
  * For each missed day, posts Rollover Tariff + Tax charges for occupied rooms
  * and resets today_checkins / today_checkouts counters — mirroring runDayEnd.
  */
-async function autoAdvanceToToday(connection) {
-  const [settings] = await connection.query('SELECT * FROM system_settings FOR UPDATE');
-  const settingsMap = {};
-  settings.forEach(s => { settingsMap[s.key_name] = s.value_val; });
 
-  const storedDate = parsePmsDate(settingsMap['system_date']);
-  if (!storedDate) return;
-
-  // Use machine local date (Node.js on Windows IST returns local date correctly).
-  // Do NOT add a UTC+5:30 offset — that was causing the date to jump 2 days ahead.
-  const now        = new Date();
-  const todayLocal = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
-
-  // Safety cap: NEVER advance beyond today. storedDate is midnight UTC.
-  if (storedDate >= todayLocal) return; // already current — nothing to do
-
-  let current = storedDate;
-  let iterations = 0;
-
-  while (current < todayLocal && iterations < 30) {
-    iterations++;
-    const next    = addDay(current);
-    const nextStr = formatPmsDate(next);
-
-    // Get all currently occupied rooms
-    const [occupiedRooms] = await connection.query(`
-      SELECT r.number, r.id, rt.base_rate as rate
-      FROM rooms r
-      JOIN room_types rt ON r.room_type_id = rt.id
-      WHERE r.status = 'occupied'
-    `);
-
-    for (const room of occupiedRooms) {
-      const tariff = room.rate;
-      const taxes  = Math.round(tariff * 0.05);
-
-      const [bookings] = await connection.query(
-        "SELECT id FROM bookings WHERE room_id = ? AND booking_status = 'Checked In'",
-        [room.id]
-      );
-      const bookingId = bookings[0]?.id || null;
-
-      // Only post if we haven't already posted for this date (avoid duplicates on repeated calls)
-      const [existingTariff] = await connection.query(
-        "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Room Tariff%Rollover%'",
-        [room.number, nextStr, bookingId]
-      );
-      
-      const [existingTax] = await connection.query(
-        "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Taxes & GST%'",
-        [room.number, nextStr, bookingId]
-      );
-
-      if (existingTariff.length === 0) {
-        await connection.query(
-          'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-          [room.number, 'Room Tariff Charge (Rollover)', tariff, nextStr, bookingId]
-        );
-        console.log(`[AutoRollover] Created Room Tariff for Room ${room.number} on ${nextStr}`);
-      } else {
-        console.log(`[AutoRollover] Skipped duplicate Room Tariff for Room ${room.number} on ${nextStr}`);
-      }
-      
-      if (existingTax.length === 0) {
-        await connection.query(
-          'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-          [room.number, 'Taxes & GST (5%)', taxes, nextStr, bookingId]
-        );
-        console.log(`[AutoRollover] Created Taxes for Room ${room.number} on ${nextStr}`);
-      } else {
-        console.log(`[AutoRollover] Skipped duplicate Taxes for Room ${room.number} on ${nextStr}`);
-      }
-    }
-
-    await connection.query(
-      "UPDATE system_settings SET value_val = ? WHERE key_name = 'system_date'",
-      [nextStr]
-    );
-    await connection.query(
-      "UPDATE system_settings SET value_val = ? WHERE key_name = 'continued_rooms'",
-      [String(occupiedRooms.length)]
-    );
-    // Reset daily counters for the new date
-    await connection.query("UPDATE system_settings SET value_val = '0' WHERE key_name = 'today_checkins'");
-    await connection.query("UPDATE system_settings SET value_val = '0' WHERE key_name = 'today_checkouts'");
-
-    // Audit log entry for auto rollover
-    await connection.query(
-      "INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (NULL, 'AUTO_DAY_ROLLOVER', ?, ?)",
-      [`System auto-advanced business date to ${nextStr}`, nextStr]
-    );
-
-    current = next;
-    console.log(`[AutoRollover] Business date advanced to ${nextStr}`);
-  }
-}
 
 export const getStatus = async (req, res) => {
   let connection;
@@ -136,8 +66,6 @@ export const getStatus = async (req, res) => {
     connection = await pool.getConnection();
     await connection.beginTransaction();
 
-    // ── Auto-advance date to today if behind ──────────────────────────────────
-    await autoAdvanceToToday(connection);
     await connection.commit();
     connection.release();
     connection = null;
@@ -148,71 +76,23 @@ export const getStatus = async (req, res) => {
       settingsMap[s.key_name] = s.value_val;
     });
 
-    const systemDate = settingsMap['system_date'] || formatPmsDate(new Date());
+    const systemDate = settingsMap['system_date'];
+    if (!systemDate) {
+      console.error('[CRITICAL] system_settings.system_date is missing from database.');
+      return res.status(500).json({ error: 'System configuration error: Business Date is missing. Please contact administrator.' });
+    }
     const todayCheckins = parseInt(settingsMap['today_checkins'] || '0', 10);
     const todayCheckouts = parseInt(settingsMap['today_checkouts'] || '0', 10);
     const continuedRooms = parseInt(settingsMap['continued_rooms'] || '0', 10);
 
-    const [rooms] = await pool.query(`
-      SELECT r.id, r.number, r.status, r.housekeeping_status, rt.code as type, rt.base_rate as rate
-      FROM rooms r
-      JOIN room_types rt ON r.room_type_id = rt.id
-    `);
+    // Compute all dynamic room statuses via RoomStatusService
+    const computedRooms = await RoomStatusService.getRoomStatuses(pool, systemDate);
 
-    // Query active bookings (Checked In or Reserved)
-    const [activeBookings] = await pool.query(`
-      SELECT 
-        b.id as booking_id,
-        b.booking_number,
-        b.room_id,
-        b.check_in_date as checkInDate,
-        b.expected_check_out_date as expectedCheckOutDate,
-        b.adults,
-        b.children,
-        b.advance_amount as deposit,
-        b.booking_status,
-        g.full_name as guestName,
-        g.phone,
-        g.address,
-        g.gst_no,
-        g.pincode,
-        g.country,
-        g.arrival_from,
-        g.departure_to,
-        g.user_id
-      FROM bookings b
-      JOIN guests g ON b.guest_id = g.id
-      WHERE b.booking_status IN ('Checked In', 'Reserved')
-    `);
-
-    // Query upcoming future reservations (Reserved only, check_in_date is in future relative to system date)
-    // We do a simple string comparison since dates are stored in YYYY-MM-DD ISO format from the guest portal
-    const [futureReservations] = await pool.query(`
-      SELECT 
-        b.id as booking_id,
-        b.booking_number,
-        b.room_id,
-        b.check_in_date as checkInDate,
-        b.expected_check_out_date as expectedCheckOutDate,
-        b.adults,
-        b.total_amount as totalAmount,
-        b.advance_amount as deposit,
-        b.booking_status,
-        g.full_name as guestName,
-        g.phone,
-        r.number as roomNumber,
-        rt.code as roomType
-      FROM bookings b
-      JOIN guests g ON b.guest_id = g.id
-      JOIN rooms r ON b.room_id = r.id
-      JOIN room_types rt ON r.room_type_id = rt.id
-      WHERE b.booking_status = 'Reserved'
-      ORDER BY b.check_in_date ASC
-    `);
-
-    // Fetch ledger items only for active bookings (Checked In or Reserved)
-    // This prevents old checked-out booking charges from polluting the current folio
-    const activeBookingIds = activeBookings.map(b => b.booking_id).filter(Boolean);
+    // Group ledgers by active booking_id to prevent old checked-out charges from polluting current folio
+    const activeBookingIds = computedRooms
+      .map(r => r.booking_id)
+      .filter(Boolean);
+      
     let ledgerByBookingId = {};
     if (activeBookingIds.length > 0) {
       const placeholders = activeBookingIds.map(() => '?').join(',');
@@ -234,36 +114,84 @@ export const getStatus = async (req, res) => {
       });
     }
 
-    const processedRooms = rooms.map(r => {
-      const activeBooking = activeBookings.find(b => b.room_id === r.id);
-      const bookingId = activeBooking ? activeBooking.booking_id : null;
-      return {
-        id: r.id,
-        number: r.number,
-        type: r.type,
-        status: r.status,
-        housekeeping_status: r.housekeeping_status,
-        rate: r.rate,
-        guestName: activeBooking ? activeBooking.guestName.toUpperCase() : '',
-        phone: activeBooking ? activeBooking.phone : '',
-        pax: activeBooking ? (activeBooking.adults + activeBooking.children) : 0,
-        deposit: activeBooking ? activeBooking.deposit : 0,
-        checkInDate: activeBooking ? activeBooking.checkInDate : '',
-        expectedCheckOutDate: activeBooking ? (activeBooking.expectedCheckOutDate || '') : '',
-        address: activeBooking ? (activeBooking.address || '') : '',
-        gst_no: activeBooking ? (activeBooking.gst_no || '') : '',
-        pincode: activeBooking ? (activeBooking.pincode || '') : '',
-        country: activeBooking ? (activeBooking.country || '') : '',
-        arrival_from: activeBooking ? (activeBooking.arrival_from || '') : '',
-        departure_to: activeBooking ? (activeBooking.departure_to || '') : '',
-        user_id: activeBooking ? activeBooking.user_id : null,
-        booking_id: bookingId,
-        booking_number: activeBooking ? activeBooking.booking_number : null,
-        ledger: (bookingId && ledgerByBookingId[bookingId]) ? ledgerByBookingId[bookingId] : []
-      };
-    });
+    const processedRooms = computedRooms.map(r => ({
+      id: r.id,
+      number: r.number,
+      type: r.type,
+      status: r.status,
+      housekeeping_status: r.housekeeping_status,
+      rate: r.rate,
+      guestName: r.guestName,
+      phone: r.phone,
+      pax: r.pax,
+      deposit: r.deposit,
+      checkInDate: r.checkInDate,
+      expectedCheckOutDate: r.expectedCheckOutDate,
+      address: r.address,
+      gst_no: r.gst_no,
+      pincode: r.pincode,
+      country: r.country,
+      arrival_from: r.arrival_from,
+      departure_to: r.departure_to,
+      user_id: r.user_id,
+      booking_id: r.booking_id,
+      reservation_id: r.reservation_id,
+      booking_number: r.booking_number,
+      ledger: (r.booking_id && ledgerByBookingId[r.booking_id]) ? ledgerByBookingId[r.booking_id] : []
+    }));
 
     const [cashLog] = await pool.query('SELECT * FROM cash_logs WHERE business_date = ?', [systemDate]);
+
+    // Query upcoming future reservations for the side panel component
+    const [futureBookings] = await pool.query(`
+      SELECT 
+        b.id as booking_id,
+        b.booking_number,
+        b.room_id,
+        b.check_in_date as checkInDate,
+        b.expected_check_out_date as expectedCheckOutDate,
+        b.adults,
+        b.total_amount as totalAmount,
+        b.advance_amount as deposit,
+        b.booking_status as status,
+        g.full_name as guestName,
+        g.phone,
+        r.number as roomNumber,
+        rt.code as roomType
+      FROM bookings b
+      JOIN guests g ON b.guest_id = g.id
+      JOIN rooms r ON b.room_id = r.id
+      JOIN room_types rt ON r.room_type_id = rt.id
+      WHERE b.booking_status = 'Reserved'
+      ORDER BY b.check_in_date ASC
+    `);
+
+    const [futureResTable] = await pool.query(`
+      SELECT 
+        res.id as reservation_id,
+        res.reservation_number as ref_code,
+        res.reservation_number as booking_number,
+        res.room_id,
+        res.room_number,
+        res.room_type as roomType,
+        res.guest_name as guest_name,
+        res.guest_name as guestName,
+        res.phone,
+        res.arrival_date as check_in_date,
+        res.arrival_date as checkInDate,
+        res.departure_date as check_out_date,
+        res.departure_date as expectedCheckOutDate,
+        res.adults as pax,
+        res.adults,
+        res.advance_payment as total_amount,
+        res.advance_payment as deposit,
+        res.status
+      FROM reservations res
+      WHERE res.status IN ('Reserved', 'Confirmed')
+      ORDER BY res.arrival_date ASC
+    `);
+
+    const upcomingReservations = [...futureBookings, ...futureResTable];
 
     res.json({
       systemDate,
@@ -272,7 +200,7 @@ export const getStatus = async (req, res) => {
       continuedRooms,
       rooms: processedRooms,
       cashLog,
-      upcomingReservations: futureReservations
+      upcomingReservations: upcomingReservations || []
     });
   } catch (error) {
     if (connection) {
@@ -347,10 +275,14 @@ export const runDayEnd = async (req, res) => {
       }
     }
 
-    await connection.query(
-      "UPDATE system_settings SET value_val = ? WHERE key_name = 'system_date'",
-      [nextDate]
-    );
+    const isDevMode = process.env.PMS_MODE === 'development';
+
+    if (!isDevMode) {
+      await connection.query(
+        "UPDATE system_settings SET value_val = ? WHERE key_name = 'system_date'",
+        [nextDate]
+      );
+    }
 
     await connection.query(
       "UPDATE system_settings SET value_val = ? WHERE key_name = 'continued_rooms'",
@@ -363,16 +295,25 @@ export const runDayEnd = async (req, res) => {
     await connection.query(
       "UPDATE system_settings SET value_val = '0' WHERE key_name = 'today_checkouts'"
     );
+    
     // Insert Audit Log entry
     const auditorId = req.user?.id || null;
+    const auditDetails = isDevMode 
+      ? `Night audit run. Business date advancement skipped (Development Mode).`
+      : `Night audit run. Business date rolled to ${nextDate}.`;
+
     await connection.query(
       `INSERT INTO audit_logs (user_id, action, details, business_date)
        VALUES (?, 'DAY_END', ?, ?)`,
-      [auditorId, `Night audit run. Business date rolled to ${nextDate}.`, nextDate]
+      [auditorId, auditDetails, nextDate]
     );
 
     await connection.commit();
-    res.json({ message: `Night audit complete. Business date rolled to ${nextDate}` });
+    res.json({ 
+      message: isDevMode 
+        ? 'Night audit complete. Business date advancement skipped (Development Mode).' 
+        : `Night audit complete. Business date rolled to ${nextDate}` 
+    });
   } catch (error) {
     if (connection) {
       try {
@@ -1105,3 +1046,5 @@ export const searchGuestsStaff = async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 };
+
+

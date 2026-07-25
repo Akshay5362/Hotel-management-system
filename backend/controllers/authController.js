@@ -289,3 +289,25 @@ export const requireGuest = (req, res, next) => {
   }
   next();
 };
+
+export const hasPermission = async (req, permissionName) => {
+  if (!req.user) return false;
+  
+  let roleName;
+  if (req.user.type === 'staff') {
+    roleName = req.user.role.toLowerCase();
+  } else {
+    roleName = req.user.role.toLowerCase();
+  }
+  
+  const pool = require('../db.js').default;
+  const [rows] = await pool.query(`
+    SELECT p.id 
+    FROM permissions p
+    JOIN role_permissions rp ON p.id = rp.permission_id
+    JOIN roles r ON rp.role_id = r.id
+    WHERE LOWER(r.name) = ? AND p.name = ?
+  `, [roleName, permissionName]);
+  
+  return rows.length > 0;
+};

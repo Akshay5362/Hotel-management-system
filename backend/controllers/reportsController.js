@@ -1,4 +1,5 @@
 import pool from '../db.js';
+import { RoomStatusService } from '../services/roomStatusService.js';
 
 // Helper to parse 'DD-MMM-YYYY' to a comparable Date object
 const parseBusinessDate = (dateStr) => {
@@ -42,7 +43,13 @@ export const getDashboardOverview = async (req, res) => {
     // Fetch relevant data
     const [payments] = await pool.query('SELECT * FROM payments');
     const [bookings] = await pool.query('SELECT * FROM bookings');
-    const [rooms] = await pool.query('SELECT * FROM rooms');
+    const [settings] = await pool.query("SELECT value_val FROM system_settings WHERE key_name = 'system_date'");
+    const businessDate = settings[0]?.value_val;
+    if (!businessDate) {
+      console.error('[CRITICAL] system_settings.system_date is missing from database.');
+      return res.status(500).json({ error: 'System configuration error: Business Date is missing. Please contact administrator.' });
+    }
+    const rooms = await RoomStatusService.getRoomStatuses(pool, businessDate);
     const [roomTypes] = await pool.query('SELECT * FROM room_types');
 
     const filteredPayments = filterByDateRange(payments, startDate, endDate, 'business_date');
@@ -123,7 +130,13 @@ export const getOccupancyReport = async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     
-    const [rooms] = await pool.query('SELECT * FROM rooms');
+    const [settings] = await pool.query("SELECT value_val FROM system_settings WHERE key_name = 'system_date'");
+    const businessDate = settings[0]?.value_val;
+    if (!businessDate) {
+      console.error('[CRITICAL] system_settings.system_date is missing from database.');
+      return res.status(500).json({ error: 'System configuration error: Business Date is missing. Please contact administrator.' });
+    }
+    const rooms = await RoomStatusService.getRoomStatuses(pool, businessDate);
     const [roomTypes] = await pool.query('SELECT * FROM room_types');
     const [bookings] = await pool.query('SELECT * FROM bookings');
 
@@ -300,7 +313,13 @@ export const getRevPARReport = async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     const [bookings] = await pool.query('SELECT * FROM bookings');
-    const [rooms] = await pool.query('SELECT * FROM rooms');
+    const [settings] = await pool.query("SELECT value_val FROM system_settings WHERE key_name = 'system_date'");
+    const businessDate = settings[0]?.value_val;
+    if (!businessDate) {
+      console.error('[CRITICAL] system_settings.system_date is missing from database.');
+      return res.status(500).json({ error: 'System configuration error: Business Date is missing. Please contact administrator.' });
+    }
+    const rooms = await RoomStatusService.getRoomStatuses(pool, businessDate);
     const totalRooms = rooms.length;
 
     const filteredBookings = filterByDateRange(bookings, startDate, endDate, 'created_at');
@@ -327,7 +346,13 @@ export const getRevPARReport = async (req, res) => {
 export const getRoomTypePerformance = async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
-    const [rooms] = await pool.query('SELECT * FROM rooms');
+    const [settings] = await pool.query("SELECT value_val FROM system_settings WHERE key_name = 'system_date'");
+    const businessDate = settings[0]?.value_val;
+    if (!businessDate) {
+      console.error('[CRITICAL] system_settings.system_date is missing from database.');
+      return res.status(500).json({ error: 'System configuration error: Business Date is missing. Please contact administrator.' });
+    }
+    const rooms = await RoomStatusService.getRoomStatuses(pool, businessDate);
     const [roomTypes] = await pool.query('SELECT * FROM room_types');
     
     const roomTypeStats = roomTypes.map(rt => {
@@ -372,4 +397,5 @@ export const getPaymentsReport = async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 };
+
 

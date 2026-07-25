@@ -15,6 +15,7 @@ import GuestRequestsModal from './components/GuestRequestsModal';
 import IdentityVerificationModal from './components/IdentityVerificationModal';
 import RefundCheckoutModal from './components/RefundCheckoutModal';
 import AnalyticsModal from './components/AnalyticsModal';
+import SettingsModal from './components/SettingsModal';
 import { AdminAuthProvider, AdminAuthContext } from './contexts/AdminAuthContext';
 import { GuestAuthProvider, GuestAuthContext } from './contexts/GuestAuthContext';
 import { AdminProtectedRoute, GuestProtectedRoute, RoleProtectedRoute } from './components/ProtectedRoutes';
@@ -161,6 +162,7 @@ function LandingPage({ onNavigate }) {
 
 import AdminHousekeeping from './components/AdminHousekeeping.jsx';
 import AdminGuests from './components/AdminGuests.jsx';
+import ReservationModule from './components/ReservationModule.jsx';
 
 function AppContent() {
   const [adminTab, setAdminTab] = useState('frontdesk');
@@ -419,7 +421,15 @@ function AppContent() {
     } else {
       setIsLoading(false);
     }
-  }, [adminToken, guestToken]);
+
+    const handleDateChange = () => {
+      fetchStatus();
+      if (adminToken) fetchRequestCount();
+    };
+
+    window.addEventListener('businessDateChanged', handleDateChange);
+    return () => window.removeEventListener('businessDateChanged', handleDateChange);
+  }, [adminToken, guestToken, fetchStatus, fetchRequestCount]);
 
   // Clock runner
   useEffect(() => {
@@ -1136,66 +1146,14 @@ function AppContent() {
           )}
           {adminTab === 'reservations' && (
             <div className="dashboard-body">
-              <div style={{ padding: '24px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '20px' }}>
-                  <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '10px' }}>
-                    📅 Upcoming Reservations
-                  </h2>
-                  <button className="btn-secondary" style={{ fontSize: '0.82rem', padding: '7px 14px' }} onClick={() => setAdminTab('frontdesk')}>
-                    ← Back to Front Office
-                  </button>
-                </div>
-                {upcomingReservations.length === 0 ? (
-                  <div style={{ textAlign: 'center', padding: '60px 20px', color: 'var(--text-muted)' }}>
-                    <div style={{ fontSize: '3rem', marginBottom: '16px' }}>📭</div>
-                    <p style={{ fontSize: '1rem', fontWeight: 600 }}>No upcoming reservations</p>
-                    <p style={{ fontSize: '0.85rem', marginTop: '6px' }}>Advance bookings from the Guest Portal will appear here.</p>
-                  </div>
-                ) : (
-                  <div style={{ overflowX: 'auto' }}>
-                    <table className="ledger-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
-                      <thead>
-                        <tr>
-                          <th style={{ textAlign: 'left', padding: '10px 14px' }}>Room #</th>
-                          <th style={{ textAlign: 'left', padding: '10px 14px' }}>Guest Name</th>
-                          <th style={{ textAlign: 'left', padding: '10px 14px' }}>Phone</th>
-                          <th style={{ textAlign: 'center', padding: '10px 14px' }}>Check-In</th>
-                          <th style={{ textAlign: 'center', padding: '10px 14px' }}>Check-Out</th>
-                          <th style={{ textAlign: 'center', padding: '10px 14px' }}>Pax</th>
-                          <th style={{ textAlign: 'right', padding: '10px 14px' }}>Amount (₹)</th>
-                          <th style={{ textAlign: 'center', padding: '10px 14px' }}>Ref Code</th>
-                          <th style={{ textAlign: 'center', padding: '10px 14px' }}>Status</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {upcomingReservations.map((res, i) => (
-                          <tr key={res.booking_id || i} style={{ cursor: 'default' }}>
-                            <td style={{ padding: '10px 14px', fontWeight: 700, color: 'var(--color-booked)' }}>{res.room_number}</td>
-                            <td style={{ padding: '10px 14px', fontWeight: 600 }}>{res.guest_name}</td>
-                            <td style={{ padding: '10px 14px', color: 'var(--text-muted)' }}>{res.phone || '—'}</td>
-                            <td style={{ padding: '10px 14px', textAlign: 'center' }}>{res.check_in_date}</td>
-                            <td style={{ padding: '10px 14px', textAlign: 'center' }}>{res.check_out_date}</td>
-                            <td style={{ padding: '10px 14px', textAlign: 'center' }}>{res.pax}</td>
-                            <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 600 }}>₹{(res.total_amount || 0).toLocaleString('en-IN')}</td>
-                            <td style={{ padding: '10px 14px', textAlign: 'center', fontFamily: 'monospace', fontSize: '0.8rem', color: 'var(--text-muted)' }}>{res.ref_code || res.booking_ref || '—'}</td>
-                            <td style={{ padding: '10px 14px', textAlign: 'center' }}>
-                              <span style={{
-                                background: res.status === 'confirmed' ? 'rgba(56,189,248,0.12)' : 'rgba(251,191,36,0.12)',
-                                color: res.status === 'confirmed' ? '#38bdf8' : '#fbbf24',
-                                border: `1px solid ${res.status === 'confirmed' ? 'rgba(56,189,248,0.3)' : 'rgba(251,191,36,0.3)'}`,
-                                borderRadius: '4px', padding: '2px 8px', fontSize: '0.75rem', fontWeight: 700,
-                                textTransform: 'uppercase'
-                              }}>
-                                {res.status || 'pending'}
-                              </span>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
+              <ReservationModule 
+                token={adminToken}
+                user={adminUser}
+                onNavigate={navigate}
+                showAlert={showAlert}
+                showConfirm={showConfirm}
+                fetchStatus={fetchStatus}
+              />
             </div>
           )}
           {(adminTab === 'frontdesk' || adminTab === 'rooms') && (
