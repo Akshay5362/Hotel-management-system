@@ -48,10 +48,10 @@ export default function MetricsBar({ stats, systemStatus }) {
 
       {/* Sync Status Banner */}
       <div className="sync-status">
-        <span className="sync-dot"></span>
-        <span>Online Sync Permission: <strong>Enabled</strong></span>
+        <span className="sync-dot" style={{ backgroundColor: systemStatus ? '#4ade80' : '#f87171' }}></span>
+        <span>Online Sync Permission: <strong>{systemStatus ? 'Enabled' : 'Disabled'}</strong></span>
         <span style={{ margin: '0 8px', color: 'var(--border-color)' }}>|</span>
-        <span>System: <strong>Offline Mode (Mock API)</strong></span>
+        <span>System: <strong>{systemStatus ? 'Online (Real API)' : 'Offline Mode (Backend Unreachable)'}</strong></span>
       </div>
     </div>
   );

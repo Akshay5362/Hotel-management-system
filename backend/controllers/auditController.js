@@ -2,12 +2,14 @@ import pool from '../db.js';
 import fs from 'fs';
 import path from 'path';
 import { RoomStatusService } from '../services/roomStatusService.js';
+import { BusinessDateService, BD_ERRORS } from '../services/businessDateService.js';
+import { AvailabilityService } from '../services/AvailabilityService.js';
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 /** Convert a stored date like "14-Jul-2026" → JS Date (midnight UTC) */
 function parsePmsDate(dateStr) {
-  const months = { Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11 };
+  const months = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
   const parts = (dateStr || '').split('-'); // ['14','Jul','2026']
   if (parts.length !== 3) return null;
   return new Date(Date.UTC(parseInt(parts[2]), months[parts[1]], parseInt(parts[0])));
@@ -15,9 +17,9 @@ function parsePmsDate(dateStr) {
 
 /** Format a JS Date → "16-Jul-2026" style */
 function formatPmsDate(d) {
-  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  const dd   = String(d.getUTCDate()).padStart(2, '0');
-  const mon  = months[d.getUTCMonth()];
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const mon = months[d.getUTCMonth()];
   const yyyy = d.getUTCFullYear();
   return `${dd}-${mon}-${yyyy}`;
 }
@@ -29,7 +31,7 @@ function parseToComparableDate(dateStr) {
   if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
     return str;
   }
-  const months = { jan:'01', feb:'02', mar:'03', apr:'04', may:'05', jun:'06', jul:'07', aug:'08', sep:'09', oct:'10', nov:'11', dec:'12' };
+  const months = { jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06', jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12' };
   const parts = str.split('-');
   if (parts.length === 3) {
     const day = parts[0].padStart(2, '0');
@@ -70,20 +72,16 @@ export const getStatus = async (req, res) => {
     connection.release();
     connection = null;
 
-    const [settings] = await pool.query('SELECT * FROM system_settings');
-    const settingsMap = {};
-    settings.forEach(s => {
-      settingsMap[s.key_name] = s.value_val;
-    });
+    const systemDate = await BusinessDateService.getBusinessDate(pool);
+    const [counterRows] = await pool.query(
+      "SELECT key_name, value_val FROM system_settings WHERE key_name IN ('today_checkins','today_checkouts','continued_rooms')"
+    );
+    const counterMap = {};
+    counterRows.forEach(r => { counterMap[r.key_name] = r.value_val; });
+    const todayCheckins  = parseInt(counterMap['today_checkins']  || '0', 10);
+    const todayCheckouts = parseInt(counterMap['today_checkouts'] || '0', 10);
+    const continuedRooms = parseInt(counterMap['continued_rooms'] || '0', 10);
 
-    const systemDate = settingsMap['system_date'];
-    if (!systemDate) {
-      console.error('[CRITICAL] system_settings.system_date is missing from database.');
-      return res.status(500).json({ error: 'System configuration error: Business Date is missing. Please contact administrator.' });
-    }
-    const todayCheckins = parseInt(settingsMap['today_checkins'] || '0', 10);
-    const todayCheckouts = parseInt(settingsMap['today_checkouts'] || '0', 10);
-    const continuedRooms = parseInt(settingsMap['continued_rooms'] || '0', 10);
 
     // Compute all dynamic room statuses via RoomStatusService
     const computedRooms = await RoomStatusService.getRoomStatuses(pool, systemDate);
@@ -92,7 +90,7 @@ export const getStatus = async (req, res) => {
     const activeBookingIds = computedRooms
       .map(r => r.booking_id)
       .filter(Boolean);
-      
+
     let ledgerByBookingId = {};
     if (activeBookingIds.length > 0) {
       const placeholders = activeBookingIds.map(() => '?').join(',');
@@ -204,7 +202,7 @@ export const getStatus = async (req, res) => {
     });
   } catch (error) {
     if (connection) {
-      try { await connection.rollback(); } catch (e) {}
+      try { await connection.rollback(); } catch (e) { }
       connection.release();
     }
     console.error('Error in getStatus controller:', error);
@@ -223,113 +221,216 @@ export const runDayEnd = async (req, res) => {
     connection = await pool.getConnection();
     await connection.beginTransaction();
 
-    // Lock system_settings to prevent concurrent auto-rollovers during manual day end
-    await connection.query('SELECT * FROM system_settings FOR UPDATE');
-
-    const [occupiedRooms] = await connection.query(`
-      SELECT r.*, rt.base_rate as rate
-      FROM rooms r
-      JOIN room_types rt ON r.room_type_id = rt.id
-      WHERE r.status = 'occupied'
-    `);
-
-    for (const room of occupiedRooms) {
-      const tariff = room.rate;
-      const taxes = Math.round(tariff * 0.05);
-
-      // Find active booking for the room
-      const [bookings] = await connection.query(
-        "SELECT id FROM bookings WHERE room_id = ? AND booking_status = 'Checked In'",
-        [room.id]
-      );
-      const bookingId = bookings[0]?.id || null;
-
-      const [existingTariff] = await connection.query(
-        "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Room Tariff%Rollover%'",
-        [room.number, nextDate, bookingId]
-      );
-      
-      const [existingTax] = await connection.query(
-        "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Taxes & GST%'",
-        [room.number, nextDate, bookingId]
-      );
-
-      if (existingTariff.length === 0) {
-        await connection.query(
-          'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-          [room.number, 'Room Tariff Charge (Rollover)', tariff, nextDate, bookingId]
-        );
-        console.log(`[ManualDayEnd] Created Room Tariff for Room ${room.number} on ${nextDate}`);
-      } else {
-        console.log(`[ManualDayEnd] Skipped duplicate Room Tariff for Room ${room.number} on ${nextDate}`);
-      }
-
-      if (existingTax.length === 0) {
-        await connection.query(
-          'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-          [room.number, 'Taxes & GST (5%)', taxes, nextDate, bookingId]
-        );
-        console.log(`[ManualDayEnd] Created Taxes for Room ${room.number} on ${nextDate}`);
-      } else {
-        console.log(`[ManualDayEnd] Skipped duplicate Taxes for Room ${room.number} on ${nextDate}`);
-      }
-    }
-
-    const isDevMode = process.env.PMS_MODE === 'development';
-
-    if (!isDevMode) {
-      await connection.query(
-        "UPDATE system_settings SET value_val = ? WHERE key_name = 'system_date'",
-        [nextDate]
-      );
-    }
-
-    await connection.query(
-      "UPDATE system_settings SET value_val = ? WHERE key_name = 'continued_rooms'",
-      [String(occupiedRooms.length)]
-    );
-
-    await connection.query(
-      "UPDATE system_settings SET value_val = '0' WHERE key_name = 'today_checkins'"
-    );
-    await connection.query(
-      "UPDATE system_settings SET value_val = '0' WHERE key_name = 'today_checkouts'"
-    );
-    
-    // Insert Audit Log entry
-    const auditorId = req.user?.id || null;
-    const auditDetails = isDevMode 
-      ? `Night audit run. Business date advancement skipped (Development Mode).`
-      : `Night audit run. Business date rolled to ${nextDate}.`;
-
-    await connection.query(
-      `INSERT INTO audit_logs (user_id, action, details, business_date)
-       VALUES (?, 'DAY_END', ?, ?)`,
-      [auditorId, auditDetails, nextDate]
-    );
+    await BusinessDateService.advanceBusinessDate(connection, nextDate, {
+      auditorId: req.user?.id || null,
+    });
 
     await connection.commit();
-    res.json({ 
-      message: isDevMode 
-        ? 'Night audit complete. Business date advancement skipped (Development Mode).' 
-        : `Night audit complete. Business date rolled to ${nextDate}` 
-    });
+    const confirmedDate = await BusinessDateService.getBusinessDate(pool);
+    res.json({ message: `Night audit complete. Business date rolled to ${confirmedDate}` });
   } catch (error) {
     if (connection) {
-      try {
-        await connection.rollback();
-      } catch (rollbackError) {
-        console.error('Rollback failed:', rollbackError);
-      }
+      try { await connection.rollback(); } catch (e) { }
+    }
+    if (error.name === 'BusinessDateError') {
+      console.warn(`[DayEnd] Rejected: [${error.code}] ${error.message}`);
+      return res.status(error.httpStatus).json({ error: error.message, code: error.code });
     }
     console.error('Error in runDayEnd controller:', error);
     res.status(500).json({ error: 'Internal Server Error' });
   } finally {
-    if (connection) {
-      connection.release();
-    }
+    if (connection) connection.release();
   }
 };
+
+// ─── UNDO DAY END ─────────────────────────────────────────────────────────────
+/**
+ * POST /api/dayend/undo
+ * Super Admin only. Reverses the most recent committed Day End iff no
+ * operational data was created after that Day End.
+ *
+ * Checks (all must be zero to allow undo):
+ *   • New bookings  (bookings.created_at  > dayend.created_at)
+ *   • Check-outs    (bookings.updated_at  > dayend.created_at AND status=Checked Out)
+ *   • Payments      (payments.created_at  > dayend.created_at)
+ *   • Invoices      (invoices.created_at  > dayend.created_at)
+ *   • Ledger items  (ledger_items.created_at > dayend.created_at, excl. rollover lines)
+ *   • Reservations  (reservations.created_at > dayend.created_at)
+ *   • Cash logs     (cash_logs.created_at > dayend.created_at)   [if created_at exists]
+ *   • Housekeeping  (room_status_history.created_at > dayend.created_at)
+ *
+ * On success:
+ *   1. Restores system_settings.system_date to previous date.
+ *   2. Deletes rollover ledger_items created by that Day End.
+ *   3. Marks the DAY_END audit log row as DAY_END_UNDONE.
+ *   4. Inserts UNDO_DAY_END audit log entry.
+ *   5. Commits.
+ */
+export const undoDayEnd = async (req, res) => {
+  const adminId  = req.user?.id  || null;
+  const username = req.user?.username || null;
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    // ── Lock system_settings to block concurrent Day End calls ──────────────
+    await connection.query('SELECT * FROM system_settings FOR UPDATE');
+
+    const currentBusinessDate = await BusinessDateService.getBusinessDate(connection);
+
+    // ── Find the most recent committed Day End ───────────────────────────────
+    const [dayEndRows] = await connection.query(
+      "SELECT id, business_date, previous_business_date, details, created_at FROM audit_logs WHERE action = 'DAY_END' ORDER BY created_at DESC LIMIT 1"
+    );
+
+    if (dayEndRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({
+        error: 'No Day End has been executed yet. Nothing to undo.',
+        code: 'NO_DAY_END_FOUND',
+      });
+    }
+
+    const lastDayEnd = dayEndRows[0];
+    const dayEndId        = lastDayEnd.id;
+    const dayEndAt        = new Date(lastDayEnd.created_at); // JS Date for comparisons
+    const rolledToDate    = BusinessDateService.parseDate(lastDayEnd.business_date);
+
+    // Verify the current Business Date matches the rolled-to date.
+    // If not, either the date moved forward again (another Day End ran) or
+    // a manual override happened — undo is unsafe.
+    if (rolledToDate !== currentBusinessDate) {
+      await connection.rollback();
+      return res.status(409).json({
+        error: `Cannot undo: current Business Date (${currentBusinessDate}) does not match the last Day End target (${rolledToDate}). Another Day End or manual date change may have occurred.`,
+        code: 'BUSINESS_DATE_MISMATCH',
+      });
+    }
+
+    // ── Extract previous business date from audit log details ────────────────
+    // Details format: "Night audit run. Business date rolled from YYYY-MM-DD to YYYY-MM-DD. ..."
+    const detailMatch = lastDayEnd.details.match(/rolled from (\d{4}-\d{2}-\d{2}) to (\d{4}-\d{2}-\d{2})/);
+    if (!detailMatch) {
+      await connection.rollback();
+      return res.status(500).json({
+        error: 'Cannot undo: audit log details do not contain the previous Business Date. The log may be corrupted.',
+        code: 'CORRUPT_AUDIT_LOG',
+      });
+    }
+    const previousDate = detailMatch[1];
+
+    // ── Operational data guard ───────────────────────────────────────────────
+    // All checks return { count, description } pairs. Any non-zero count blocks undo.
+    const dataChecks = [
+      {
+        label: 'new check-ins',
+        query: 'SELECT COUNT(*) as cnt FROM bookings WHERE created_at > ? AND booking_status != ?',
+        params: [dayEndAt, 'Cancelled'],
+      },
+      {
+        label: 'new check-outs',
+        query: "SELECT COUNT(*) as cnt FROM bookings WHERE updated_at > ? AND booking_status = 'Checked Out'",
+        params: [dayEndAt],
+      },
+      {
+        label: 'new payments',
+        query: 'SELECT COUNT(*) as cnt FROM payments WHERE created_at > ?',
+        params: [dayEndAt],
+      },
+      {
+        label: 'new invoices',
+        query: 'SELECT COUNT(*) as cnt FROM invoices WHERE created_at > ?',
+        params: [dayEndAt],
+      },
+      {
+        label: 'new ledger entries (non-rollover)',
+        query: "SELECT COUNT(*) as cnt FROM ledger_items WHERE created_at > ? AND `desc` NOT LIKE 'Room Tariff%Rollover%' AND `desc` NOT LIKE 'Taxes & GST%'",
+        params: [dayEndAt],
+      },
+      {
+        label: 'new reservations',
+        query: 'SELECT COUNT(*) as cnt FROM reservations WHERE created_at > ?',
+        params: [dayEndAt],
+      },
+      {
+        label: 'housekeeping updates',
+        query: 'SELECT COUNT(*) as cnt FROM room_status_history WHERE created_at > ?',
+        params: [dayEndAt],
+      },
+    ];
+
+    // Conditionally check cash_logs only if it has a created_at column
+    const [cashCols] = await connection.query("SHOW COLUMNS FROM cash_logs LIKE 'created_at'");
+    if (cashCols.length > 0) {
+      dataChecks.push({
+        label: 'new cash transactions',
+        query: 'SELECT COUNT(*) as cnt FROM cash_logs WHERE created_at > ?',
+        params: [dayEndAt],
+      });
+    }
+
+    const blockers = [];
+    for (const check of dataChecks) {
+      const [[{ cnt }]] = await connection.query(check.query, check.params);
+      if (cnt > 0) blockers.push(`${cnt} ${check.label}`);
+    }
+
+    if (blockers.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({
+        error: `Undo rejected: operational data exists after the last Day End. Remove or reverse these records first.`,
+        code: 'POST_DAY_END_DATA_EXISTS',
+        blockers,
+      });
+    }
+
+    // ── Reverse rollover ledger entries created by this Day End ──────────────
+    // These are ledger_items with business_date = rolledToDate AND a rollover desc.
+    const [delResult] = await connection.query(
+      "DELETE FROM ledger_items WHERE business_date = ? AND (`desc` LIKE 'Room Tariff%Rollover%' OR `desc` LIKE 'Taxes & GST%')",
+      [rolledToDate]
+    );
+    console.log(`[UndoDayEnd] Deleted ${delResult.affectedRows} rollover ledger items for ${rolledToDate}.`);
+
+    // ── Restore Business Date to previous via BusinessDateService ────────────
+    console.log(`[UndoDayEnd] Restoring Business Date: ${rolledToDate} → ${previousDate}`);
+    await BusinessDateService.setBusinessDate(connection, previousDate, { allowBackward: true });
+
+    // ── Mark the DAY_END audit log as undone ─────────────────────────────────
+    await connection.query(
+      "UPDATE audit_logs SET action = 'DAY_END_UNDONE' WHERE id = ?",
+      [dayEndId]
+    );
+
+    // ── Insert UNDO_DAY_END audit log ────────────────────────────────────────
+    const undoDetail = `Day End #${dayEndId} reversed by ${username || 'admin'}. Business Date restored from ${rolledToDate} to ${previousDate}.`;
+    await connection.query(
+      "INSERT INTO audit_logs (user_id, action, details, business_date, previous_business_date, new_business_date) VALUES (?, 'UNDO_DAY_END', ?, ?, ?, ?)",
+      [adminId, undoDetail, previousDate, rolledToDate, previousDate]
+    );
+
+    await connection.commit();
+
+    const restoredDate = await BusinessDateService.getBusinessDate(pool);
+    console.log(`[UndoDayEnd] Complete. Business Date is now ${restoredDate}.`);
+
+    res.json({
+      message: `Day End successfully reversed. Business Date restored to ${restoredDate}.`,
+      previousDate: rolledToDate,
+      restoredDate,
+      rolledBackLedgerItems: delResult.affectedRows,
+    });
+  } catch (error) {
+    if (connection) { try { await connection.rollback(); } catch (e) { } }
+    console.error('[UndoDayEnd] Error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
 /** Admin endpoint — get all pending guest requests with room & guest details */
 export const getGuestRequests = async (req, res) => {
   try {
@@ -498,7 +599,7 @@ export const resolveGuestRequest = async (req, res) => {
     res.json({ message: 'Request resolved successfully' });
   } catch (error) {
     if (connection) {
-      try { await connection.rollback(); } catch (e) {}
+      try { await connection.rollback(); } catch (e) { }
     }
     console.error('resolveGuestRequest error:', error);
     res.status(500).json({ error: 'Internal Server Error' });
@@ -510,7 +611,7 @@ export const resolveGuestRequest = async (req, res) => {
 export const resolveExtensionRequest = async (req, res) => {
   const { id } = req.params;
   const { action } = req.body; // 'approve' or 'reject'
-  
+
   if (!id) return res.status(400).json({ error: 'Request ID is required' });
   if (!['approve', 'reject'].includes(action)) {
     return res.status(400).json({ error: 'Invalid action. Must be approve or reject' });
@@ -549,14 +650,26 @@ export const resolveExtensionRequest = async (req, res) => {
 
     if (action === 'approve') {
       console.log(`[ExtensionResolve] Admin ${adminId} called approve API for Request ID ${realId}`);
-      
+
+      // Verify availability for extension period using AvailabilityService
+      const availResult = await AvailabilityService.checkRoomAvailability(connection, {
+        roomId: extReq.room_id,
+        arrivalDate: extReq.current_checkout_date || booking.expected_check_out_date,
+        departureDate: extReq.requested_checkout_date,
+        forUpdate: true
+      });
+      if (!availResult.available) {
+        await connection.rollback();
+        return res.status(400).json({ error: `Cannot approve extension: ${availResult.reason}` });
+      }
+
       // Update Booking
       await connection.query(
         "UPDATE bookings SET expected_check_out_date = ? WHERE id = ?",
         [extReq.requested_checkout_date, booking.id]
       );
       console.log(`[ExtensionResolve] Booking ${booking.id} updated checkout date to ${extReq.requested_checkout_date}`);
-      
+
       // Post Ledger Entries immediately for the new extension period
       const [roomRows] = await connection.query(`
         SELECT r.number, rt.base_rate FROM rooms r
@@ -565,19 +678,19 @@ export const resolveExtensionRequest = async (req, res) => {
       `, [extReq.room_id]);
       const room = roomRows[0];
       const tariff = room.base_rate;
-      const taxes = Math.round(tariff * 0.05);
+      // GST included in room rate — no separate tax line
 
       let currentDate = new Date(extReq.current_checkout_date);
       let endDate = new Date(extReq.requested_checkout_date);
-      currentDate.setHours(0,0,0,0);
-      endDate.setHours(0,0,0,0);
+      currentDate.setHours(0, 0, 0, 0);
+      endDate.setHours(0, 0, 0, 0);
       let additionalCharges = 0;
-      
+
       console.log(`[ExtensionResolve] Ledger posting started. Dates: ${currentDate.toISOString()} to ${endDate.toISOString()}`);
 
       while (currentDate < endDate) {
         const bizDateStr = currentDate.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
-        
+
         // Post Room Tariff
         const [existingTariff] = await connection.query(
           "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Room Tariff%Rollover%'",
@@ -586,7 +699,7 @@ export const resolveExtensionRequest = async (req, res) => {
         if (existingTariff.length === 0) {
           await connection.query(
             'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-            [room.number, 'Room Tariff Charge (Rollover)', tariff, bizDateStr, booking.id]
+            [room.number, 'Room Tariff (Rollover, Incl. GST)', tariff, bizDateStr, booking.id]
           );
           additionalCharges += tariff;
           console.log(`[ExtensionResolve] Room tariff ₹${tariff} inserted for ${bizDateStr}`);
@@ -594,25 +707,9 @@ export const resolveExtensionRequest = async (req, res) => {
           console.log(`[ExtensionResolve] Room tariff skipped (already exists) for ${bizDateStr}`);
         }
 
-        // Post GST
-        const [existingTax] = await connection.query(
-          "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Taxes & GST%'",
-          [room.number, bizDateStr, booking.id]
-        );
-        if (existingTax.length === 0) {
-          await connection.query(
-            'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-            [room.number, 'Taxes & GST (5%)', taxes, bizDateStr, booking.id]
-          );
-          additionalCharges += taxes;
-          console.log(`[ExtensionResolve] GST ₹${taxes} inserted for ${bizDateStr}`);
-        } else {
-          console.log(`[ExtensionResolve] GST skipped (already exists) for ${bizDateStr}`);
-        }
-        
         currentDate.setDate(currentDate.getDate() + 1);
       }
-      
+
       console.log(`[ExtensionResolve] Balance recalculated successfully. Total added: ₹${additionalCharges}`);
 
       // Update Request status
@@ -628,7 +725,7 @@ export const resolveExtensionRequest = async (req, res) => {
           [guestUserId, '✅ Extension Approved', `Your request to extend your stay until ${extReq.requested_checkout_date} has been approved.`]
         );
       }
-      
+
       await connection.query(
         `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'EXTENSION_APPROVED', ?, CURDATE())`,
         [adminId, `Admin approved stay extension for Booking ${booking.id} to ${extReq.requested_checkout_date}`]
@@ -666,7 +763,7 @@ export const resolveExtensionRequest = async (req, res) => {
     res.json({ message: `Extension request ${action}d successfully` });
   } catch (error) {
     if (connection) {
-      try { await connection.rollback(); } catch (e) {}
+      try { await connection.rollback(); } catch (e) { }
     }
     console.error('resolveExtensionRequest error:', error);
     res.status(500).json({ error: 'Internal Server Error' });
@@ -768,7 +865,7 @@ export const verifyGuestDocument = async (req, res) => {
     await connection.commit();
     res.json({ success: true, message: `Document successfully marked as ${status}` });
   } catch (error) {
-    if (connection) { try { await connection.rollback(); } catch (e) {} }
+    if (connection) { try { await connection.rollback(); } catch (e) { } }
     console.error('Error verifying guest document:', error);
     res.status(500).json({ success: false, message: 'Internal Server Error' });
   } finally {
@@ -779,11 +876,11 @@ export const verifyGuestDocument = async (req, res) => {
 // ─── ADMIN: DELETE GUEST DOCUMENT ──────────────────────────────────────────────────
 export const deleteGuestDocument = async (req, res) => {
   const { guestId } = req.params;
-  
+
   let connection;
   try {
     connection = await pool.getConnection();
-    
+
     const [guestRows] = await connection.query(
       'SELECT id_document_path FROM guests WHERE id = ?',
       [guestId]
@@ -818,7 +915,7 @@ export const deleteGuestDocument = async (req, res) => {
       if (path.isAbsolute(docPath)) {
         filePath = docPath;
       } else {
-        const backendRoot = process.cwd(); 
+        const backendRoot = process.cwd();
         const relativePath = docPath.startsWith('/') ? docPath.slice(1) : docPath;
         filePath = path.join(backendRoot, relativePath);
       }
@@ -835,7 +932,7 @@ export const deleteGuestDocument = async (req, res) => {
     res.json({ success: true, message: 'Identity document deleted successfully' });
   } catch (error) {
     if (connection) {
-      try { await connection.rollback(); } catch (e) {}
+      try { await connection.rollback(); } catch (e) { }
     }
     console.error('deleteGuestDocument error:', error);
     res.status(500).json({ success: false, message: 'Internal Server Error' });
@@ -846,15 +943,15 @@ export const deleteGuestDocument = async (req, res) => {
 
 // ─── ADMIN: LIST ALL GUESTS (paginated, filterable) ──────────────────────────
 export const listGuests = async (req, res) => {
-  const page    = Math.max(1, parseInt(req.query.page  || '1',  10));
-  const limit   = Math.min(50, Math.max(1, parseInt(req.query.limit || '25', 10)));
-  const offset  = (page - 1) * limit;
-  const q       = (req.query.q || '').trim();
-  const filter  = req.query.filter || 'all'; // all | inhouse | checkedout | reserved | vip | blacklisted
+  const page = Math.max(1, parseInt(req.query.page || '1', 10));
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit || '25', 10)));
+  const offset = (page - 1) * limit;
+  const q = (req.query.q || '').trim();
+  const filter = req.query.filter || 'all'; // all | inhouse | checkedout | reserved | vip | blacklisted
 
   // Build WHERE clauses
   const whereClauses = [];
-  const params       = [];
+  const params = [];
 
   if (q.length >= 2) {
     const term = `%${q.toUpperCase()}%`;
@@ -974,7 +1071,7 @@ export const searchGuestsStaff = async (req, res) => {
   if (!q || q.trim().length < 2) {
     return res.status(400).json({ error: 'Search query must be at least 2 characters' });
   }
-  const term    = `%${q.trim().toUpperCase()}%`;
+  const term = `%${q.trim().toUpperCase()}%`;
   const termRaw = `%${q.trim()}%`;          // for booking_number (case-sensitive in some engines)
   try {
     // First try: match by booking number — find the guest via their booking

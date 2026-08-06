@@ -27,25 +27,6 @@ import { io } from 'socket.io-client';
 
 // Room inventory: 17 rooms — 3 Premium, 10 Executive, 4 Standard
 // Rooms 13, 15, 18 do NOT exist.
-const INITIAL_ROOMS = [
-  { id: '1',  number: '1',  type: 'PREMIUM',   status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '2',  number: '2',  type: 'EXECUTIVE',  status: 'occupied', guestName: 'RAJVEER SINGH', pax: 2, phone: '+91 9876543210', rate: 2000, deposit: 1000, checkInDate: '10-Jul-2026', user_id: null, ledger: [{ id: 1, desc: 'Room Tariff Charge', qty: 1, amount: 2000, business_date: '10-Jul-2026' }, { id: 2, desc: 'Taxes & GST (5%)', qty: 1, amount: 240, business_date: '10-Jul-2026' }] },
-  { id: '3',  number: '3',  type: 'EXECUTIVE',  status: 'occupied', guestName: 'KATARI AKHILESH', pax: 1, phone: '+91 9123456789', rate: 2000, deposit: 2000, checkInDate: '09-Jul-2026', user_id: 3, ledger: [{ id: 1, desc: 'Room Tariff Charge (2 Nights)', qty: 2, amount: 4000, business_date: '09-Jul-2026' }, { id: 2, desc: 'Taxes & GST (5%)', qty: 1, amount: 480, business_date: '09-Jul-2026' }] },
-  { id: '4',  number: '4',  type: 'EXECUTIVE',  status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '5',  number: '5',  type: 'PREMIUM',    status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '6',  number: '6',  type: 'EXECUTIVE',  status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '7',  number: '7',  type: 'EXECUTIVE',  status: 'occupied', guestName: 'RAJESH', pax: 1, phone: '+91 8888888888', rate: 2000, deposit: 500, checkInDate: '11-Jul-2026', user_id: null, ledger: [{ id: 1, desc: 'Room Tariff Charge', qty: 1, amount: 2000, business_date: '11-Jul-2026' }, { id: 2, desc: 'Taxes & GST (5%)', qty: 1, amount: 240, business_date: '11-Jul-2026' }] },
-  { id: '8',  number: '8',  type: 'EXECUTIVE',  status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '9',  number: '9',  type: 'EXECUTIVE',  status: 'occupied', guestName: 'MR. NAVEEN SONI', pax: 2, phone: '+91 7777777777', rate: 2000, deposit: 1500, checkInDate: '10-Jul-2026', user_id: null, ledger: [{ id: 1, desc: 'Room Tariff Charge', qty: 1, amount: 2000, business_date: '10-Jul-2026' }, { id: 2, desc: 'Taxes & GST (5%)', qty: 1, amount: 240, business_date: '10-Jul-2026' }] },
-  { id: '10', number: '10', type: 'EXECUTIVE',  status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '11', number: '11', type: 'EXECUTIVE',  status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '12', number: '12', type: 'EXECUTIVE',  status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2000, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '14', number: '14', type: 'PREMIUM',    status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 2500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '16', number: '16', type: 'STANDARD',   status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 1500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '17', number: '17', type: 'STANDARD',   status: 'occupied', guestName: 'RAGHUBEER', pax: 1, phone: '+91 9999999999', rate: 1500, deposit: 1000, checkInDate: '11-Jul-2026', user_id: null, ledger: [{ id: 1, desc: 'Room Tariff Charge', qty: 1, amount: 1500, business_date: '11-Jul-2026' }, { id: 2, desc: 'Taxes & GST (5%)', qty: 1, amount: 180, business_date: '11-Jul-2026' }] },
-  { id: '19', number: '19', type: 'STANDARD',   status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 1500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-  { id: '20', number: '20', type: 'STANDARD',   status: 'vacant',   guestName: '', pax: 0, phone: '', rate: 1500, deposit: 0, checkInDate: '', user_id: null, ledger: [] },
-];
 
 
 function LandingPage({ onNavigate }) {
@@ -280,25 +261,37 @@ function AppContent() {
   // Load status from backend
   const fetchStatus = useCallback(async () => {
     const currentToken = adminToken || guestToken;
+    const tokenSource = adminToken ? 'AdminAuthContext (localStorage adminToken)' : (guestToken ? 'GuestAuthContext (localStorage guestToken)' : 'None');
     if (!currentToken) {
       setIsLoading(false);
       return;
     }
+
+    const requestUrl = `http://localhost:5000/api/status?_t=${new Date().getTime()}`;
+    const authHeader = `Bearer ${currentToken}`;
 
     try {
       // Add a 5-second timeout so the app never hangs forever
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
 
-      const res = await fetch(`http://localhost:5000/api/status?_t=${new Date().getTime()}`, { 
+      console.log(`[API Request] URL: ${requestUrl} | Token Source: ${tokenSource} | Auth Header: ${authHeader.substring(0, 20)}...`);
+
+      const res = await fetch(requestUrl, { 
         signal: controller.signal,
         headers: {
-          'Authorization': `Bearer ${currentToken}`
+          'Authorization': authHeader
         }
       });
       clearTimeout(timeout);
 
+      console.log(`[API Response Status] ${res.status}`);
+
+      // Any HTTP response from server means backend is reachable and online
+      setIsBackendOnline(true);
+
       if (res.status === 401 || res.status === 403) {
+        console.warn(`[API Auth Warning] Server returned HTTP ${res.status} (Unauthorized/Forbidden).`);
         const isAdminPath = window.location.pathname.includes('admin');
         if (isAdminPath) {
           adminLogout();
@@ -310,8 +303,15 @@ function AppContent() {
         return;
       }
 
-      if (!res.ok) throw new Error('Failed to fetch dashboard data');
+      if (!res.ok) {
+        const errorText = await res.text().catch(() => '');
+        console.error(`[API Server Error] HTTP ${res.status} - ${errorText}`);
+        throw new Error(`Failed to fetch dashboard data: HTTP ${res.status}`);
+      }
+
       const data = await res.json();
+      console.log('[API Response Body]', data);
+
       setRooms(data.rooms);
       setSystemDate(data.systemDate);
       setTodayCheckins(data.todayCheckins);
@@ -319,15 +319,9 @@ function AppContent() {
       setContinuedRooms(data.continuedRooms);
       setCashLog(data.cashLog);
       setUpcomingReservations(data.upcomingReservations || []);
-      setIsBackendOnline(true);
     } catch (err) {
-      console.error('Backend unreachable, loading local demo data:', err);
+      console.error('[API Network Error] Backend unreachable / connection error:', err);
       setIsBackendOnline(false);
-      // Fallback: load from local initial data so app never stays stuck
-      setRooms(INITIAL_ROOMS);
-      setTodayCheckins(2);
-      setTodayCheckouts(4);
-      setContinuedRooms(3);
     } finally {
       // Always stop loading — no matter what happens
       setIsLoading(false);
@@ -590,6 +584,9 @@ function AppContent() {
         break;
       case 'requests':
         setActiveModal('requests');
+        break;
+      case 'settings':
+        setActiveModal('settings');
         break;
       case 'refresh':
         setFilter('all');
@@ -1172,6 +1169,7 @@ function AppContent() {
           {/* Bottom Metrics Information Bar */}
           <MetricsBar 
             stats={globalStats}
+            systemStatus={isBackendOnline}
           />
 
 
@@ -1265,6 +1263,11 @@ function AppContent() {
             onRefundComplete={processRefundCheckout}
             showAlert={showAlert}
             showConfirm={showConfirm}
+          />
+
+          <SettingsModal
+            isOpen={activeModal === 'settings'}
+            onClose={() => { setActiveModal(null); fetchStatus(); }}
           />
         </div>
         <RoomInspectorDrawer 

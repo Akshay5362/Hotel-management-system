@@ -1133,3 +1133,70 @@ input:focus, select:focus, textarea:focus {
   from { opacity: 0; transform: translateX(30px); }
   to   { opacity: 1; transform: translateX(0);    }
 }
+
+/* ── Business Date Management additions ─────────────────────────────────────── */
+
+/* Base button class (used by SettingsModal and others) */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 9px 18px;
+  border-radius: 8px;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  border: 1px solid transparent;
+  font-family: var(--font-body);
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none !important;
+}
+
+.btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
+
+/* .input-field — alias for native styled inputs where a CSS class is preferred */
+.input-field {
+  width: 100%;
+  padding: 9px 13px;
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--text-main);
+  font-size: 0.88rem;
+  font-family: var(--font-body);
+  transition: all 0.2s;
+}
+
+.input-field:focus {
+  outline: none;
+  border-color: var(--color-vacant);
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.15);
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.input-field:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Spinner animation for loading states */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+/* floatAnimation used in LandingPage */
+@keyframes floatAnimation {
+  0%, 100% { transform: translateY(0); }
+  50%       { transform: translateY(-10px); }
+}
+

@@ -1,13 +1,14 @@
 import pool from '../db.js';
+import { BusinessDateService } from '../services/businessDateService.js';
 import { processCheckIn } from '../services/checkInService.js';
 import { RoomStatusService, isDateOverlap, parseToComparableDate } from '../services/roomStatusService.js';
+import { AvailabilityService } from '../services/AvailabilityService.js';
 
 /**
  * Auto-generate Reservation Number: RES-YYYYMMDD-XXXX
  */
 async function generateReservationNumber(connection) {
-  const [settings] = await connection.query("SELECT value_val FROM system_settings WHERE key_name = 'system_date'");
-  const businessDate = settings[0]?.value_val || '25-Jul-2026';
+  const businessDate = await BusinessDateService.getBusinessDate(connection);
   const compDate = parseToComparableDate(businessDate) || '2026-07-25';
   const dateStr = compDate.replace(/-/g, '');
   const prefix = `RES-${dateStr}-`;
@@ -44,10 +45,13 @@ export const getAvailableRoomsForReservation = async (req, res) => {
       return res.status(400).json({ error: 'Arrival date and departure date are required' });
     }
 
-    const availableRooms = await RoomStatusService.getAvailableRoomsForDateRange(pool, arrivalDate, departureDate, roomType);
+    // AvailabilityService enforces all 4 blocking rules in one call
+    const availableRooms = await AvailabilityService.getAvailableRooms(
+      pool, arrivalDate, departureDate, roomType || 'ALL'
+    );
     res.json({ success: true, count: availableRooms.length, rooms: availableRooms });
   } catch (error) {
-    if (error.message.includes('Arrival date must be strictly before departure date')) {
+    if (error.message && error.message.includes('Arrival date must be strictly before departure date')) {
       return res.status(400).json({ error: error.message });
     }
     console.error('Error fetching available rooms for reservation:', error);
@@ -147,37 +151,26 @@ export const createReservation = async (req, res) => {
       return res.status(400).json({ error: 'Please select a room for reservation' });
     }
 
-    // Double Booking Prevention Check
-    const [overlappingBookings] = await connection.query(`
-      SELECT b.id, b.check_in_date, b.expected_check_out_date, b.check_out_date
-      FROM bookings b
-      JOIN rooms r ON b.room_id = r.id
-      WHERE r.number = ? AND b.booking_status = 'Checked In'
-    `, [selectedRoomNumber]);
-
-    const hasBookingConflict = overlappingBookings.some(b => {
-      const bEnd = b.expected_check_out_date || b.check_out_date || b.check_in_date;
-      return isDateOverlap(arrivalDate, departureDate, b.check_in_date, bEnd);
-    });
-
-    if (hasBookingConflict) {
+    // ── Availability Validation with row lock (concurrency-safe) ─────────────
+    // validateAndLockRoom acquires SELECT ... FOR UPDATE, then checks:
+    //   1. Room physical status (not dirty/OOO/maintenance/occupied/blocked)
+    //   2. Housekeeping status
+    //   3. No overlapping Checked In booking
+    //   4. No overlapping active reservation
+    // Throws { status: 409, message, code: 'ROOM_ALREADY_BOOKED' } if blocked.
+    try {
+      await AvailabilityService.validateAndLockRoom(connection, {
+        roomId:         selectedRoomId,
+        roomNumber:     selectedRoomNumber,
+        arrivalDate,
+        departureDate,
+      });
+    } catch (availErr) {
       await connection.rollback();
-      return res.status(400).json({ error: `Room ${selectedRoomNumber} is already occupied during the selected date range.` });
-    }
-
-    const [overlappingRes] = await connection.query(`
-      SELECT id, arrival_date, departure_date
-      FROM reservations
-      WHERE room_number = ? AND status IN ('Reserved', 'Confirmed')
-    `, [selectedRoomNumber]);
-
-    const hasResConflict = overlappingRes.some(r => {
-      return isDateOverlap(arrivalDate, departureDate, r.arrival_date, r.departure_date);
-    });
-
-    if (hasResConflict) {
-      await connection.rollback();
-      return res.status(400).json({ error: `Room ${selectedRoomNumber} has an existing reservation during the selected date range.` });
+      return res.status(availErr.status || 409).json({
+        error: availErr.message,
+        code:  availErr.code || 'ROOM_ALREADY_BOOKED'
+      });
     }
 
     // Generate Reservation Number
@@ -208,8 +201,7 @@ export const createReservation = async (req, res) => {
 
     // Log Advance Payment if present
     if (parsedAdvance > 0) {
-      const [settings] = await connection.query("SELECT value_val FROM system_settings WHERE key_name = 'system_date'");
-      const businessDate = settings[0]?.value_val || arrivalDate || '25-Jul-2026';
+      const businessDate = await BusinessDateService.getBusinessDate(connection);
       await connection.query(`
         INSERT INTO cash_logs (time, room, guest, type, amount, business_date)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -364,20 +356,22 @@ export const updateReservation = async (req, res) => {
       }
     }
 
-    // Double Booking Check (excluding current reservation ID)
+    // ── Availability Validation for modification (same validator, excluding self) ─
     if (roomNumber !== currentRes.room_number || arrivalDate !== currentRes.arrival_date || departureDate !== currentRes.departure_date) {
-      const [overlappingRes] = await connection.query(`
-        SELECT id FROM reservations
-        WHERE room_number = ? AND status IN ('Reserved', 'Confirmed') AND id != ?
-      `, [roomNumber, id]);
-
-      const hasConflict = overlappingRes.some(r => {
-        return isDateOverlap(arrivalDate, departureDate, r.arrival_date, r.departure_date);
-      });
-
-      if (hasConflict) {
+      try {
+        await AvailabilityService.validateAndLockRoom(connection, {
+          roomId:                 selectedRoomId,
+          roomNumber:             roomNumber,
+          arrivalDate,
+          departureDate,
+          excludeReservationId:   parseInt(id, 10),
+        });
+      } catch (availErr) {
         await connection.rollback();
-        return res.status(400).json({ error: `Room ${roomNumber} has an overlapping reservation during specified dates.` });
+        return res.status(availErr.status || 409).json({
+          error: availErr.message,
+          code:  availErr.code || 'ROOM_ALREADY_BOOKED'
+        });
       }
     }
 
@@ -443,12 +437,7 @@ export const cancelReservation = async (req, res) => {
         const booking = bookingRows[0];
         
         // Fetch current system business date
-        const [settings] = await connection.query("SELECT value_val FROM system_settings WHERE key_name = 'system_date'");
-        const businessDate = settings[0]?.value_val;
-    if (!businessDate) {
-      console.error('[CRITICAL] system_settings.system_date is missing from database.');
-      return res.status(500).json({ error: 'System configuration error: Business Date is missing. Please contact administrator.' });
-    }
+        const businessDate = await BusinessDateService.getBusinessDate(connection);
 
         const refundVal = refundAmount !== undefined ? parseFloat(refundAmount) : (current.advance_payment || 0);
 
@@ -484,7 +473,7 @@ export const cancelReservation = async (req, res) => {
           // 3. Mark room as dirty
           if (current.room_id) {
             await connection.query(
-              `UPDATE rooms SET status = 'dirty', housekeeping_status = 'Dirty' WHERE id = ?`,
+              `UPDATE rooms SET status = 'dirty' WHERE id = ?`,
               [current.room_id]
             );
           }

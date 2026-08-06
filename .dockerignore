@@ -1,0 +1,13 @@
+node_modules
+*/node_modules
+backend/node_modules
+guest-web/node_modules
+dist
+*/dist
+.git
+.gitignore
+.vscode
+*.log
+logs
+build-log.txt
+release

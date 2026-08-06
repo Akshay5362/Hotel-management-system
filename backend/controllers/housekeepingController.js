@@ -1,4 +1,5 @@
 import db from '../db.js';
+import { BusinessDateService } from '../services/businessDateService.js';
 
 export const getHousekeepingRooms = async (req, res) => {
   try {
@@ -81,10 +82,7 @@ export const updateHousekeepingStatus = async (req, res) => {
     }
 
     // Get business date
-    const [settings] = await db.query(
-      "SELECT value_val FROM system_settings WHERE key_name = 'system_date'"
-    );
-    const businessDate = settings[0]?.value_val || '25-Jul-2026';
+    const businessDate = await BusinessDateService.getBusinessDate(db);
 
     // Build update — only housekeeping_status is changed, occupancy status is never touched
     let updateFields = 'housekeeping_status = ?';

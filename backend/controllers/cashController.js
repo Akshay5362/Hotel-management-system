@@ -1,14 +1,15 @@
 import pool from '../db.js';
+import { BusinessDateService } from '../services/businessDateService.js';
 
-// ── Helper: format current time ─────────────────────────────────────────────
+// â”€â”€ Helper: format current time â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function formatTime(date) {
   return date.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
 }
 
-// ── Helper: generate receipt ID ─────────────────────────────────────────────
+// â”€â”€ Helper: generate receipt ID â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Format: CS-YYYYMMDD-NNNN (e.g. CS-20260722-0001)
 async function generateReceiptId(businessDate, connection) {
-  // Derive YYYYMMDD from business date string (e.g. "22-Jul-2026" → "20260722")
+  // Derive YYYYMMDD from business date string (e.g. "22-Jul-2026" â†’ "20260722")
   const parsed = new Date(businessDate);
   const datePart = isNaN(parsed.getTime())
     ? businessDate.replace(/-/g, '').replace(/[A-Za-z]/g, '').slice(0, 8)
@@ -22,7 +23,7 @@ async function generateReceiptId(businessDate, connection) {
   return `CS-${datePart}-${seq}`;
 }
 
-// ── POST /api/cash/submit ────────────────────────────────────────────────────
+// â”€â”€ POST /api/cash/submit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 export const submitCash = async (req, res) => {
   const { amount, receivedBy, shift, name, notes } = req.body;
 
@@ -34,7 +35,7 @@ export const submitCash = async (req, res) => {
     req.user?.username ||
     'Receptionist';
 
-  // Validation — only amount is required; receivedBy and shift are optional
+  // Validation â€” only amount is required; receivedBy and shift are optional
   if (!amount || isNaN(amount) || Number(amount) <= 0) {
     return res.status(400).json({ error: 'Invalid amount. Must be a positive number.' });
   }
@@ -52,11 +53,7 @@ export const submitCash = async (req, res) => {
     await connection.beginTransaction();
 
     // Get current business date
-    const [settingsRows] = await connection.query(
-      `SELECT value_val FROM system_settings WHERE key_name = 'system_date'`
-    );
-    const businessDate = settingsRows[0]?.value_val ||
-      new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
+    const businessDate = await BusinessDateService.getBusinessDate(connection);
 
     // Calculate cash in hand (advances + settlements - refunds - already submitted)
     const [cashLogRows] = await connection.query(
@@ -79,7 +76,7 @@ export const submitCash = async (req, res) => {
       await connection.rollback();
       connection.release();
       return res.status(400).json({
-        error: `Cannot submit ₹${parsedAmount.toLocaleString('en-IN')}. Cash in hand is only ₹${cashInHand.toLocaleString('en-IN')}.`
+        error: `Cannot submit â‚¹${parsedAmount.toLocaleString('en-IN')}. Cash in hand is only â‚¹${cashInHand.toLocaleString('en-IN')}.`
       });
     }
 
@@ -98,7 +95,7 @@ export const submitCash = async (req, res) => {
     // Structured audit log
     const structuredDetails = JSON.stringify({
       Receipt:      receiptId,
-      Amount:       `₹${parsedAmount}`,
+      Amount:       `â‚¹${parsedAmount}`,
       Receptionist: receptionistName,
       Shift:        shiftLabel,
       Received_By:  receiverName,
@@ -114,7 +111,7 @@ export const submitCash = async (req, res) => {
 
     return res.json({
       success: true,
-      message: `₹${parsedAmount.toLocaleString('en-IN')} submitted successfully.`,
+      message: `â‚¹${parsedAmount.toLocaleString('en-IN')} submitted successfully.`,
       submission: {
         id:               insertResult.insertId,
         receipt_id:       receiptId,
@@ -137,13 +134,10 @@ export const submitCash = async (req, res) => {
   }
 };
 
-// ── GET /api/cash/submissions ────────────────────────────────────────────────
+// â”€â”€ GET /api/cash/submissions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 export const getCashSubmissions = async (req, res) => {
   try {
-    const [settingsRows] = await pool.query(
-      `SELECT value_val FROM system_settings WHERE key_name = 'system_date'`
-    );
-    const businessDate = settingsRows[0]?.value_val;
+    const businessDate = await BusinessDateService.getBusinessDate(pool);
 
     const [rows] = await pool.query(
       `SELECT * FROM cash_submissions WHERE business_date = ? ORDER BY submitted_at ASC`,
@@ -156,3 +150,4 @@ export const getCashSubmissions = async (req, res) => {
     return res.status(500).json({ error: 'Internal Server Error' });
   }
 };
+

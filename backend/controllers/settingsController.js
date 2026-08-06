@@ -1,16 +1,50 @@
+/**
+ * settingsController.js
+ * =====================
+ * Handles Business Date management endpoints.
+ *
+ * Single endpoint:  POST /api/settings/business-date
+ *
+ * Request body:
+ *   {
+ *     "action":  "update" | "rollback" | "reset_to_today"   // default: "update"
+ *     "date":    "YYYY-MM-DD"                               // required for "update"
+ *     "reason":  "string"                                   // always required
+ *     "force":   false                                       // required for backward
+ *   }
+ *
+ * Authorization:
+ *   GET  — any authenticated user (read-only)
+ *   POST — requires hasPermission('override_business_date') → 403 otherwise
+ *
+ * Business Rules:
+ *   1. No direct SQL reads of system_date outside BusinessDateService.
+ *   2. No OS clock used for business logic.
+ *   3. Forward moves: always allowed for authorized users.
+ *   4. Backward moves: allowed only when force=true AND reason provided.
+ *   5. Rollback: moves business date back by exactly one day.
+ *   6. Reset to today: DEV-ONLY (NODE_ENV=development).
+ *   7. Every operation writes an audit_log entry.
+ *   8. Lock prevents concurrent Day End modification.
+ */
+
 import pool from '../db.js';
 import { RoomStatusService } from '../services/roomStatusService.js';
 import { hasPermission } from './authController.js';
+import { BusinessDateService, BD_ERRORS } from '../services/businessDateService.js';
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Validate that a string is non-empty after trim. */
+function requireReason(reason) {
+  return typeof reason === 'string' && reason.trim().length > 0;
+}
+
+// ── GET /api/settings/business-date ─────────────────────────────────────────
 
 export const getBusinessDateInfo = async (req, res) => {
   try {
-    const [settings] = await pool.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
-    const businessDate = settings[0]?.value_val || null;
-
-    if (!businessDate) {
-      console.error('[CRITICAL] system_settings.system_date is missing from database.');
-      return res.status(500).json({ error: 'System configuration error: Business Date is missing. Please contact administrator.' });
-    }
+    const businessDate = await BusinessDateService.getBusinessDate(pool);
 
     const [logs] = await pool.query(`
       SELECT created_at 
@@ -24,9 +58,9 @@ export const getBusinessDateInfo = async (req, res) => {
     // Fetch room statuses to calculate stats
     const processedRooms = await RoomStatusService.getRoomStatuses(pool, businessDate);
     
-    let occupiedRooms = 0;
-    let bookedRooms = 0;
-    let dirtyRooms = 0;
+    let occupiedRooms    = 0;
+    let bookedRooms      = 0;
+    let dirtyRooms       = 0;
     let pendingCheckouts = 0;
 
     const bDateObj = new Date(businessDate);
@@ -35,28 +69,27 @@ export const getBusinessDateInfo = async (req, res) => {
     for (const room of processedRooms) {
       if (room.status === 'occupied') {
         occupiedRooms++;
-        
-        // Check if expected checkout is today or earlier
         if (room.expectedCheckOutDate) {
           const expDateObj = new Date(room.expectedCheckOutDate);
           expDateObj.setHours(0, 0, 0, 0);
-          if (expDateObj <= bDateObj) {
-            pendingCheckouts++;
-          }
+          if (expDateObj <= bDateObj) pendingCheckouts++;
         }
       } else if (room.status === 'booked') {
         bookedRooms++;
       }
-      
-      if (room.housekeeping_status === 'Dirty') {
+      if (room.status === 'dirty' || room.housekeeping_status === 'Dirty') {
         dirtyRooms++;
       }
     }
 
+    // Include mode so the UI can show DEV badge and allow reset button
+    const isDev = process.env.NODE_ENV === 'development';
+
     res.json({
       businessDate,
-      systemDate: new Date().toISOString(),
+      systemDate: new Date().toISOString(),   // wall-clock for UI display only
       lastDayEnd,
+      mode: isDev ? 'development' : 'production',
       stats: {
         occupiedRooms,
         bookedRooms,
@@ -70,91 +103,181 @@ export const getBusinessDateInfo = async (req, res) => {
   }
 };
 
+// ── POST /api/settings/business-date ────────────────────────────────────────
+
 export const updateBusinessDate = async (req, res) => {
-  const { newDate, reason } = req.body;
-  const adminId = req.user?.id;
+  const { action = 'update', date, reason, force = false } = req.body;
+  const adminId  = req.user?.id;
   const username = req.user?.username;
-  const role = req.user?.role;
-  const clientIp = req.ip || req.connection.remoteAddress;
+  const role     = req.user?.role;
+  const clientIp = req.ip || req.connection?.remoteAddress || null;
 
-  if (!newDate || !reason) {
-    return res.status(400).json({ error: 'New date and reason are required.' });
+  // ── 1. Permission check (permission-based, not hardcoded role) ────────────
+  const canOverride = await hasPermission(req, 'override_business_date');
+  if (!canOverride) {
+    return res.status(403).json({
+      error: 'Forbidden: You do not have permission to modify the Business Date.',
+      code:  'PERMISSION_DENIED',
+    });
   }
 
-  if (!/^\d{2}-[A-Z][a-z]{2}-\d{4}$/.test(newDate)) {
-    return res.status(400).json({ error: 'Invalid date format. Expected DD-Mon-YYYY' });
+  // ── 2. Validate reason (always required) ──────────────────────────────────
+  if (!requireReason(reason)) {
+    return res.status(400).json({
+      error: 'A reason is required for all Business Date modifications.',
+      code:  'REASON_REQUIRED',
+    });
   }
 
+  // ── 3. Validate action ────────────────────────────────────────────────────
+  const VALID_ACTIONS = ['update', 'rollback', 'reset_to_today'];
+  if (!VALID_ACTIONS.includes(action)) {
+    return res.status(400).json({
+      error: `Invalid action "${action}". Must be one of: ${VALID_ACTIONS.join(', ')}.`,
+      code:  'INVALID_ACTION',
+    });
+  }
+
+  // ── 4. Additional validation for 'update' action ──────────────────────────
+  if (action === 'update') {
+    if (!date) {
+      return res.status(400).json({ error: 'A target date is required for action=update.', code: 'DATE_REQUIRED' });
+    }
+    const parsed = BusinessDateService.parseDate(date);
+    if (!parsed) {
+      return res.status(400).json({
+        error: `Invalid date format: "${date}". Expected YYYY-MM-DD.`,
+        code:  BD_ERRORS.INVALID_FORMAT,
+      });
+    }
+  }
+
+  // ── 5. Acquire lock and execute ───────────────────────────────────────────
   let connection;
   try {
     connection = await pool.getConnection();
-    
-    // Acquire a NOWAIT lock on system_settings to prevent modification if Day End is running
-    // If Day End is running, it will have locked the rows and this will throw an error immediately
+
+    // Acquire NOWAIT lock — throws immediately if Day End is running
     try {
-      await connection.query('SELECT value_val FROM system_settings WHERE key_name = ? FOR UPDATE NOWAIT', ['system_date']);
+      await BusinessDateService.acquireLock(connection);
     } catch (lockError) {
-      // ER_LOCK_NOWAIT (3572) or ER_LOCK_DEADLOCK (1213)
       if (lockError.code === 'ER_LOCK_NOWAIT' || lockError.code === 'ER_LOCK_DEADLOCK') {
-        return res.status(409).json({ error: 'Cannot modify Business Date. A Day End / Night Audit process is currently running.' });
+        return res.status(409).json({
+          error: 'Cannot modify Business Date: a Day End / Night Audit process is currently running.',
+          code:  'LOCK_CONFLICT',
+        });
       }
       throw lockError;
     }
 
     await connection.beginTransaction();
 
-    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
-    const oldDate = settings[0]?.value_val;
+    const oldDate = await BusinessDateService.getBusinessDate(connection);
+    let newDate;
+    let auditAction;
 
-    if (!oldDate) {
-      throw new Error('System configuration error: Business Date is missing.');
+    // ── ACTION: update ───────────────────────────────────────────────────────
+    if (action === 'update') {
+      const targetIso = BusinessDateService.parseDate(date);
+      const cmp       = BusinessDateService.compareDates(targetIso, oldDate);
+
+      if (cmp === 0) {
+        await connection.rollback();
+        connection.release();
+        return res.status(400).json({
+          error: `Business Date is already ${oldDate}. No change made.`,
+          code:  BD_ERRORS.SAME_DATE,
+        });
+      }
+
+      // Backward movement guard
+      if (cmp < 0 && !force) {
+        await connection.rollback();
+        connection.release();
+        return res.status(400).json({
+          error: `Business Date cannot move backward (current: ${oldDate}, requested: ${targetIso}). Set force=true to override.`,
+          code:  BD_ERRORS.BACKWARD,
+        });
+      }
+
+      // All clear — delegate write to BusinessDateService
+      await BusinessDateService.setBusinessDate(connection, targetIso, { allowBackward: true, allowSameDate: false });
+      newDate     = targetIso;
+      auditAction = 'MANUAL_DATE_CHANGE';
     }
 
-    const dOld = new Date(oldDate);
-    const dNew = new Date(newDate);
-    dOld.setHours(0, 0, 0, 0);
-    dNew.setHours(0, 0, 0, 0);
-
-    const canModify = await hasPermission(req, 'modify_business_date');
-    if (!canModify) {
-      await connection.rollback();
-      return res.status(403).json({ error: 'You do not have permission to modify the business date.' });
+    // ── ACTION: rollback ─────────────────────────────────────────────────────
+    else if (action === 'rollback') {
+      const result = await BusinessDateService.rollbackBusinessDate(connection, {
+        userId: adminId, username, role, reason: reason.trim(), clientIp,
+      });
+      // rollbackBusinessDate already writes its own audit log
+      newDate     = result.newDate;
+      auditAction = null; // already logged inside rollbackBusinessDate
     }
 
-    const canOverride = await hasPermission(req, 'override_business_date');
-
-    // Prevent backwards time travel unless Super Admin
-    if (dNew < dOld && !canOverride) {
-      await connection.rollback();
-      return res.status(403).json({ error: 'Business Date cannot be moved backwards. Only a Super Administrator can bypass this restriction.' });
+    // ── ACTION: reset_to_today ───────────────────────────────────────────────
+    else if (action === 'reset_to_today') {
+      if (process.env.NODE_ENV !== 'development') {
+        await connection.rollback();
+        connection.release();
+        return res.status(403).json({
+          error: 'Reset to Today is only available in development mode.',
+          code:  BD_ERRORS.PRODUCTION_GUARD,
+        });
+      }
+      const result = await BusinessDateService.resetToSystemDate(connection, {
+        userId: adminId, username, role, reason: reason.trim(), clientIp,
+      });
+      // resetToSystemDate already writes its own audit log
+      newDate     = result.newDate;
+      auditAction = null; // already logged inside resetToSystemDate
     }
 
-    await connection.query(
-      'UPDATE system_settings SET value_val = ? WHERE key_name = ?',
-      [newDate, 'system_date']
-    );
-
-    const auditDetails = `Manual Business Date change via override. Old: ${oldDate}, New: ${newDate}`;
-    
-    await connection.query(
-      `INSERT INTO audit_logs (
-        user_id, action, details, business_date, 
-        previous_business_date, new_business_date, reason, 
-        username, role, client_ip, application_version
-      ) VALUES (?, 'MANUAL_DATE_CHANGE', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        adminId, auditDetails, newDate,
-        oldDate, newDate, reason,
-        username || null, role || null, clientIp || null, '1.0.0'
-      ]
-    );
+    // ── Write audit log for 'update' (rollback/reset write their own) ────────
+    if (auditAction) {
+      const auditDetails = `Manual Business Date change. Old: ${oldDate}, New: ${newDate}. Force: ${force}`;
+      await connection.query(
+        `INSERT INTO audit_logs (
+          user_id, action, details, business_date,
+          previous_business_date, new_business_date, reason,
+          username, role, client_ip, application_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '1.0.0')`,
+        [
+          adminId, auditAction, auditDetails, newDate,
+          oldDate, newDate, reason.trim(),
+          username || null, role || null, clientIp || null,
+        ]
+      );
+    }
 
     await connection.commit();
-    res.json({ message: 'Business Date updated successfully.', newDate });
+
+    console.log(`[Settings] Business Date changed: ${oldDate} → ${newDate} (action=${action}, user=${username || adminId})`);
+
+    res.json({
+      success: true,
+      message: `Business Date successfully changed from ${oldDate} to ${newDate}.`,
+      previousDate: oldDate,
+      newDate,
+      action,
+    });
+
   } catch (error) {
-    if (connection) await connection.rollback();
-    console.error('Error updating business date:', error);
-    res.status(500).json({ error: 'Failed to update business date.' });
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
+
+    // Return structured error for known BusinessDateErrors
+    if (error.name === 'BusinessDateError') {
+      return res.status(error.httpStatus || 400).json({
+        error: error.message,
+        code:  error.code,
+      });
+    }
+
+    console.error('[Settings] Error updating business date:', error);
+    res.status(500).json({ error: 'Failed to update business date. Please try again.' });
   } finally {
     if (connection) connection.release();
   }

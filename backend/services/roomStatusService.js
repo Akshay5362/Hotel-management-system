@@ -18,7 +18,7 @@ export function parseToComparableDate(dateStr) {
   }
   const parsed = new Date(str);
   if (!isNaN(parsed.getTime())) {
-    return parsed.isOString().split('T')[0];
+    return parsed.toISOString().split('T')[0];
   }
   return str;
 }
@@ -35,7 +35,8 @@ export function isDateOverlap(start1, end1, start2, end2) {
 export class RoomStatusService {
   static async getRoomStatuses(connection, businessDate) {
     const [rooms] = await connection.query(`
-      SELECT r.id, r.number, r.status as db_status, r.housekeeping_status, 
+      SELECT r.id, r.number, r.status as db_status,
+             r.housekeeping_status, r.housekeeping_priority, r.last_cleaned_at,
              rt.code as type, rt.title as type_title, rt.base_rate as rate
       FROM rooms r
       JOIN room_types rt ON r.room_type_id = rt.id
@@ -100,9 +101,35 @@ export class RoomStatusService {
 
       const roomBooking = activeBookings.find(b => b.room_id === r.id);
       if (roomBooking && roomBooking.booking_status === 'Checked In') {
-        currentBooking = roomBooking;
-        computedStatus = 'occupied';
+        const checkInComp  = parseToComparableDate(roomBooking.checkInDate);
+        const checkOutComp = parseToComparableDate(roomBooking.expectedCheckOutDate);
+
+        // A booking is "currently occupied" when:
+        //   1. booking_status = 'Checked In'   (guest is actively in the room)
+        //   AND
+        //   2. check_in_date <= businessDate    (they have arrived)
+        //   AND
+        //   3. businessDate <= expected_check_out_date  (inclusive — same-day checkout counts as occupied)
+        //
+        // Note: we use <= on checkout (not <) so that same-day bookings where
+        // check_in == check_out still show the room as occupied.
+        const isCurrentlyOccupied =
+          checkInComp && sysComp && checkInComp <= sysComp &&
+          (checkOutComp ? sysComp <= checkOutComp : true);
+
+        if (isCurrentlyOccupied) {
+          currentBooking = roomBooking;
+          computedStatus = 'occupied';
+        }
       }
+
+      // If the DB says 'occupied' but no currently-valid booking window matches,
+      // override to 'vacant' so stale old bookings don't ghost the room.
+      // Exception: if the booking_status IS 'Checked In' we already handled it above.
+      if (r.db_status === 'occupied' && !currentBooking) {
+        computedStatus = 'vacant';
+      }
+
 
       if (computedStatus === 'vacant' && !currentBooking) {
         const matchingRes = activeReservations.find(res => {
@@ -123,12 +150,24 @@ export class RoomStatusService {
         }
       }
 
+      // ── Housekeeping dirty override ────────────────────────────────────────
+      // If the room is physically vacant (no active guest) but still flagged as
+      // Dirty by housekeeping, surface 'dirty' so the dashboard and check-in
+      // logic are in agreement — both block the room from new walk-in check-ins.
+      if (
+        (computedStatus === 'vacant' || computedStatus === 'booked') &&
+        !currentBooking &&
+        (r.housekeeping_status === 'Dirty' || r.db_status === 'dirty')
+      ) {
+        computedStatus = 'dirty';
+      }
+
       return {
         id: r.id,
         number: r.number,
         type: r.type,
         status: computedStatus,
-        housekeeping_status: r.housekeeping_status,
+        housekeeping_status: r.housekeeping_status || (r.db_status === 'dirty' ? 'Dirty' : 'Clean'),
         rate: r.rate,
         guestName: currentBooking 
           ? currentBooking.guestName.toUpperCase() 
@@ -167,58 +206,12 @@ export class RoomStatusService {
 
   static async getRoomStatus(connection, roomId, businessDate) {
     const statuses = await this.getRoomStatuses(connection, businessDate);
-    return statuses.find(r => String(r.id) ?? r.id === String(roomId) ?? roomId) /* just r.id == roomId */
     return statuses.find(r => String(r.id) === String(roomId));
   }
 
   static async getAvailableRoomsForDateRange(connection, arrivalDate, departureDate, roomType = 'ALL') {
-    const sArr = parseToComparableDate(arrivalDate);
-    const sDep = parseToComparableDate(departureDate);
-    if (!sArr || !sDep || sArr >= sDep) {
-      throw new Error('Arrival date must be strictly before departure date');
-    }
-
-    const [rooms] = await connection.query(`
-      SELECT r.id, r.number, r.status, rt.code as room_type, rt.title, rt.base_rate
-      FROM rooms r
-      JOIN room_types rt ON r.room_type_id = rt.id
-      WHERE r.status != 'maintenance' AND r.status != 'out_of_order'
-    `);
-
-    const [activeBookings] = await connection.query(`
-      SELECT b.room_id, r.number as room_number, b.check_in_date, b.expected_check_out_date, b.check_out_date
-      FROM bookings b
-      JOIN rooms r ON b.room_id = r.id
-      WHERE b.booking_status = 'Checked In'
-    `);
-
-    const [activeReservations] = await connection.query(`
-      SELECT room_id, room_number, arrival_date, departure_date
-      FROM reservations
-      WHERE status IN ('Reserved', 'Confirmed')
-    `);
-
-    return rooms.filter(room => {
-      if (roomType && roomType !== 'ALL' && room.room_type !== roomType) return false;
-
-      const hasBookingOverlap = activeBookings.some(b => {
-        if (b.room_id === room.id || b.room_number === room.number) {
-          const bEnd = b.expected_check_out_date || b.check_out_date || b.check_in_date;
-          return isDateOverlap(arrivalDate, departureDate, b.check_in_date, bEnd);
-        }
-        return false;
-      });
-      if (hasBookingOverlap) return false;
-
-      const hasResOverlap = activeReservations.some(res => {
-        if (res.room_id === room.id || res.room_number === room.number) {
-          return isDateOverlap(arrivalDate, departureDate, res.arrival_date, res.departure_date);
-        }
-        return false;
-      });
-      if (hasResOverlap) return false;
-
-      return true;
-    });
+    const { AvailabilityService } = await import('./AvailabilityService.js');
+    return AvailabilityService.getAvailableRooms(connection, arrivalDate, departureDate, roomType);
   }
 }
+

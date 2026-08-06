@@ -5,6 +5,7 @@ export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAdd
   const [newDesc, setNewDesc] = useState('');
   const [newAmount, setNewAmount] = useState('');
   const [showInvoiceMenu, setShowInvoiceMenu] = useState(false);
+  const [showSettleMenu, setShowSettleMenu] = useState(false);
   const [isGeneratingInvoice, setIsGeneratingInvoice] = useState(false);
 
   if (!isOpen || !room) return null;
@@ -25,20 +26,40 @@ export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAdd
       showAlert('Please enter a valid amount', 'Validation Error');
       return;
     }
-
     onAddLedgerItem(room.number, newDesc, amt);
     setNewDesc('');
     setNewAmount('');
   };
 
-  const handleCheckOut = async () => {
-    const msg = balance >= 0 
+  // Core checkout — returns true on success
+  const executeCheckOut = async () => {
+    const msg = balance >= 0
       ? `Confirm settlement of ₹ ${balance.toLocaleString('en-IN')} and check out Room ${room.number}?`
       : `Confirm refund of ₹ ${Math.abs(balance).toLocaleString('en-IN')} and check out Room ${room.number}?`;
-    
     const confirmed = await showConfirm(msg, 'Settle & Checkout');
     if (confirmed) {
       onCheckOut(room.number, balance);
+      return true;
+    }
+    return false;
+  };
+
+  const handleCheckOut = async () => {
+    setShowSettleMenu(false);
+    await executeCheckOut();
+  };
+
+  // Settle then immediately print invoice
+  const handleSettleAndPrint = async () => {
+    setShowSettleMenu(false);
+    const ok = await executeCheckOut();
+    if (ok) {
+      setIsGeneratingInvoice(true);
+      try {
+        await generateInvoicePDF(room, 'print');
+      } finally {
+        setIsGeneratingInvoice(false);
+      }
     }
   };
 
@@ -57,11 +78,11 @@ export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAdd
       <div className="modal-content" style={{ maxWidth: '640px' }}>
         <div className="modal-header">
           <h3>
-            <span>🧾</span> Guest Folio & Checkout - Room {room.number}
+            <span>🧾</span> Guest Folio &amp; Checkout - Room {room.number}
           </h3>
           <button className="btn-close" onClick={onClose}>&times;</button>
         </div>
-        
+
         <div className="modal-body">
           {/* Guest Summary Info */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px', marginBottom: '20px', padding: '12px', background: 'rgba(255,255,255,0.02)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
@@ -79,24 +100,24 @@ export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAdd
             </div>
             <div>
               <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Room Type / Rate</p>
-              <p style={{ fontWeight: '600', color: 'var(--text-secondary)' }}>{room.type} (₹ {room.rate}/Night)</p>
+              <p style={{ fontWeight: '600', color: 'var(--text-secondary)' }}>{room.type} (₹ {room.rate}/Night, Incl. GST)</p>
             </div>
           </div>
 
-          {/* Add Billing Item (Bill Posting) */}
+          {/* Post Charges */}
           <div style={{ marginBottom: '20px' }}>
             <h4 style={{ fontSize: '0.85rem', textTransform: 'uppercase', color: 'var(--text-secondary)', marginBottom: '8px', letterSpacing: '0.5px' }}>Post Charges (Bill Posting)</h4>
             <form onSubmit={handlePostCharge} style={{ display: 'flex', gap: '10px' }}>
-              <input 
-                type="text" 
-                placeholder="e.g. Laundry, Dinner, Extra Bed" 
+              <input
+                type="text"
+                placeholder="e.g. Laundry, Dinner, Extra Bed"
                 value={newDesc}
                 onChange={(e) => setNewDesc(e.target.value)}
                 style={{ flex: 2 }}
               />
-              <input 
-                type="number" 
-                placeholder="Amount (₹)" 
+              <input
+                type="number"
+                placeholder="Amount (₹)"
                 value={newAmount}
                 onChange={(e) => setNewAmount(e.target.value)}
                 style={{ flex: 1 }}
@@ -105,7 +126,7 @@ export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAdd
             </form>
           </div>
 
-          {/* Ledger Table */}
+          {/* Billing Ledger */}
           <div>
             <h4 style={{ fontSize: '0.85rem', textTransform: 'uppercase', color: 'var(--text-secondary)', marginBottom: '8px', letterSpacing: '0.5px' }}>Billing Ledger</h4>
             <div className="ledger-table-container">
@@ -137,7 +158,7 @@ export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAdd
 
               <div className="ledger-summary">
                 <div className="ledger-summary-row">
-                  <span>Subtotal</span>
+                  <span>Subtotal <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>(GST Inclusive)</span></span>
                   <span>₹ {subtotal.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</span>
                 </div>
                 <div className="ledger-summary-row" style={{ color: 'var(--color-booked)' }}>
@@ -154,8 +175,13 @@ export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAdd
         </div>
 
         <div className="modal-footer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          {/* Left actions */}
           <div style={{ display: 'flex', gap: '8px' }}>
-            <button className="btn-secondary" style={{ background: 'linear-gradient(135deg, #0284c7 0%, #0369a1 100%)', color: '#fff', border: 'none' }} onClick={onModifyClick}>
+            <button
+              className="btn-secondary"
+              style={{ background: 'linear-gradient(135deg, #0284c7 0%, #0369a1 100%)', color: '#fff', border: 'none' }}
+              onClick={onModifyClick}
+            >
               ✏️ Modify Check-In
             </button>
             <button
@@ -166,28 +192,31 @@ export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAdd
               💰 Cancel &amp; Refund
             </button>
           </div>
-          <div style={{ display: 'flex', gap: '10px' }}>
+
+          {/* Right actions */}
+          <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+
+            {/* Invoice ▼ */}
             <div style={{ position: 'relative' }}>
-              <button 
+              <button
                 className="btn-secondary"
-                onClick={() => setShowInvoiceMenu(!showInvoiceMenu)}
+                onClick={() => { setShowInvoiceMenu(!showInvoiceMenu); setShowSettleMenu(false); }}
                 disabled={isGeneratingInvoice}
-                style={{ position: 'relative' }}
               >
-                {isGeneratingInvoice ? 'Generating...' : '📄 Invoice ▼'}
+                {isGeneratingInvoice ? 'Generating…' : '📄 Invoice ▼'}
               </button>
               {showInvoiceMenu && (
-                <div style={{ position: 'absolute', bottom: '100%', right: 0, marginBottom: '8px', background: '#1e293b', border: '1px solid #334155', borderRadius: '6px', padding: '5px 0', zIndex: 50, minWidth: '150px', boxShadow: '0 -10px 15px -3px rgba(0, 0, 0, 0.5)' }}>
-                  <button 
-                    onClick={() => handleInvoiceAction('print')} 
+                <div style={{ position: 'absolute', bottom: '100%', right: 0, marginBottom: '8px', background: '#1e293b', border: '1px solid #334155', borderRadius: '6px', padding: '5px 0', zIndex: 50, minWidth: '160px', boxShadow: '0 -10px 15px -3px rgba(0,0,0,0.5)' }}>
+                  <button
+                    onClick={() => handleInvoiceAction('print')}
                     style={{ display: 'block', width: '100%', padding: '8px 20px', background: 'transparent', border: 'none', color: '#fff', textAlign: 'left', cursor: 'pointer', fontSize: '0.85rem' }}
                     onMouseEnter={(e) => e.target.style.background = 'rgba(255,255,255,0.1)'}
                     onMouseLeave={(e) => e.target.style.background = 'transparent'}
                   >
                     🖨️ Print Invoice
                   </button>
-                  <button 
-                    onClick={() => handleInvoiceAction('download')} 
+                  <button
+                    onClick={() => handleInvoiceAction('download')}
                     style={{ display: 'block', width: '100%', padding: '8px 20px', background: 'transparent', border: 'none', color: '#fff', textAlign: 'left', cursor: 'pointer', fontSize: '0.85rem' }}
                     onMouseEnter={(e) => e.target.style.background = 'rgba(255,255,255,0.1)'}
                     onMouseLeave={(e) => e.target.style.background = 'transparent'}
@@ -197,8 +226,41 @@ export default function CheckOutModal({ isOpen, onClose, room, onCheckOut, onAdd
                 </div>
               )}
             </div>
+
             <button className="btn-secondary" onClick={onClose}>Close</button>
-            <button className="btn-danger" onClick={handleCheckOut}>Settle &amp; Check Out</button>
+
+            {/* Settle & Check Out ▼ */}
+            <div style={{ position: 'relative' }}>
+              <button
+                className="btn-danger"
+                onClick={() => { setShowSettleMenu(!showSettleMenu); setShowInvoiceMenu(false); }}
+                style={{ display: 'flex', alignItems: 'center', gap: '6px' }}
+              >
+                Settle &amp; Check Out ▼
+              </button>
+              {showSettleMenu && (
+                <div style={{ position: 'absolute', bottom: '100%', right: 0, marginBottom: '8px', background: '#1e293b', border: '1px solid #334155', borderRadius: '6px', padding: '5px 0', zIndex: 50, minWidth: '220px', boxShadow: '0 -10px 15px -3px rgba(0,0,0,0.5)' }}>
+                  <button
+                    onClick={handleCheckOut}
+                    style={{ display: 'block', width: '100%', padding: '10px 20px', background: 'transparent', border: 'none', color: '#fff', textAlign: 'left', cursor: 'pointer', fontSize: '0.85rem' }}
+                    onMouseEnter={(e) => e.target.style.background = 'rgba(255,255,255,0.1)'}
+                    onMouseLeave={(e) => e.target.style.background = 'transparent'}
+                  >
+                    ✅ Settle Only
+                  </button>
+                  <button
+                    onClick={handleSettleAndPrint}
+                    disabled={isGeneratingInvoice}
+                    style={{ display: 'block', width: '100%', padding: '10px 20px', background: 'transparent', border: 'none', color: '#4ade80', textAlign: 'left', cursor: 'pointer', fontSize: '0.85rem', fontWeight: '600' }}
+                    onMouseEnter={(e) => e.target.style.background = 'rgba(255,255,255,0.1)'}
+                    onMouseLeave={(e) => e.target.style.background = 'transparent'}
+                  >
+                    🖨️ Settle &amp; Print Invoice
+                  </button>
+                </div>
+              )}
+            </div>
+
           </div>
         </div>
       </div>

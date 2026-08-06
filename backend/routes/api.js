@@ -1,17 +1,19 @@
 import express from 'express';
 import { checkIn, checkOut, clean, addLedgerItem, shift, bookRoom, modifyCheckIn, guestRequestCheckIn, guestAddService, guestReportMaintenance, guestExtendStay, getGuestBill, getGuestNotifications, markNotificationRead, guestRequestCheckout, guestSubmitFeedback, getGuestHistory, getGuestHistoryAdmin, uploadIdentity, getRefundPolicy, updateRefundPolicy, processRefundCheckout, getPublicRooms, adminExtendStay, adminLateCheckout, adminNoShow, updateRoomStatus } from '../controllers/roomController.js';
-import { getStatus, runDayEnd, getGuestRequests, resolveGuestRequest, resolveExtensionRequest, getGuestDocuments, verifyGuestDocument, deleteGuestDocument, searchGuests, listGuests, searchGuestsStaff } from '../controllers/auditController.js';
+import { getStatus, runDayEnd, undoDayEnd, getGuestRequests, resolveGuestRequest, resolveExtensionRequest, getGuestDocuments, verifyGuestDocument, deleteGuestDocument, searchGuests, listGuests, searchGuestsStaff } from '../controllers/auditController.js';
 import { getBusinessDateInfo, updateBusinessDate } from '../controllers/settingsController.js';
 import { submitCash, getCashSubmissions } from '../controllers/cashController.js';
 import { staffLogin, getAllStaff, getStaffById, createStaff, updateStaff, updateStaffStatus, deleteStaff } from '../controllers/staffController.js';
 import { uploadIDDocument } from '../middleware/uploadMiddleware.js';
-import { signUp, signIn, authenticate, requireAdmin, requireGuest } from '../controllers/authController.js';
+import { signUp, signIn, authenticate, requireAdmin, requireSuperAdmin, requireGuest } from '../controllers/authController.js';
 import paymentRoutes from './paymentRoutes.js';
 import reportsRoutes from './reportsRoutes.js';
 import invoiceRoutes from './invoiceRoutes.js';
 import housekeepingRoutes from './housekeepingRoutes.js';
 import staffRoutes from './staffRoutes.js';
 import reservationRoutes from './reservationRoutes.js';
+
+import factoryResetRoutes from './factoryResetRoutes.js';
 
 const router = express.Router();
 
@@ -28,10 +30,15 @@ router.post('/staff/auth/login', staffLogin);
 // Audit & status routes
 router.get('/status', authenticate, getStatus);
 router.post('/dayend', authenticate, requireAdmin, runDayEnd);
+router.post('/dayend/undo', authenticate, requireSuperAdmin, undoDayEnd);
 
 // Settings routes
+// NOTE: GET is open to all authenticated users (read-only).
+// POST uses permission-based authorization inside the controller
+// (hasPermission('override_business_date')) — not role-hardcoded middleware.
+// This allows fine-grained control via the roles/permissions tables.
 router.get('/settings/business-date', authenticate, getBusinessDateInfo);
-router.post('/settings/business-date', authenticate, requireAdmin, updateBusinessDate);
+router.post('/settings/business-date', authenticate, updateBusinessDate);
 
 // Room routes (Admin)
 router.post('/rooms/:number/checkin', authenticate, requireAdmin, checkIn);
@@ -102,5 +109,8 @@ router.use('/staff', authenticate, requireAdmin, staffRoutes);
 
 // ── Reservation Module ───────────────────────────────────────────────────────
 router.use('/reservations', reservationRoutes);
+
+// ── Factory Reset Module (Phase 1 Architecture) ─────────────────────────────
+router.use('/system/factory-reset', factoryResetRoutes);
 
 export default router;

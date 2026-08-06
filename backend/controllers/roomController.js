@@ -1,4 +1,7 @@
 import { processCheckIn } from '../services/checkInService.js';
+import { BusinessDateService } from '../services/businessDateService.js';
+import { CheckoutRecoveryService } from '../services/CheckoutRecoveryService.js';
+import { AvailabilityService } from '../services/AvailabilityService.js';
 import pool from '../db.js';
 import fs from 'fs';
 import path from 'path';
@@ -107,9 +110,8 @@ export const checkOut = async (req, res) => {
 
     const activeBooking = bookingRows[0];
 
-    // Fetch system settings for business date
-    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
-    const businessDate = settings[0]?.value_val || '11-Jul-2026';
+    // Business date via centralised service
+    const businessDate = await BusinessDateService.getBusinessDate(connection);
 
     // Insert cash log transaction if there's any transaction amount
     if (parsedBalancePaid !== 0) {
@@ -130,12 +132,24 @@ export const checkOut = async (req, res) => {
     }
 
     // Update booking status to Checked Out
-    const finalPaymentStatus = (activeBooking.advance_amount + parsedBalancePaid >= activeBooking.total_amount) ? 'Paid' : 'Partial';
+    // Payment is always 'Paid' — receptionist collects all dues before pressing Settle & Check Out.
+    const totalCollected = (activeBooking.advance_amount || 0) + parsedBalancePaid;
     await connection.query(
-      `UPDATE bookings 
-       SET booking_status = 'Checked Out', payment_status = ?, check_out_date = ?
+      `UPDATE bookings
+       SET booking_status = 'Checked Out', payment_status = 'Paid',
+           total_amount = ?, check_out_date = ?
        WHERE id = ?`,
-      [finalPaymentStatus, businessDate, activeBooking.id]
+      [totalCollected, businessDate, activeBooking.id]
+    );
+
+    // Create invoice with balance_due = 0 (Paid in full)
+    const invoiceNumber = `INV-${businessDate.replace(/-/g, '')}-${String(activeBooking.id).padStart(4, '0')}`;
+    await connection.query(
+      `INSERT INTO invoices
+         (invoice_number, booking_id, total_amount, paid_amount, balance_due, status, business_date)
+       VALUES (?, ?, ?, ?, 0, 'Paid', ?)
+       ON DUPLICATE KEY UPDATE paid_amount = VALUES(paid_amount), balance_due = 0, status = 'Paid'`,
+      [invoiceNumber, activeBooking.id, totalCollected, totalCollected, businessDate]
     );
 
     // Update Room Status History
@@ -163,7 +177,7 @@ export const checkOut = async (req, res) => {
       `INSERT INTO booking_history (booking_id, action, old_room_id, new_room_id, changed_by, business_date, notes)
        VALUES (?, 'CHECKED_OUT', ?, ?, ?, ?, ?)`,
       [activeBooking.id, room.id, room.id, resolvedUserId, businessDate,
-       `Checkout settled. Balance paid: ₹${parsedBalancePaid}. Payment status: ${finalPaymentStatus}.`]
+       `Checkout settled. Total collected: ₹${totalCollected}. Payment status: Paid.`]
     );
 
     // Notify the guest about checkout completion and request feedback
@@ -188,6 +202,25 @@ export const checkOut = async (req, res) => {
        SET value_val = CAST(CAST(value_val AS UNSIGNED) + 1 AS CHAR)
        WHERE key_name = 'today_checkouts'`
     );
+
+    // ── Phase 1: Snapshot capture (immediately before commit) ─────────────────
+    // Stores an immutable copy of all checkout state for future Undo support.
+    // A snapshot failure is caught inside createSnapshot() — checkout proceeds.
+    const [ledgerItemsForSnapshot] = await connection.query(
+      'SELECT * FROM ledger_items WHERE booking_id = ? ORDER BY id ASC',
+      [activeBooking.id]
+    );
+    await CheckoutRecoveryService.createSnapshot(connection, {
+      bookingId:      activeBooking.id,
+      roomId:         room.id,
+      guestId:        activeBooking.guest_id,
+      userId:         resolvedUserId,
+      room,
+      booking:        activeBooking,
+      ledgerItems:    ledgerItemsForSnapshot,
+      totalCollected,
+      businessDate,
+    });
 
     await connection.commit();
     res.json({ message: `Successfully checked out Room ${number}` });
@@ -216,12 +249,11 @@ export const clean = async (req, res) => {
     return res.status(400).json({ error: 'Room number is required' });
   }
 
-  // Obtain operator user id
   const operatorId = req.user?.id || null;
 
   try {
     const [roomRows] = await pool.query(`
-      SELECT r.id, r.status
+      SELECT r.id, r.status, r.housekeeping_status
       FROM rooms r
       JOIN room_types rt ON r.room_type_id = rt.id
       WHERE r.number = ?
@@ -231,32 +263,43 @@ export const clean = async (req, res) => {
     }
 
     const room = roomRows[0];
-    if (room.status !== 'dirty') {
+
+    // Room is dirty if rooms.status = 'dirty' OR housekeeping_status = 'Dirty'
+    const isDirtyByStatus = room.status === 'dirty';
+    const isDirtyByHK     = room.housekeeping_status === 'Dirty';
+
+    if (!isDirtyByStatus && !isDirtyByHK) {
       return res.status(400).json({ error: `Room ${number} is not dirty` });
     }
 
-    // Get current business date
-    const [settings] = await pool.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
-    const businessDate = settings[0]?.value_val || '11-Jul-2026';
+    const businessDate = await BusinessDateService.getBusinessDate(pool);
 
-    // Log Room Status History
-    await pool.query(
-      `INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date)
-       VALUES (?, 'dirty', 'vacant', ?, ?)`,
-      [room.id, operatorId, businessDate]
-    );
+    if (isDirtyByStatus) {
+      await pool.query(
+        `INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date)
+         VALUES (?, 'dirty', 'vacant', ?, ?)`,
+        [room.id, operatorId, businessDate]
+      );
+    }
 
-    // Insert Audit Log entry
     await pool.query(
       `INSERT INTO audit_logs (user_id, action, details, business_date)
        VALUES (?, 'CLEAN_ROOM', ?, ?)`,
-      [operatorId, `Marked Room ${number} as Clean and vacant.`, businessDate]
+      [operatorId, `Marked Room ${number} as Clean and vacant. (status=${room.status}, hk=${room.housekeeping_status})`, businessDate]
     );
 
-    await pool.query(
-      `UPDATE rooms SET status = 'vacant', housekeeping_status = 'Clean', housekeeping_priority = 'Normal', last_cleaned_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [room.id]
-    );
+    // Reset BOTH columns atomically
+    if (isDirtyByStatus) {
+      await pool.query(
+        `UPDATE rooms SET status = 'vacant', housekeeping_status = 'Clean', housekeeping_priority = 'Normal', last_cleaned_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [room.id]
+      );
+    } else {
+      await pool.query(
+        `UPDATE rooms SET housekeeping_status = 'Clean', housekeeping_priority = 'Normal', last_cleaned_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [room.id]
+      );
+    }
 
     res.json({ message: `Room ${number} marked as CLEAN and vacant` });
   } catch (error) {
@@ -366,14 +409,17 @@ export const shift = async (req, res) => {
     }
     const targetRoom = toRooms[0];
 
-    // Ensure target room has no active bookings (strict 1-to-1)
-    const [targetActiveBookings] = await connection.query(
-      "SELECT id FROM bookings WHERE room_id = ? AND booking_status IN ('Reserved', 'Checked In') LIMIT 1",
-      [targetRoom.id]
-    );
-    if (targetActiveBookings.length > 0) {
+    // Validate target room availability using AvailabilityService
+    const avail = await AvailabilityService.checkRoomAvailability(connection, {
+      roomId: targetRoom.id,
+      roomNumber: toRoomNumber,
+      arrivalDate: businessDate,
+      departureDate: businessDate,
+      forUpdate: true
+    });
+    if (!avail.available && avail.code !== 'ROOM_OCCUPIED_BOOKING') {
       await connection.rollback();
-      return res.status(400).json({ error: `Target Room ${toRoomNumber} already has an active reservation. Cannot shift here.` });
+      return res.status(400).json({ error: `Target Room ${toRoomNumber} is not available for shift: ${avail.reason}` });
     }
 
     // Find the active check-in booking
@@ -414,17 +460,12 @@ export const shift = async (req, res) => {
       [toRoomNumber, booking.id]
     );
 
-    // Insert target room's tariff and taxes for the current business date
+    // Insert target room's tariff for the current business date (GST included in rate)
     const targetTariff = targetRoom.rate;
-    const targetTaxes = Math.round(targetTariff * 0.05);
 
     await connection.query(
       'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-      [toRoomNumber, `Room Tariff (${targetRoom.type})`, targetTariff, businessDate, booking.id]
-    );
-    await connection.query(
-      'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-      [toRoomNumber, 'Taxes & GST (5%)', targetTaxes, businessDate, booking.id]
+      [toRoomNumber, `Room Tariff — ${targetRoom.type} (Incl. GST)`, targetTariff, businessDate, booking.id]
     );
 
     // Log Room Status History for source room
@@ -600,25 +641,21 @@ export const bookRoom = async (req, res) => {
     const newCheckIn = checkInDate ? new Date(checkInDate) : new Date();
     const newCheckOut = checkOutDate ? new Date(checkOutDate) : null;
 
-    // Block if room is 'occupied' (guest physically present) or 'dirty' / 'inactive'
-    if (room.status === 'occupied' || room.status === 'dirty' || room.status === 'inactive') {
-      await connection.rollback();
-      return res.status(400).json({ error: `Room ${number} is currently ${room.status} and cannot be booked` });
-    }
+    // Unified availability validation via AvailabilityService
+    const checkInStr = checkInDate || (await BusinessDateService.getBusinessDate(connection));
+    const checkOutStr = checkOutDate || checkInStr;
+    const availResult = await AvailabilityService.checkRoomAvailability(connection, {
+      roomId: room.id,
+      roomNumber: number,
+      arrivalDate: checkInStr,
+      departureDate: checkOutStr,
+      forUpdate: true
+    });
 
-    // Strict 1-to-1 Mapping: A room must never have more than one active booking.
-    const [conflictRows] = await connection.query(`
-      SELECT booking_status
-      FROM bookings
-      WHERE room_id = ?
-        AND booking_status IN ('Reserved', 'Checked In')
-      LIMIT 1
-    `, [room.id]);
-
-    if (conflictRows.length > 0) {
+    if (!availResult.available) {
       await connection.rollback();
-      return res.status(400).json({ 
-        error: `Room ${number} already has an active reservation (${conflictRows[0].booking_status}). Please choose another room.` 
+      return res.status(400).json({
+        error: `Room ${number} cannot be booked: ${availResult.reason}`
       });
     }
 
@@ -708,9 +745,9 @@ export const bookRoom = async (req, res) => {
       }
     }
 
-    const netTariffAmount = tariffAmount; 
-    const taxesAmount = Math.round((netTariffAmount - loyaltyDiscountAmount + servicesTotal) * 0.05);
-    const bookingTotal = (netTariffAmount - loyaltyDiscountAmount) + taxesAmount + servicesTotal;
+    const netTariffAmount = tariffAmount;
+    // GST is included in the room rate — no separate tax line
+    const bookingTotal = (netTariffAmount - loyaltyDiscountAmount) + servicesTotal;
 
     // Create Reserved Booking
     const bookingNumber = 'BKG-' + Math.floor(100000 + Math.random() * 900000);
@@ -725,7 +762,7 @@ export const bookRoom = async (req, res) => {
     // Add initial ledger entries (Room Tariff Charge, Services, and Taxes)
     await connection.query(
       'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-      [number, 'Room Tariff Charge', tariffAmount, businessDate, bookingId]
+      [number, 'Room Tariff (Incl. GST)', tariffAmount, businessDate, bookingId]
     );
 
     // Add negative loyalty discount ledger item if any
@@ -744,10 +781,7 @@ export const bookRoom = async (req, res) => {
       );
     }
 
-    await connection.query(
-      'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-      [number, 'Taxes & GST (5%)', taxesAmount, businessDate, bookingId]
-    );
+    // (GST included in rate — no separate tax line)
 
     // Add extra guests as zero-charge ledger items to folio
     if (extraGuests && Array.isArray(extraGuests)) {
@@ -1166,18 +1200,17 @@ export const guestExtendStay = async (req, res) => {
 
     console.log(`[ExtendStay] Request received for Booking ${booking.id} to new checkout date ${newCheckOutDate}`);
 
-    // Verify room availability for the extension period
-    const [conflicts] = await connection.query(`
-      SELECT id FROM bookings 
-      WHERE room_id = ? 
-        AND id != ?
-        AND booking_status IN ('Confirmed', 'Checked In')
-        AND check_in_date < ? 
-        AND expected_check_out_date > ?
-    `, [booking.room_id, booking.id, newCheckOutDate, booking.expected_check_out_date]);
+    // Verify room availability for the extension period using AvailabilityService
+    const availResult = await AvailabilityService.checkRoomAvailability(connection, {
+      roomId: booking.room_id,
+      roomNumber: booking.room_number,
+      arrivalDate: booking.expected_check_out_date,
+      departureDate: newCheckOutDate,
+      forUpdate: true
+    });
 
-    if (conflicts.length > 0) {
-      console.log(`[ExtendStay] Conflict found for Room ${booking.room_id}. Request rejected.`);
+    if (!availResult.available) {
+      console.log(`[ExtendStay] Conflict found for Room ${booking.room_id}. Request rejected: ${availResult.reason}`);
       await connection.rollback();
       return res.status(400).json({ error: 'Sorry, this room is already booked for the requested extension period.' });
     }
@@ -1833,8 +1866,18 @@ export const adminExtendStay = async (req, res) => {
     }
     const booking = bookingRows[0];
 
-    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
-    const businessDate = settings[0]?.value_val || '11-Jul-2026';
+    // Verify availability for extension period using AvailabilityService
+    const availResult = await AvailabilityService.checkRoomAvailability(connection, {
+      roomId: room.id,
+      roomNumber: number,
+      arrivalDate: booking.expected_check_out_date,
+      departureDate: newCheckOutDate,
+      forUpdate: true
+    });
+    if (!availResult.available) {
+      await connection.rollback();
+      return res.status(400).json({ error: `Cannot extend stay: ${availResult.reason}` });
+    }
 
     // Extend booking checkout date
     await connection.query(
@@ -1842,16 +1885,11 @@ export const adminExtendStay = async (req, res) => {
       [newCheckOutDate, booking.id]
     );
 
-    // Post additional tariff + tax for the extension
+    // Post additional tariff for the extension (GST included in rate)
     const tariff = room.rate;
-    const taxes  = Math.round(tariff * 0.05);
     await connection.query(
       'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-      [number, `Stay Extension — Additional Night Tariff`, tariff, businessDate, booking.id]
-    );
-    await connection.query(
-      'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-      [number, 'Taxes & GST (5%)', taxes, businessDate, booking.id]
+      [number, `Stay Extension — Additional Night Tariff (Incl. GST)`, tariff, businessDate, booking.id]
     );
 
     await connection.query(

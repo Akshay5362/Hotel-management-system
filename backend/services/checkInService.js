@@ -1,4 +1,5 @@
 import { formatTime } from '../utils/dateUtils.js';
+import { BusinessDateService } from './businessDateService.js';
 
 export const processCheckIn = async (connection, {
   roomNumber,
@@ -21,8 +22,7 @@ export const processCheckIn = async (connection, {
   departureDate = null
 }) => {
   // 1. Get Business Date
-  const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
-  const businessDate = settings[0]?.value_val;
+  const businessDate = await BusinessDateService.getBusinessDate(connection);
   if (!businessDate) throw new Error('System configuration error: Business Date is missing.');
 
   const actualCheckInDate = checkInDate || businessDate;
@@ -42,14 +42,32 @@ export const processCheckIn = async (connection, {
   const room = roomRows[0];
 
   if (room.status === 'occupied') {
-    throw { status: 400, message: `Room ${roomNumber} is already occupied (Already Checked-In).`, code: 'ALREADY_CHECKED_IN' };
+    // Verify a real active 'Checked In' booking backs this status.
+    // If none exists (ghost/orphaned status from a failed or missed checkout),
+    // auto-correct the room to vacant and allow the new check-in to proceed.
+    const [activeCheckedIn] = await connection.query(
+      `SELECT id FROM bookings
+       WHERE room_id = ? AND booking_status = 'Checked In' LIMIT 1`,
+      [room.id]
+    );
+    if (activeCheckedIn.length > 0) {
+      // Real occupied — block as expected
+      throw { status: 400, message: `Room ${roomNumber} is already occupied (Already Checked-In).`, code: 'ALREADY_CHECKED_IN' };
+    }
+    // Ghost status — auto-heal and continue
+    await connection.query(
+      `UPDATE rooms SET status = 'vacant' WHERE id = ?`,
+      [room.id]
+    );
+    room.status = 'vacant';
+    console.warn(`[checkInService] Auto-corrected ghost occupied status for Room ${roomNumber} (no active Checked In booking found).`);
   }
   if (room.status !== 'vacant' && room.status !== 'booked') {
     throw { status: 400, message: `Room ${roomNumber} is not vacant or booked. Current status: ${room.status}` };
   }
 
   // Dirty check
-  if (room.housekeeping_status === 'Dirty') {
+  if (room.status === 'dirty' || room.housekeeping_status === 'Dirty') {
     if (!manualOverride) {
       throw { status: 400, message: `Room ${roomNumber} has pending housekeeping (Dirty).`, code: 'ROOM_DIRTY' };
     }
@@ -135,17 +153,12 @@ export const processCheckIn = async (connection, {
     );
   }
 
-  // 7. Ledger Items
+  // 7. Ledger Items — GST is INCLUDED in the room rate (no separate tax line)
   const tariffAmount = room.rate || 0;
-  const taxesAmount = Math.round(tariffAmount * 0.05);
 
   await connection.query(
     "INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)",
-    [roomNumber, 'Room Tariff Charge', tariffAmount, businessDate, bookingId]
-  );
-  await connection.query(
-    "INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)",
-    [roomNumber, 'Taxes & GST (5%)', taxesAmount, businessDate, bookingId]
+    [roomNumber, 'Room Tariff (Incl. GST)', tariffAmount, businessDate, bookingId]
   );
 
   // 8. Payments & Cash Logs
