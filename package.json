@@ -11,19 +11,17 @@
   "type": "module",
   "main": "electron/main.js",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
+    "dev":     "vite",
+    "build":   "vite build",
     "preview": "vite preview",
 
     "backend:dev": "cd backend && node server.js",
 
-    "electron:start": "cross-env NODE_ENV=development electron .",
-    "electron:local": "cross-env NODE_ENV=development electron .",
-    "electron:wait":  "wait-on http://localhost:5173 http://localhost:5000/api/health --timeout 60000 && npm run electron:start",
-    "electron:dev":   "concurrently --kill-others --names \"VITE,BACKEND,ELECTRON\" --prefix-colors \"cyan.bold,yellow.bold,magenta.bold\" --prefix \"[{name}]\" \"npm run dev\" \"npm run backend:dev\" \"npm run electron:wait\"",
-
-    "electron:prod":  "npm run build && cross-env NODE_ENV=production electron .",
-    "electron:build": "npm run build && electron-builder --win"
+    "electron:local":      "wait-on http://localhost:5173 http://localhost:5000/api/health --timeout 60000 && cross-env ELECTRON_MODE=local NODE_ENV=development electron .",
+    "electron:docker-dev": "wait-on http://localhost:5173 http://localhost:5000/api/health --timeout 120000 && cross-env ELECTRON_MODE=docker-dev NODE_ENV=development electron .",
+    "electron:docker":     "wait-on http://localhost:5000/api/health --timeout 120000 && cross-env ELECTRON_MODE=docker NODE_ENV=development electron .",
+    "electron:prod":       "npm run build && cross-env ELECTRON_MODE=production NODE_ENV=production electron .",
+    "electron:build":      "npm run build && electron-builder --win"
   },
   "build": {
     "appId": "com.webline.pms",

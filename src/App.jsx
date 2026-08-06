@@ -421,8 +421,19 @@ function AppContent() {
       if (adminToken) fetchRequestCount();
     };
 
+    // Factory Reset auto-refresh — reloads all rooms, counters and data
+    // immediately after a successful factory reset without restarting Electron.
+    const handleFactoryReset = () => {
+      fetchStatus();
+      if (adminToken) fetchRequestCount();
+    };
+
     window.addEventListener('businessDateChanged', handleDateChange);
-    return () => window.removeEventListener('businessDateChanged', handleDateChange);
+    window.addEventListener('factoryResetComplete', handleFactoryReset);
+    return () => {
+      window.removeEventListener('businessDateChanged', handleDateChange);
+      window.removeEventListener('factoryResetComplete', handleFactoryReset);
+    };
   }, [adminToken, guestToken, fetchStatus, fetchRequestCount]);
 
   // Clock runner

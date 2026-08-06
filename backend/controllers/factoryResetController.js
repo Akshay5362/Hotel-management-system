@@ -1,101 +1,78 @@
 import { FactoryResetService } from '../services/FactoryResetService.js';
 
-// ─── Single canonical logger action ────────────────────────────────────────────
-const ACTION = 'FACTORY_RESET_REQUEST';
+// ─── Canonical required confirmation phrase ────────────────────────────────────
+const REQUIRED_PHRASE = 'RESET HOTEL DATA';
 
-/**
- * Emits a structured, multi-line log entry for every Factory Reset API call.
- * Records all Phase 1 invariants explicitly so terminal output is unambiguous.
- *
- * @param {import('express').Request} req
- * @param {number} httpStatus   - The HTTP status code being returned.
- * @returns {string}            - The unique requestId for correlation.
- */
-function logFactoryResetRequest(req, httpStatus) {
+// ─── Logger ───────────────────────────────────────────────────────────────────
+function logRequest(req, httpStatus, extra = {}) {
   const requestId = `req_fr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-
-  const entry = {
-    action     : ACTION,
-    requestId,
-    userId     : req.user?.id   || null,
-    role       : req.user?.role || null,
-    ip         : req.ip || req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '127.0.0.1',
-    route      : req.originalUrl || req.url,
-    timestamp  : new Date().toISOString(),
-    // ── Phase 1 invariants (explicit) ──────────────────────────────────────
-    phase      : 1,
-    sqlExecuted: false,
-    txStarted  : false,
-    fsModified : false,
-    httpStatus,
-  };
-
   console.log(
     `\n[FactoryReset]\n` +
-    `  Action     : ${entry.action}\n` +
-    `  RequestID  : ${entry.requestId}\n` +
-    `  User       : ${entry.userId ?? 'anonymous'} (${entry.role ?? 'none'})\n` +
-    `  IP         : ${entry.ip}\n` +
-    `  Route      : ${entry.route}\n` +
-    `  Timestamp  : ${entry.timestamp}\n` +
-    `  Phase      : ${entry.phase}\n` +
-    `  Database   : untouched  (SQL executed: ${entry.sqlExecuted}, transaction: ${entry.txStarted})\n` +
-    `  Filesystem : untouched  (modified: ${entry.fsModified})\n` +
-    `  Response   : HTTP ${entry.httpStatus}\n`
+    `  RequestID  : ${requestId}\n` +
+    `  User       : ${req.user?.id ?? 'anonymous'} (${req.user?.role ?? 'none'})\n` +
+    `  IP         : ${req.ip || req.headers['x-forwarded-for'] || '127.0.0.1'}\n` +
+    `  Route      : ${req.originalUrl || req.url}\n` +
+    `  Timestamp  : ${new Date().toISOString()}\n` +
+    `  HTTP       : ${httpStatus}\n` +
+    `  ${Object.entries(extra).map(([k, v]) => `${k}: ${v}`).join('\n  ')}\n`
   );
-
   return requestId;
 }
 
-// ─── Controllers ───────────────────────────────────────────────────────────────
-
-/**
- * GET /api/system/factory-reset/status
- * Returns Phase 1 readiness status. No SQL or FS changes.
- */
+// ─── GET /api/system/factory-reset/status ─────────────────────────────────────
+// Returns a preflight read-only check of current record counts.
 export const getFactoryResetStatus = async (req, res) => {
-  logFactoryResetRequest(req, 200);
+  logRequest(req, 200, { action: 'STATUS' });
   try {
     const statusData = await FactoryResetService.verifyReset();
     return res.status(200).json({
-      success  : true,
-      action   : ACTION,
-      status   : 'Phase 1 - Architecture Ready',
-      message  : 'Factory Reset service is initialized. Phase 2 implementation required for operational reset.',
-      phase    : 1,
-      database : 'untouched',
-      filesystem: 'untouched',
+      success:    true,
+      status:     'Ready',
+      message:    'Factory Reset service is operational. All systems ready.',
       validation: statusData,
     });
   } catch (error) {
-    return res.status(500).json({ success: false, action: ACTION, error: error.message });
+    return res.status(500).json({ success: false, error: error.message });
   }
 };
 
-/**
- * POST /api/system/factory-reset
- * Phase 1 placeholder. Always returns HTTP 501 Not Implemented.
- * No SQL, no transaction, no filesystem modification occurs.
- */
+// ─── POST /api/system/factory-reset ───────────────────────────────────────────
+// Executes the full factory reset.
+// Body: { confirmationPhrase: "RESET HOTEL DATA" }
 export const factoryReset = async (req, res) => {
-  logFactoryResetRequest(req, 501);
+  const { confirmationPhrase } = req.body || {};
 
-  // Phase 1: call verifyReset() (read-only validation only) then return 501.
-  // Do NOT call factoryReset() or any destructive method.
-  try {
-    await FactoryResetService.verifyReset();
-  } catch (_) {
-    // verifyReset is read-only and should never throw in Phase 1,
-    // but guard defensively so the 501 is still returned cleanly.
+  // ── 1. Confirmation phrase validation ────────────────────────────────────────
+  if (!confirmationPhrase || confirmationPhrase.trim() !== REQUIRED_PHRASE) {
+    logRequest(req, 400, { action: 'REJECTED', reason: 'Wrong or missing confirmation phrase' });
+    return res.status(400).json({
+      success: false,
+      error:   `Confirmation phrase incorrect. You must type exactly: ${REQUIRED_PHRASE}`,
+    });
   }
 
-  return res.status(501).json({
-    success    : false,
-    action     : ACTION,
-    message    : 'Factory Reset is not implemented yet. Phase 2 required.',
-    phase      : 1,
-    sqlExecuted: false,
-    txStarted  : false,
-    fsModified : false,
+  logRequest(req, 202, {
+    action:   'EXECUTING',
+    operator: req.user?.id,
+    phrase:   confirmationPhrase,
   });
+
+  try {
+    const result = await FactoryResetService.factoryReset();
+
+    logRequest(req, 200, {
+      action:     'COMPLETED',
+      executionMs: result.summary.executionMs,
+      guests:     result.summary.guestsDeleted,
+      bookings:   result.summary.bookingsDeleted,
+    });
+
+    return res.status(200).json(result);
+  } catch (error) {
+    logRequest(req, 500, { action: 'FAILED', error: error.message });
+    return res.status(500).json({
+      success: false,
+      error:   error.message,
+    });
+  }
 };

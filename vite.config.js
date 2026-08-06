@@ -11,6 +11,7 @@ export default defineConfig({
   },
   server: {
     port: 5173,
-    host: true
+    strictPort: true,   // FAIL immediately if :5173 is occupied — never drift to 5174
+    host: true,
   }
 });

@@ -115,6 +115,20 @@ process.on('exit', (code) => {
 const isDev = !app.isPackaged;
 L('ENV', `isDev = ${isDev}  (based on app.isPackaged)`);
 
+// ─── Startup mode (electron/config.js is the source of truth) ────────────────
+// Injected by npm scripts via cross-env. Falls back sensibly when not set.
+//  local        npm run electron:local      → Vite :5173 + local backend
+//  docker-dev   npm run electron:docker-dev → Vite :5173 + Docker backend
+//  docker       npm run electron:docker     → dist/ + Docker backend
+//  production   installer (app.isPackaged)  → dist/ + spawns packaged backend
+const ELECTRON_MODE  = process.env.ELECTRON_MODE || (app.isPackaged ? 'production' : 'local');
+const USES_VITE      = ELECTRON_MODE === 'local' || ELECTRON_MODE === 'docker-dev';
+const SPAWNS_BACKEND = ELECTRON_MODE === 'production' || app.isPackaged;
+
+L('ENV', `ELECTRON_MODE  = ${ELECTRON_MODE}`);
+L('ENV', `USES_VITE      = ${USES_VITE}   (true → load http://localhost:5173)`);
+L('ENV', `SPAWNS_BACKEND = ${SPAWNS_BACKEND}  (true → spawn packaged backend/server.js)`);
+
 // ─── Path placeholders ────────────────────────────────────────────────────────
 const DEV_URL = 'http://localhost:5173';
 let PRELOAD_PATH, SPLASH_PATH, PROD_ENTRY;
@@ -209,7 +223,8 @@ if (ENABLE_LOCK) {
 app.on('before-quit', () => {
   L('QUIT', 'before-quit fired');
   if (killBackend) {
-    try { if (!isDev) killBackend(); } catch (e) { LERR('QUIT', 'killBackend failed', e); }
+    // Only kill the backend Electron itself spawned (production installer only)
+    try { if (SPAWNS_BACKEND) killBackend(); } catch (e) { LERR('QUIT', 'killBackend failed', e); }
   }
 });
 
@@ -379,7 +394,9 @@ function createWindow() {
   });
 
   mainWindow.webContents.on('will-navigate', (event, navUrl) => {
-    let allowed = isDev
+    // USES_VITE modes (local/docker-dev) navigate within the Vite dev server;
+    // docker/production modes navigate within the dist/ file:// origin.
+    let allowed = USES_VITE
       ? (navUrl.startsWith(DEV_URL) || navUrl.startsWith('http://localhost:5000'))
       : (() => {
           const prodDir = path.dirname(PROD_ENTRY).replace(/\\/g, '/');
@@ -401,16 +418,16 @@ function createWindow() {
 function loadApp(retryCount = 0) {
   const MAX_RETRIES = 3;
 
-  if (isDev) {
-    L('LOAD', `loadURL → ${DEV_URL}  (attempt ${retryCount + 1})`);
+  if (USES_VITE) {
+    L('LOAD', `loadURL → ${DEV_URL}  (attempt ${retryCount + 1})  [mode: ${ELECTRON_MODE}]`);
   } else {
     const exists = fs.existsSync(PROD_ENTRY);
-    L('LOAD', `loadFile → ${PROD_ENTRY}  (attempt ${retryCount + 1})`);
+    L('LOAD', `loadFile → ${PROD_ENTRY}  (attempt ${retryCount + 1})  [mode: ${ELECTRON_MODE}]`);
     L('LOAD', `  file exists: ${exists}`);
-    if (!exists) L('LOAD', 'CRITICAL: index.html missing — loadFile will fail!');
+    if (!exists) L('LOAD', `CRITICAL: dist/index.html missing — run "npm run build" first! [mode: ${ELECTRON_MODE}]`);
   }
 
-  const p = isDev ? mainWindow.loadURL(DEV_URL) : mainWindow.loadFile(PROD_ENTRY);
+  const p = USES_VITE ? mainWindow.loadURL(DEV_URL) : mainWindow.loadFile(PROD_ENTRY);
   p.then(() => L('LOAD', `loadFile/loadURL resolved OK (attempt ${retryCount + 1})`))
    .catch((err) => {
      LERR('LOAD', `Load failed (attempt ${retryCount + 1})`, err);
@@ -521,9 +538,14 @@ app.whenReady().then(async () => {
 
   try { createSplashWindow(); } catch (e) { LERR('SPLASH', 'createSplashWindow threw', e); }
 
-  if (!isDev) {
-    // ── PRODUCTION ────────────────────────────────────────────────────────────
-    L('BACKEND', 'Production mode — launching backend');
+  // ── Mode-specific startup — reads ELECTRON_MODE constants set at top of file ─
+  L('MODE', `Startup mode: ${ELECTRON_MODE}  USES_VITE=${USES_VITE}  SPAWNS_BACKEND=${SPAWNS_BACKEND}`);
+
+  if (SPAWNS_BACKEND) {
+    // ── PRODUCTION INSTALLER: spawn packaged backend, wait for health ─────────
+    // ONLY executes when app.isPackaged=true or ELECTRON_MODE=production.
+    // Development modes (local/docker-dev/docker) NEVER reach this branch.
+    L('BACKEND', 'Production mode — launching packaged backend from extraResources');
     try {
       const backendRoot = app.isPackaged ? process.resourcesPath : path.join(APP_ROOT, '..');
       const serverPath  = path.join(backendRoot, 'backend', 'server.js');
@@ -545,7 +567,7 @@ app.whenReady().then(async () => {
         L('BACKEND', 'waitForBackend not available — skipping health check');
       }
     } catch (err) {
-      LERR('BACKEND', 'Backend startup failed', err);
+      LERR('BACKEND', 'Packaged backend startup failed', err);
       closeSplash();
       try {
         const { response } = await dialog.showMessageBox({
@@ -558,11 +580,65 @@ app.whenReady().then(async () => {
         L('BACKEND', 'User chose "Continue anyway" despite backend failure');
       } catch (de) { LERR('BACKEND', 'dialog.showMessageBox threw', de); }
     }
+
+  } else if (USES_VITE) {
+    // ── LOCAL / DOCKER-DEV: Vite dev server + external backend ───────────────
+    // wait-on in the npm script guarantees both are up before Electron starts.
+    // These checks are a quick internal re-verification with friendly dialogs.
+    L('VITE', `[${ELECTRON_MODE}] Verifying Vite on :5173...`);
+    try {
+      await waitForPort(5173, 15000);
+      L('VITE', 'Vite :5173 confirmed ✓');
+    } catch (err) {
+      L('VITE', `Vite :5173 not reachable: ${err.message} — continuing (wait-on should have caught this)`);
+    }
+
+    L('BACKEND', `[${ELECTRON_MODE}] Verifying backend health on :5000...`);
+    if (waitForBackend) {
+      try {
+        await waitForBackend(5000, 15000);
+        L('BACKEND', 'Backend :5000 health confirmed ✓');
+      } catch (err) {
+        LERR('BACKEND', 'External backend health check failed', err);
+        closeSplash();
+        const hint = ELECTRON_MODE === 'local'
+          ? 'Run "npm run backend:dev" in a separate terminal first.'
+          : 'Run "docker compose up -d" and wait for the backend container to be healthy.';
+        try {
+          const { response } = await dialog.showMessageBox({
+            type: 'error', title: 'Backend Unavailable',
+            message: `Backend not reachable on localhost:5000\n\nMode: ${ELECTRON_MODE}`,
+            detail: `${hint}\n\nError: ${err.message}\nLog: ${LOG_FILE}`,
+            buttons: ['Continue anyway', 'Exit'],
+          });
+          if (response === 1) { app.quit(); return; }
+        } catch (de) { LERR('BACKEND', 'dialog threw', de); }
+      }
+    }
+
   } else {
-    // ── DEVELOPMENT ───────────────────────────────────────────────────────────
-    L('VITE', 'Dev mode — waiting for Vite on port 5173');
-    try { await waitForPort(5173, 60000); }
-    catch (err) { L('VITE', `Vite not ready: ${err.message} — continuing anyway`); }
+    // ── DOCKER (production testing): no Vite, no backend spawn ───────────────
+    // wait-on in the npm script already confirmed backend health on :5000.
+    // dist/index.html must exist (run "npm run build" first).
+    L('BACKEND', `[${ELECTRON_MODE}] Verifying Docker backend health on :5000...`);
+    if (waitForBackend) {
+      try {
+        await waitForBackend(5000, 15000);
+        L('BACKEND', 'Docker backend :5000 health confirmed ✓');
+      } catch (err) {
+        LERR('BACKEND', 'Docker backend health check failed', err);
+        closeSplash();
+        try {
+          const { response } = await dialog.showMessageBox({
+            type: 'error', title: 'Docker Backend Unavailable',
+            message: 'Docker backend not reachable on localhost:5000',
+            detail: 'Run "docker compose up -d" and wait for the backend\ncontainer healthcheck to pass, then retry electron:docker.\n\nError: ' + err.message,
+            buttons: ['Continue anyway', 'Exit'],
+          });
+          if (response === 1) { app.quit(); return; }
+        } catch (de) { LERR('BACKEND', 'dialog threw', de); }
+      }
+    }
   }
 
   L('WINDOW', 'Calling createWindow()');

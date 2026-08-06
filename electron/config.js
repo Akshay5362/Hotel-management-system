@@ -1,74 +1,84 @@
 /**
  * electron/config.js
  * ─────────────────────────────────────────────────────────────────────────────
- * SINGLE SOURCE OF TRUTH for all Electron configuration.
+ * SINGLE SOURCE OF TRUTH for all Electron startup configuration.
  *
- * PURPOSE:
- *   Centralise every configurable value so that main.js and preload.js
- *   never contain hardcoded strings. Changing the dev port, window size,
- *   or app title only requires editing this one file.
+ * Every startup path reads ONLY from here — no duplicated URLs in main.js.
  *
- * USAGE:
- *   import config from './config.js';   (in main.js / preload.js)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * STARTUP MODES  (set by npm scripts via cross-env ELECTRON_MODE=...)
+ * ─────────────────────────────────────────────────────────────────────────────
  *
- * PRODUCTION vs DEVELOPMENT:
- *   Electron sets NODE_ENV = 'production' when packaged by electron-builder.
- *   In dev, you start Electron manually so NODE_ENV = 'development' (default).
+ *  local        npm run electron:local
+ *               Requires: npm run dev  +  npm run backend:dev
+ *               Loads:    http://localhost:5173  (Vite dev server)
+ *               Backend:  EXTERNAL — Electron NEVER spawns it
+ *
+ *  docker-dev   npm run electron:docker-dev
+ *               Requires: docker compose up -d  +  npm run dev
+ *               Loads:    http://localhost:5173  (Vite dev server)
+ *               Backend:  DOCKER — Electron NEVER spawns it
+ *
+ *  docker       npm run electron:docker
+ *               Requires: docker compose up -d  +  npm run build
+ *               Loads:    dist/index.html  (production build)
+ *               Backend:  DOCKER — Electron NEVER spawns it
+ *
+ *  production   electron-builder installer  (app.isPackaged = true)
+ *               Loads:    dist/index.html  (bundled in asar)
+ *               Backend:  SPAWNED by Electron from extraResources/backend/
+ *
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+// ─── Mode detection ───────────────────────────────────────────────────────────
+// Value is injected by npm scripts via cross-env. Never hardcoded at runtime.
+const ELECTRON_MODE = process.env.ELECTRON_MODE || 'local';
 
-// Resolve __dirname for ES Module context (Electron main process uses CommonJS,
-// but we keep this ready for the hybrid approach used in main.js).
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = dirname(__filename);
+export const MODES = Object.freeze({
+  LOCAL:      'local',
+  DOCKER_DEV: 'docker-dev',
+  DOCKER:     'docker',
+  PRODUCTION: 'production',
+});
 
-const isDev = process.env.NODE_ENV !== 'production';
+// ─── Derived flags ────────────────────────────────────────────────────────────
+
+/**
+ * true  → Electron loads http://localhost:5173 (Vite dev server must be running)
+ * false → Electron loads dist/index.html       (production build must exist)
+ */
+export const USES_VITE = ELECTRON_MODE === MODES.LOCAL || ELECTRON_MODE === MODES.DOCKER_DEV;
+
+/**
+ * true  → Electron spawns backend/server.js from extraResources (packaged installer only)
+ * false → Backend is external (local process or Docker) — Electron NEVER spawns it
+ *
+ * Development modes MUST NEVER set this to true.
+ */
+export const SPAWNS_BACKEND = ELECTRON_MODE === MODES.PRODUCTION;
+
+// ─── URL constants ────────────────────────────────────────────────────────────
+
+/** Vite dev server — fixed to :5173 with strictPort, never drifts */
+export const VITE_URL = 'http://localhost:5173';
+
+/** Express backend API base URL — identical in every mode */
+export const API_BASE_URL = 'http://localhost:5000';
+
+/** Backend health check endpoint polled before window opens */
+export const HEALTH_URL = `${API_BASE_URL}/api/health`;
+
+// ─── Default export ───────────────────────────────────────────────────────────
 
 const config = {
-  // ── App Identity ─────────────────────────────────────────────────────────
-  appName    : 'Webline PMS Plus — Hotel Sky-5',
-  appVersion : '1.0.0',
-
-  // ── URLs ─────────────────────────────────────────────────────────────────
-  //   DEV:  Vite dev server (npm run dev → http://localhost:5173)
-  //   PROD: Built React files served from ./dist/index.html
-  devUrl     : 'http://localhost:5173',
-  prodEntry  : join(__dirname, '..', 'dist', 'index.html'),
-
-  // ── Window ───────────────────────────────────────────────────────────────
-  window: {
-    width          : 1400,
-    height         : 880,
-    minWidth       : 1024,
-    minHeight      : 700,
-    title          : 'Webline PMS Plus — Hotel Sky-5',
-    backgroundColor: '#0d1117',   // matches CSS --bg-primary so no white flash on load
-    show           : false,       // show AFTER content is ready (avoids blank-window flash)
-  },
-
-  // ── Security ─────────────────────────────────────────────────────────────
-  //   These values are spread into BrowserWindow.webPreferences in main.js.
-  //   DO NOT set nodeIntegration: true — it exposes the full Node.js API to
-  //   the renderer (React app), which is a critical security vulnerability.
-  webPreferences: {
-    contextIsolation  : true,   // renderer runs in isolated JS context
-    nodeIntegration   : false,  // renderer has NO access to Node.js modules
-    sandbox           : false,  // keep false so preload.js can use contextBridge
-    webSecurity       : true,   // enforce same-origin policy in renderer
-  },
-
-  // ── Backend API (the Node.js/Express server) ─────────────────────────────
-  //   React already calls this directly via fetch(); Electron does not proxy it.
-  //   This is documented here for reference only.
-  backendPort: 5000,
-  backendUrl : 'http://localhost:5000',
-
-  // ── Dev helper ───────────────────────────────────────────────────────────
-  isDev,
-  openDevTools: isDev,   // auto-open Chrome DevTools only in dev mode
+  ELECTRON_MODE,
+  MODES,
+  USES_VITE,
+  SPAWNS_BACKEND,
+  VITE_URL,
+  API_BASE_URL,
+  HEALTH_URL,
 };
 
 export default config;

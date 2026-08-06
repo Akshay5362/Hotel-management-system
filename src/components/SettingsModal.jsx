@@ -3,7 +3,7 @@ import {
   X, CalendarDays, Clock, Save, Info, AlertTriangle,
   Users, Bed, CheckSquare, Sparkles, RotateCcw, RefreshCw,
   ShieldAlert, Calendar, ArrowDown, ArrowUp, Loader2, CheckCircle2,
-  FlaskConical
+  FlaskConical, Trash2, DatabaseZap, CheckCircle
 } from 'lucide-react';
 import { AdminAuthContext } from '../contexts/AdminAuthContext';
 
@@ -71,7 +71,7 @@ function ConfirmDialog({ isOpen, title, message, onConfirm, onCancel, danger = f
   if (!isOpen) return null;
   return (
     <div style={{
-      position: 'fixed', inset: 0, zIndex: 9999,
+      position: 'fixed', inset: 0, zIndex: 20000,
       background: 'rgba(0,0,0,0.75)', display: 'flex',
       alignItems: 'center', justifyContent: 'center',
       backdropFilter: 'blur(4px)',
@@ -124,6 +124,9 @@ function ConfirmDialog({ isOpen, title, message, onConfirm, onCancel, danger = f
   );
 }
 
+// ─── REQUIRED_PHRASE constant (must match backend) ───────────────────────────
+const REQUIRED_PHRASE = 'RESET HOTEL DATA';
+
 // ─── Main Component ───────────────────────────────────────────────────────────
 export default function SettingsModal({ isOpen, onClose }) {
   const { adminToken, adminUser } = useContext(AdminAuthContext);
@@ -146,6 +149,12 @@ export default function SettingsModal({ isOpen, onClose }) {
 
   // Confirmation dialog state
   const [confirm, setConfirm] = useState({ open: false, title: '', message: '', handler: null, danger: false });
+
+  // ── Factory Reset state ────────────────────────────────────────────────────
+  const [frPhrase,   setFrPhrase]   = useState('');
+  const [frLoading,  setFrLoading]  = useState(false);
+  const [frError,    setFrError]    = useState('');
+  const [frSummary,  setFrSummary]  = useState(null);
 
   // ── Permission check: only 'admin' role that is NOT staff can modify ────────
   const isSuperAdmin = adminUser?.role === 'admin' && adminUser?.type !== 'staff';
@@ -336,6 +345,71 @@ export default function SettingsModal({ isOpen, onClose }) {
       handler: () => { setConfirm(c => ({ ...c, open: false })); callApi('reset_to_today'); },
     });
   };
+
+  // ── Factory Reset handler ──────────────────────────────────────────────────
+  const handleFactoryReset = useCallback(() => {
+    console.log('[FactoryReset] Factory Reset button clicked');
+    console.log('[FactoryReset] frPhrase:', JSON.stringify(frPhrase.trim()), '| REQUIRED:', JSON.stringify(REQUIRED_PHRASE));
+
+    if (frPhrase.trim() !== REQUIRED_PHRASE) {
+      console.warn('[FactoryReset] Phrase mismatch — returning early. Button should have been disabled.');
+      return;
+    }
+
+    console.log('[FactoryReset] Opening confirmation dialog');
+
+    const executeReset = async () => {
+      console.log('[FactoryReset] User confirmed factory reset');
+      setConfirm(c => ({ ...c, open: false }));
+      setFrLoading(true);
+      setFrError('');
+      setFrSummary(null);
+      try {
+        console.log('[FactoryReset] Sending POST /api/system/factory-reset');
+        const res = await fetch(`${API_BASE}/system/factory-reset`, {
+          method:  'POST',
+          headers: {
+            'Content-Type':  'application/json',
+            'Authorization': `Bearer ${adminToken}`,
+          },
+          body: JSON.stringify({ confirmationPhrase: frPhrase.trim() }),
+        });
+        const result = await res.json();
+        console.log('[FactoryReset] Response status:', res.status, '| Body:', result);
+        if (!res.ok) throw new Error(result.error || 'Factory reset failed');
+
+        setFrSummary(result.summary);
+        setFrPhrase('');
+
+        // ── Auto-refresh: dispatch event so App.jsx reloads all data ──────
+        window.dispatchEvent(new CustomEvent('factoryResetComplete'));
+      } catch (err) {
+        console.error('[FactoryReset] Error during reset:', err.message);
+        setFrError(err.message);
+      } finally {
+        setFrLoading(false);
+      }
+    };
+
+    setConfirm({
+      open:    true,
+      title:   '⚠️ FACTORY RESET — FINAL CONFIRMATION',
+      message:
+        `You are about to perform an IRREVERSIBLE factory reset.\n\n` +
+        `ALL of the following will be permanently deleted:\n` +
+        `  • All guest profiles and guest login accounts\n` +
+        `  • All bookings and check-ins\n` +
+        `  • All reservations\n` +
+        `  • All payments, invoices and cash logs\n` +
+        `  • All audit logs and notifications\n` +
+        `  • All uploaded identity documents (files on disk)\n` +
+        `  • All housekeeping and maintenance records\n\n` +
+        `PRESERVED: Admin users, staff, rooms, room types, hotel settings.\n\n` +
+        `This cannot be undone. Are you absolutely sure?`,
+      danger:  true,
+      handler: executeReset,
+    });
+  }, [frPhrase, adminToken]);
 
   if (!isOpen) return null;
 
@@ -637,7 +711,166 @@ export default function SettingsModal({ isOpen, onClose }) {
                     )}
                   </div>
                 )}
-              </div>
+
+              {/* ── Factory Reset Danger Zone ───────────────────────────── */}
+              {isSuperAdmin && (
+                <div style={{
+                  background: 'rgba(239,68,68,0.06)',
+                  padding: '20px', borderRadius: '10px',
+                  border: '1px solid rgba(239,68,68,0.35)',
+                  marginTop: '4px',
+                }}>
+
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: '8px',
+                    marginBottom: '8px',
+                  }}>
+                    <Trash2 size={16} color="#ef4444" />
+                    <h3 style={{
+                      margin: 0, color: '#ef4444', fontSize: '0.95rem',
+                      fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em',
+                    }}>Danger Zone — Factory Reset</h3>
+                  </div>
+
+                  <p style={{
+                    fontSize: '0.82rem', color: '#fca5a5',
+                    margin: '0 0 16px 0', lineHeight: 1.65,
+                  }}>
+                    Permanently deletes <strong>all guest data, bookings, payments, invoices,
+                    reservations, cash logs, audit logs, and uploaded identity documents</strong>.
+                    Admin accounts, room configuration and hotel settings are preserved.
+                    This action <strong>cannot be undone</strong>.
+                  </p>
+
+                  {/* Confirmation phrase input */}
+                  {!frSummary && (
+                    <div style={{ marginBottom: '14px' }}>
+                      <label style={{
+                        display: 'block', fontSize: '0.8rem',
+                        color: '#fca5a5', marginBottom: '6px', fontWeight: 600,
+                      }}>
+                        Type <code style={{
+                          background: 'rgba(239,68,68,0.15)', padding: '1px 6px',
+                          borderRadius: '4px', letterSpacing: '0.05em',
+                        }}>{REQUIRED_PHRASE}</code> to enable reset:
+                      </label>
+                      <input
+                        id="fr-phrase-input"
+                        type="text"
+                        className="input-field"
+                        style={{
+                          width: '100%',
+                          borderColor: frPhrase.trim() === REQUIRED_PHRASE
+                            ? 'rgba(239,68,68,0.7)' : 'rgba(239,68,68,0.25)',
+                          background: 'rgba(239,68,68,0.06)',
+                          color: '#fca5a5',
+                        }}
+                        placeholder="RESET HOTEL DATA"
+                        value={frPhrase}
+                        onChange={e => { setFrPhrase(e.target.value); setFrError(''); }}
+                        disabled={frLoading}
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                    </div>
+                  )}
+
+                  {/* Execute button */}
+                  {!frSummary && (
+                    <button
+                      id="fr-execute-btn"
+                      onClick={handleFactoryReset}
+                      disabled={frPhrase.trim() !== REQUIRED_PHRASE || frLoading}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: '8px',
+                        padding: '9px 20px', border: 'none', borderRadius: '8px',
+                        background: frPhrase.trim() === REQUIRED_PHRASE
+                          ? '#ef4444' : 'rgba(239,68,68,0.2)',
+                        color: frPhrase.trim() === REQUIRED_PHRASE ? '#fff' : '#ef444488',
+                        cursor: frPhrase.trim() === REQUIRED_PHRASE && !frLoading
+                          ? 'pointer' : 'not-allowed',
+                        fontWeight: 600, fontSize: '0.9rem',
+                        transition: 'all 0.2s',
+                        opacity: frLoading ? 0.7 : 1,
+                      }}
+                    >
+                      {frLoading
+                        ? <><Loader2 size={15} style={{ animation: 'spin 1s linear infinite' }} /> Executing Reset…</>
+                        : <><DatabaseZap size={15} /> Execute Factory Reset</>
+                      }
+                    </button>
+                  )}
+
+                  {/* Error banner */}
+                  {frError && (
+                    <div style={{
+                      marginTop: '12px', padding: '10px 14px', borderRadius: '7px',
+                      background: 'rgba(239,68,68,0.12)', border: '1px solid rgba(239,68,68,0.3)',
+                      color: '#fca5a5', fontSize: '0.84rem',
+                      display: 'flex', gap: '8px', alignItems: 'flex-start',
+                    }}>
+                      <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: '2px' }} />
+                      {frError}
+                    </div>
+                  )}
+
+                  {/* Success summary */}
+                  {frSummary && (
+                    <div style={{
+                      marginTop: '4px', padding: '16px 18px', borderRadius: '9px',
+                      background: 'rgba(74,222,128,0.08)',
+                      border: '1px solid rgba(74,222,128,0.3)',
+                    }}>
+                      <div style={{
+                        display: 'flex', alignItems: 'center', gap: '8px',
+                        color: '#4ade80', fontWeight: 700, fontSize: '0.9rem',
+                        marginBottom: '12px',
+                      }}>
+                        <CheckCircle size={16} /> Factory Reset Complete in {frSummary.executionMs}ms
+                      </div>
+                      <table style={{
+                        width: '100%', borderCollapse: 'collapse',
+                        fontSize: '0.82rem', color: '#c9d1d9',
+                      }}>
+                        <tbody>
+                          {[
+                            ['Guests Deleted',        frSummary.guestsDeleted],
+                            ['Guest Logins Deleted',  frSummary.guestUsersDeleted],
+                            ['Reservations Deleted',  frSummary.reservationsDeleted],
+                            ['Bookings Deleted',      frSummary.bookingsDeleted],
+                            ['Payments Deleted',      frSummary.paymentsDeleted],
+                            ['Invoices Deleted',      frSummary.invoicesDeleted],
+                            ['Cash Logs Deleted',     frSummary.cashLogsDeleted],
+                            ['Notifications Deleted', frSummary.notificationsDeleted],
+                            ['Room Service Deleted',  frSummary.roomServiceDeleted],
+                            ['Maintenance Deleted',   frSummary.maintenanceDeleted],
+                            ['Audit Logs Deleted',    frSummary.auditLogsDeleted],
+                            ['Rooms Reset to Vacant', frSummary.roomsReset],
+                            ['Business Date Reset',   frSummary.businessDateReset],
+                            ['Files Deleted',         frSummary.filesDeletedFromDisk],
+                          ].map(([label, val]) => (
+                            <tr key={label} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                              <td style={{ padding: '4px 0', color: '#8b949e' }}>{label}</td>
+                              <td style={{
+                                padding: '4px 0', textAlign: 'right', fontWeight: 600,
+                                color: typeof val === 'number' && val > 0 ? '#4ade80' : '#c9d1d9',
+                              }}>{val}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      <p style={{
+                        marginTop: '12px', fontSize: '0.78rem',
+                        color: '#8b949e', margin: '12px 0 0 0',
+                      }}>
+                        The dashboard has been refreshed automatically. All rooms are now vacant.
+                      </p>
+                    </div>
+                  )}
+
+                </div>
+              )}
+            </div>
             )}
           </div>
         </div>
