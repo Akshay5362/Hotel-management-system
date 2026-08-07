@@ -54,24 +54,29 @@ export default function ReportsModal({ isOpen, onClose, rooms, cashLog, currentD
     }, 1200);
   };
 
-  // Helper to advance date string like "11-Jul-2026"
+  // Helper to advance a YYYY-MM-DD business date by one day.
+  // The backend stores and returns Business Date as YYYY-MM-DD (e.g. "2026-08-06").
+  // This function uses UTC arithmetic so it is never affected by the local timezone.
   const advanceDateStr = (dateStr) => {
-    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    const parts = dateStr.split('-');
-    if (parts.length !== 3) return dateStr;
+    if (!dateStr || typeof dateStr !== 'string') return dateStr;
 
-    const day = parseInt(parts[0], 10);
-    const monthIndex = months.indexOf(parts[1]);
-    const year = parseInt(parts[2], 10);
+    // Expect YYYY-MM-DD from the API
+    const match = dateStr.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!match) return dateStr; // unrecognised format – return as-is
 
-    const date = new Date(year, monthIndex, day);
-    date.setDate(date.getDate() + 1);
+    const y = parseInt(match[1], 10);
+    const m = parseInt(match[2], 10); // 1-based
+    const d = parseInt(match[3], 10);
 
-    const newDay = String(date.getDate()).padStart(2, '0');
-    const newMonth = months[date.getMonth()];
-    const newYear = date.getFullYear();
+    // Use Date.UTC to avoid any local-timezone day-boundary shift
+    const next = new Date(Date.UTC(y, m - 1, d + 1));
 
-    return `${newDay}-${newMonth}-${newYear}`;
+    const newYear  = next.getUTCFullYear();
+    const newMonth = String(next.getUTCMonth() + 1).padStart(2, '0');
+    const newDay   = String(next.getUTCDate()).padStart(2, '0');
+
+    // Return YYYY-MM-DD — the format the backend's advanceBusinessDate() validates
+    return `${newYear}-${newMonth}-${newDay}`;
   };
 
   const handlePrint = () => {
