@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { API_URL, getApiHeaders, getAssetUrl } from '../config/apiConfig';
 
 const STATUS_COLORS = {
   Pending:  { bg: 'rgba(234, 179, 8, 0.15)', border: 'rgba(234, 179, 8, 0.4)',  text: '#fde047' },
@@ -29,8 +30,8 @@ export default function IdentityVerificationModal({ isOpen, onClose, token, room
     setIsLoading(true);
     setError(null);
     try {
-      const res = await fetch('http://localhost:5000/api/admin/guest-documents', {
-        headers: { 'Authorization': `Bearer ${token}` }
+      const res = await fetch(`${API_URL}/admin/guest-documents`, {
+        headers: getApiHeaders(token)
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.message || 'Failed to fetch documents');
@@ -50,12 +51,9 @@ export default function IdentityVerificationModal({ isOpen, onClose, token, room
 
     setIsSubmitting(true);
     try {
-      const res = await fetch(`http://localhost:5000/api/admin/guest-documents/${selectedDoc.id}/verify`, {
+      const res = await fetch(`${API_URL}/admin/guest-documents/${selectedDoc.id}/verify`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
+        headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ status, rejectionReason })
       });
 
@@ -80,9 +78,9 @@ export default function IdentityVerificationModal({ isOpen, onClose, token, room
   const handleDeleteDocument = async () => {
     setIsSubmitting(true);
     try {
-      const res = await fetch(`http://localhost:5000/api/admin/guest-documents/${selectedDoc.id}`, {
+      const res = await fetch(`${API_URL}/admin/guest-documents/${selectedDoc.id}`, {
         method: 'DELETE',
-        headers: { 'Authorization': `Bearer ${token}` }
+        headers: getApiHeaders(token)
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.message || 'Deletion failed');
@@ -257,13 +255,13 @@ export default function IdentityVerificationModal({ isOpen, onClose, token, room
                       <div style={{ padding: '30px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
                         <div style={{ fontSize: '2.5rem', marginBottom: '8px' }}>🖼️</div>
                         <div>Image could not be loaded.</div>
-                        <a href={`http://localhost:5000/guest-documents/${selectedDoc.id_document_path}`} target="_blank" rel="noopener noreferrer" style={{ color: '#38bdf8', fontSize: '0.8rem', marginTop: '6px', display: 'inline-block' }}>
+                        <a href={getAssetUrl(`/guest-documents/${selectedDoc.id_document_path}`)} target="_blank" rel="noopener noreferrer" style={{ color: '#38bdf8', fontSize: '0.8rem', marginTop: '6px', display: 'inline-block' }}>
                           Open file directly →
                         </a>
                       </div>
                     ) : (
                       <img
-                        src={`http://localhost:5000/guest-documents/${selectedDoc.id_document_path}`}
+                        src={getAssetUrl(`/guest-documents/${selectedDoc.id_document_path}`)}
                         alt="Guest ID Document"
                         onError={() => setImgError(true)}
                         style={{ maxWidth: '100%', maxHeight: '320px', objectFit: 'contain', borderRadius: '6px' }}
@@ -271,15 +269,16 @@ export default function IdentityVerificationModal({ isOpen, onClose, token, room
                     )
                   ) : selectedDoc.id_document_path?.endsWith('.pdf') ? (
                     <object
-                      data={`http://localhost:5000/guest-documents/${selectedDoc.id_document_path}`}
+                      data={getAssetUrl(`/guest-documents/${selectedDoc.id_document_path}`)}
                       type="application/pdf"
                       width="100%"
                       height="320px"
                     >
-                      <a href={`http://localhost:5000/guest-documents/${selectedDoc.id_document_path}`} target="_blank" rel="noopener noreferrer" style={{ color: '#38bdf8' }}>
+                      <a href={getAssetUrl(`/guest-documents/${selectedDoc.id_document_path}`)} target="_blank" rel="noopener noreferrer" style={{ color: '#38bdf8' }}>
                         Open PDF →
                       </a>
                     </object>
+
                   ) : (
                     <div style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>No document file attached.</div>
                   )}

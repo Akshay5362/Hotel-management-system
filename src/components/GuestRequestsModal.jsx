@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import { API_URL, getApiHeaders } from '../config/apiConfig';
 
 const TYPE_CONFIG = {
   service: { label: 'Room Service', color: '#818cf8', bg: 'rgba(129,140,248,0.12)', border: 'rgba(129,140,248,0.3)', icon: '🛎️' },
@@ -18,8 +19,8 @@ export default function GuestRequestsModal({ isOpen, onClose, token, onRequestRe
     if (!token) return;
     if (!silent) setLoading(true);
     try {
-      const res = await fetch('http://localhost:5000/api/admin/guest-requests', {
-        headers: { Authorization: `Bearer ${token}` }
+      const res = await fetch(`${API_URL}/admin/guest-requests`, {
+        headers: getApiHeaders(token)
       });
       if (res.ok) {
         const data = await res.json();
@@ -38,20 +39,17 @@ export default function GuestRequestsModal({ isOpen, onClose, token, onRequestRe
     if (!token || resolvingId) return;
     setResolvingId(id);
     try {
-      let url = `http://localhost:5000/api/admin/guest-requests/${id}/resolve`;
+      let url = `${API_URL}/admin/guest-requests/${id}/resolve`;
       let body = {};
       
       if (id.startsWith('ext_')) {
-        url = `http://localhost:5000/api/admin/guest-requests/extension/${id}/resolve`;
+        url = `${API_URL}/admin/guest-requests/extension/${id}/resolve`;
         body = { action }; // 'approve' or 'reject'
       }
 
       const res = await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
-        },
+        headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
         body: Object.keys(body).length > 0 ? JSON.stringify(body) : undefined
       });
       if (res.ok) {

@@ -31,7 +31,8 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AdminAuthContext } from '../contexts/AdminAuthContext';
 import ReservationModule from './ReservationModule';
 
-const API = 'http://localhost:5000/api';
+import { API_URL as API, getApiHeaders } from '../config/apiConfig';
+
 
 // ── Status styling ───────────────────────────────────────────────────────────
 const STATUS_STYLE = {
@@ -161,6 +162,8 @@ function CheckInModal({ room, rooms, token, onClose, onSuccess, isWalkIn = false
   const [form, setForm] = useState({
     guestName: '', phone: '', pax: '1', deposit: '0',
     roomNumber: room?.number || '',
+    billing_instruction: 'Direct to Guest',
+    meal_plan: 'EP',
   });
   const [loading, setLoading]         = useState(false);
   const [error, setError]             = useState('');
@@ -193,10 +196,12 @@ function CheckInModal({ room, rooms, token, onClose, onSuccess, isWalkIn = false
     setLoading(true); setError('');
     try {
       await apiCall('POST', `/rooms/${rn}/checkin`, {
-        guestName:       form.guestName.trim().toUpperCase(),
-        phone:           form.phone.trim(),
-        pax:             parseInt(form.pax) || 1,
-        deposit:         parseInt(form.deposit) || 0,
+        guestName:          form.guestName.trim().toUpperCase(),
+        phone:              form.phone.trim(),
+        pax:                parseInt(form.pax) || 1,
+        deposit:            parseInt(form.deposit) || 0,
+        billing_instruction: form.billing_instruction || 'Direct to Guest',
+        meal_plan:          form.meal_plan || 'EP',
         // manual_override is sent only for admin/manager who explicitly toggled the override
         ...(isDirtyRoom && canOverride && showDirty ? { manual_override: true } : {}),
       }, token);
@@ -281,6 +286,27 @@ function CheckInModal({ room, rooms, token, onClose, onSuccess, isWalkIn = false
             <label style={labelStyle}>Deposit (₹)</label>
             <input style={inputStyle} type="number" min="0" value={form.deposit}
               onChange={e => setForm(f => ({ ...f, deposit: e.target.value }))} />
+          </div>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+          <div>
+            <label style={labelStyle}>Billing Instructions</label>
+            <select style={inputStyle} value={form.billing_instruction}
+              onChange={e => setForm(f => ({ ...f, billing_instruction: e.target.value }))}>
+              <option value="Direct to Guest">Direct to Guest</option>
+              <option value="Bill to Company">Bill to Company</option>
+              <option value="Room Tariff Only">Room Tariff Only</option>
+            </select>
+          </div>
+          <div>
+            <label style={labelStyle}>Meal Plan</label>
+            <select style={inputStyle} value={form.meal_plan}
+              onChange={e => setForm(f => ({ ...f, meal_plan: e.target.value }))}>
+              <option value="EP">EP (Room Only)</option>
+              <option value="CP">CP (+ Breakfast)</option>
+              <option value="MAP">MAP (+ B&amp;D)</option>
+              <option value="AP">AP (All Meals)</option>
+            </select>
           </div>
         </div>
       </div>

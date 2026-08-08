@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { API_URL, getApiHeaders } from '../config/apiConfig';
+
 
 const RECEIVERS = ['Owner', 'Manager', 'Area Manager', 'Other'];
 
@@ -68,12 +70,13 @@ export default function CashStatusModal({ isOpen, onClose, cashLog, token, admin
   const [successMsg, setSuccessMsg] = useState('');
 
   // ── Load today's submissions ────────────────────────────────────────────────
+
   const loadSubmissions = useCallback(async () => {
     if (!token) return;
     setSubsLoading(true);
     try {
-      const res = await fetch('http://localhost:5000/api/cash/submissions', {
-        headers: { Authorization: `Bearer ${token}` }
+      const res = await fetch(`${API_URL}/cash/submissions`, {
+        headers: getApiHeaders(token)
       });
       const data = await res.json();
       setSubmissions(data.submissions || []);
@@ -83,6 +86,7 @@ export default function CashStatusModal({ isOpen, onClose, cashLog, token, admin
       setSubsLoading(false);
     }
   }, [token]);
+
 
   useEffect(() => {
     if (isOpen) {
@@ -134,11 +138,12 @@ export default function CashStatusModal({ isOpen, onClose, cashLog, token, admin
   const handleConfirmSubmit = async () => {
     setIsSubmitting(true);
     try {
-      const res = await fetch('http://localhost:5000/api/cash/submit', {
+      const res = await fetch(`${API_URL}/cash/submit`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ amount: Number(submitAmount), receiverName: receiver, remarks })
       });
+
       const data = await res.json();
       if (!res.ok) {
         setFormError(data.error || 'Submission failed.');

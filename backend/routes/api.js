@@ -14,8 +14,10 @@ import staffRoutes from './staffRoutes.js';
 import reservationRoutes from './reservationRoutes.js';
 
 import factoryResetRoutes from './factoryResetRoutes.js';
+import inventoryRoutes from './inventoryRoutes.js';
 
 const router = express.Router();
+
 
 // Public routes
 router.get('/public/rooms', getPublicRooms);
@@ -110,7 +112,11 @@ router.use('/staff', authenticate, requireAdmin, staffRoutes);
 // ── Reservation Module ───────────────────────────────────────────────────────
 router.use('/reservations', reservationRoutes);
 
+// ── Inventory Module ────────────────────────────────────────────────────────
+router.use('/inventory', authenticate, inventoryRoutes);
+
 // ── Factory Reset Module (Phase 1 Architecture) ─────────────────────────────
 router.use('/system/factory-reset', factoryResetRoutes);
 
 export default router;
+

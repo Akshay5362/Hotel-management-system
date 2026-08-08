@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { exportToExcel } from '../utils/exportUtils';
 
-// ── API helper (mirrors the one in ReceptionPortal) ──────────────────────────
-const API_BASE = 'http://localhost:5000/api';
+import { API_URL as API_BASE, getApiHeaders } from '../config/apiConfig';
+
 async function apiCall(method, endpoint, body, token) {
   const opts = {
     method,
-    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
   };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(`${API_BASE}${endpoint}`, opts);
@@ -16,6 +16,7 @@ async function apiCall(method, endpoint, body, token) {
   }
   return res.json();
 }
+
 
 // ── Style tokens (identical to App.jsx/ReceptionPortal palette) ───────────────
 const inp = {

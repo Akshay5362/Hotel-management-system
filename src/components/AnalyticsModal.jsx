@@ -1,4 +1,6 @@
 import React, {  useState, useEffect, useContext , useRef, useMemo, useCallback } from 'react';
+import { API_URL, getApiHeaders } from '../config/apiConfig';
+
 import { 
   LineChart, Line, BarChart, Bar, PieChart, Pie, Cell, 
   XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer 
@@ -263,10 +265,11 @@ export default function AnalyticsModal({ isOpen, onClose }) {
       else if (activeTab === 'payments') endpoint = 'payments';
 
       if (endpoint) {
-        const res = await fetch(`http://localhost:5000/api/reports/${endpoint}?${params}`, {
-          headers: { 'Authorization': `Bearer ${adminToken}` }
+        const res = await fetch(`${API_URL}/reports/${endpoint}?${params}`, {
+          headers: getApiHeaders(adminToken)
         });
         const data = await res.json();
+
         dataCache.current[cacheKey] = data;
 
         if (activeTab === 'dashboard') setDashboardData(data);

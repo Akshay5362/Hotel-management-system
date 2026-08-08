@@ -54,6 +54,8 @@ export class RoomStatusService {
         b.total_amount as totalAmount,
         b.advance_amount as deposit,
         b.booking_status,
+        b.billing_instruction,
+        b.meal_plan,
         g.full_name as guestName,
         g.phone,
         g.address,
@@ -197,6 +199,8 @@ export class RoomStatusService {
         booking_id: currentBooking ? currentBooking.booking_id : null,
         reservation_id: currentReservation ? currentReservation.reservation_id : null,
         booking_number: currentBooking ? currentBooking.booking_number : (currentReservation ? currentReservation.booking_number : null),
+        billing_instruction: currentBooking ? (currentBooking.billing_instruction || 'Direct to Guest') : 'Direct to Guest',
+        meal_plan: currentBooking ? (currentBooking.meal_plan || 'EP') : 'EP',
         db_status: r.db_status,
         activeBooking: currentBooking,
         activeReservation: currentReservation

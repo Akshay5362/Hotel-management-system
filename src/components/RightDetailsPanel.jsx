@@ -95,6 +95,18 @@ export default function RightDetailsPanel({ selectedRoom, onActionClick }) {
                 <span style={{ color: 'var(--text-muted)' }}>Balance Due:</span>
                 <span style={{ fontWeight: 'bold', color: '#f87171' }}>₹{selectedRoom.deposit ? (selectedRoom.price - selectedRoom.deposit) : selectedRoom.price}</span>
               </div>
+              {selectedRoom.meal_plan && (
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>Meal Plan:</span>
+                  <span style={{ fontWeight: '500', color: '#4ade80' }}>{selectedRoom.meal_plan} Plan</span>
+                </div>
+              )}
+              {selectedRoom.billing_instruction && (
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>Billing:</span>
+                  <span style={{ fontWeight: '500', fontSize: '0.82rem' }}>{selectedRoom.billing_instruction}</span>
+                </div>
+              )}
             </div>
           ) : (
             <div style={{ display: 'flex', height: '100%', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: '0.85rem' }}>

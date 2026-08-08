@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
 import PaymentPanel from './PaymentPanel';
+import { API_BASE_URL } from '../services/api';
+
 
 export default function GuestBookingWizard({
   user,
@@ -335,13 +337,15 @@ export default function GuestBookingWizard({
     try {
       const activeExtraGuests = extraGuests.slice(0, numGuests - 1);
 
-      const res = await fetch(`http://localhost:5000/api/rooms/${selectedRoomNumber}/book`, {
+      const res = await fetch(`${API_BASE_URL}/rooms/${selectedRoomNumber}/book`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
+          'ngrok-skip-browser-warning': 'true',
           'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({
+
           guestName: guestName.trim(),
           phone: guestPhone.trim(),
           email: guestEmail.trim(),
@@ -1558,9 +1562,9 @@ export default function GuestBookingWizard({
                         setIsSubmitting(true);
                         try {
                           // 1. Get Order ID
-                          const res = await fetch(`http://localhost:5000/api/payments/razorpay/order`, {
+                          const res = await fetch(`${API_BASE_URL}/payments/razorpay/order`, {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                            headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true', 'Authorization': `Bearer ${token}` },
                             body: JSON.stringify({ amount: parseInt(paymentDeposit, 10) })
                           });
                           const data = await res.json();
@@ -1577,15 +1581,16 @@ export default function GuestBookingWizard({
                             handler: async function (response) {
                               try {
                                 // 3. Verify Payment
-                                const verifyRes = await fetch(`http://localhost:5000/api/payments/razorpay/verify`, {
+                                const verifyRes = await fetch(`${API_BASE_URL}/payments/razorpay/verify`, {
                                   method: 'POST',
-                                  headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                                  headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true', 'Authorization': `Bearer ${token}` },
                                   body: JSON.stringify({
                                     razorpay_order_id: response.razorpay_order_id,
                                     razorpay_payment_id: response.razorpay_payment_id,
                                     razorpay_signature: response.razorpay_signature
                                   })
                                 });
+
                                 const verifyData = await verifyRes.json();
                                 if (!verifyRes.ok) throw new Error(verifyData.error || 'Verification failed');
                                 

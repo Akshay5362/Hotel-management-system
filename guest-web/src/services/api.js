@@ -1,10 +1,13 @@
-export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000/api';
+const rawBase = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000').replace(/\/+$/, '');
+export const API_ORIGIN = rawBase.endsWith('/api') ? rawBase.replace(/\/api$/, '') : rawBase;
+export const API_BASE_URL = `${API_ORIGIN}/api`;
 
 export const apiFetch = async (path, options = {}) => {
   const token = localStorage.getItem('guestToken');
   
   const headers = {
     'Content-Type': 'application/json',
+    'ngrok-skip-browser-warning': 'true',
     ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
     ...(options.headers || {}),
   };
@@ -21,3 +24,4 @@ export const apiFetch = async (path, options = {}) => {
   }
   return data;
 };
+

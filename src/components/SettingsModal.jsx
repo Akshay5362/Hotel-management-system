@@ -22,8 +22,8 @@ function daysDiff(a, b) {
   return Math.round((msB - msA) / 86400000);
 }
 
-// ─── API base ─────────────────────────────────────────────────────────────────
-const API_BASE = 'http://localhost:5000/api';
+import { API_URL as API_BASE, getApiHeaders } from '../config/apiConfig';
+
 
 // ─── Stat Card ────────────────────────────────────────────────────────────────
 function StatCard({ icon: Icon, label, value, color }) {

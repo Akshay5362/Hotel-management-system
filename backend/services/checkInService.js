@@ -1,6 +1,10 @@
 import { formatTime } from '../utils/dateUtils.js';
 import { BusinessDateService } from './businessDateService.js';
 
+// Allowed values for the two new optional fields
+const ALLOWED_BILLING_INSTRUCTIONS = ['Direct to Guest', 'Bill to Company', 'Room Tariff Only'];
+const ALLOWED_MEAL_PLANS           = ['EP', 'CP', 'MAP', 'AP'];
+
 export const processCheckIn = async (connection, {
   roomNumber,
   guestName,
@@ -19,8 +23,17 @@ export const processCheckIn = async (connection, {
   reservationId = null,
   isGuestSelfCheckIn = false,
   guestId = null,
-  departureDate = null
+  departureDate = null,
+  billingInstruction = 'Direct to Guest',
+  mealPlan = 'EP'
 }) => {
+  // Validate optional fields (ignore invalid values gracefully — use default)
+  const resolvedBilling = ALLOWED_BILLING_INSTRUCTIONS.includes(billingInstruction)
+    ? billingInstruction
+    : 'Direct to Guest';
+  const resolvedMealPlan = ALLOWED_MEAL_PLANS.includes(mealPlan)
+    ? mealPlan
+    : 'EP';
   // 1. Get Business Date
   const businessDate = await BusinessDateService.getBusinessDate(connection);
   if (!businessDate) throw new Error('System configuration error: Business Date is missing.');
@@ -135,12 +148,14 @@ export const processCheckIn = async (connection, {
   const [bResult] = await connection.query(
     `INSERT INTO bookings (
       booking_number, guest_id, room_id, check_in_date, expected_check_out_date,
-      adults, children, booking_status, payment_status, total_amount, advance_amount, created_by
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Checked In', ?, ?, ?, ?)`,
+      adults, children, booking_status, payment_status, total_amount, advance_amount, created_by,
+      billing_instruction, meal_plan
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Checked In', ?, ?, ?, ?, ?, ?)`,
     [
       bookingNumber, finalGuestId, room.id, actualCheckInDate, departureDate || actualCheckInDate,
       pax, children, deposit > 0 ? 'Partial' : 'Pending',
-      room.rate, deposit, resolvedUserId
+      room.rate, deposit, resolvedUserId,
+      resolvedBilling, resolvedMealPlan
     ]
   );
   const bookingId = bResult.insertId;

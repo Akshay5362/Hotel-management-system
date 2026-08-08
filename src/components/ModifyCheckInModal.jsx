@@ -32,6 +32,8 @@ export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, sh
   const [country, setCountry] = useState('');
   const [arrivalFrom, setArrivalFrom] = useState('');
   const [departureTo, setDepartureTo] = useState('');
+  const [billingInstruction, setBillingInstruction] = useState('Direct to Guest');
+  const [mealPlan, setMealPlan] = useState('EP');
 
   // Reset or initialize state when room changes or modal opens
   useEffect(() => {
@@ -48,6 +50,8 @@ export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, sh
       setCountry(room.country || '');
       setArrivalFrom(room.arrival_from || '');
       setDepartureTo(room.departure_to || '');
+      setBillingInstruction(room.billing_instruction || 'Direct to Guest');
+      setMealPlan(room.meal_plan || 'EP');
     }
   }, [room, isOpen]);
 
@@ -82,7 +86,9 @@ export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, sh
       pincode,
       country,
       arrival_from: arrivalFrom,
-      departure_to: departureTo
+      departure_to: departureTo,
+      billing_instruction: billingInstruction,
+      meal_plan: mealPlan
     });
   };
 
@@ -231,6 +237,34 @@ export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, sh
                 value={gstNo}
                 onChange={(e) => setGstNo(e.target.value)}
               />
+            </div>
+
+            {/* Billing & Meal Plan Section */}
+            <h4 style={{ fontSize: '0.85rem', color: '#ffd700', textTransform: 'uppercase', marginBottom: '12px', marginTop: '20px', borderBottom: '1px solid rgba(255,255,255,0.06)', paddingBottom: '6px' }}>Billing &amp; Meal Plan</h4>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Billing Instructions</label>
+                <select
+                  value={billingInstruction}
+                  onChange={(e) => setBillingInstruction(e.target.value)}
+                >
+                  <option value="Direct to Guest">Direct to Guest</option>
+                  <option value="Bill to Company">Bill to Company</option>
+                  <option value="Room Tariff Only">Room Tariff Only</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label>Meal Plan</label>
+                <select
+                  value={mealPlan}
+                  onChange={(e) => setMealPlan(e.target.value)}
+                >
+                  <option value="EP">EP Plan (Room Only)</option>
+                  <option value="CP">CP Plan (+ Breakfast)</option>
+                  <option value="MAP">MAP Plan (+ Breakfast &amp; Dinner)</option>
+                  <option value="AP">AP Plan (All Meals)</option>
+                </select>
+              </div>
             </div>
 
             {/* Logistics Info Section */}

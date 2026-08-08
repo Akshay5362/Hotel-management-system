@@ -135,6 +135,8 @@ export const getStatus = async (req, res) => {
       booking_id: r.booking_id,
       reservation_id: r.reservation_id,
       booking_number: r.booking_number,
+      billing_instruction: r.billing_instruction || 'Direct to Guest',
+      meal_plan: r.meal_plan || 'EP',
       ledger: (r.booking_id && ledgerByBookingId[r.booking_id]) ? ledgerByBookingId[r.booking_id] : []
     }));
 

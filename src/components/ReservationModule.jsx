@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { API_URL, getApiHeaders } from '../config/apiConfig';
 
 /**
  * ReservationModule.jsx
@@ -67,14 +68,14 @@ export default function ReservationModule({ token, user, onNavigate, showAlert, 
     setLoading(true);
     setError(null);
     try {
-      let url = 'http://localhost:5000/api/reservations?';
+      let url = `${API_URL}/reservations?`;
       if (statusFilter && statusFilter !== 'ALL') url += `status=${statusFilter}&`;
       if (searchQuery) url += `search=${encodeURIComponent(searchQuery)}&`;
       if (fromDateFilter) url += `fromDate=${fromDateFilter}&`;
       if (toDateFilter) url += `toDate=${toDateFilter}&`;
 
       const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}` }
+        headers: getApiHeaders(token)
       });
       if (!res.ok) throw new Error('Failed to load reservations');
       const data = await res.json();
@@ -102,9 +103,9 @@ export default function ReservationModule({ token, user, onNavigate, showAlert, 
     }
     setLoadingRooms(true);
     try {
-      const url = `http://localhost:5000/api/reservations/available-rooms?arrivalDate=${arrDate}&departureDate=${depDate}&roomType=${rType || 'ALL'}`;
+      const url = `${API_URL}/reservations/available-rooms?arrivalDate=${arrDate}&departureDate=${depDate}&roomType=${rType || 'ALL'}`;
       const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}` }
+        headers: getApiHeaders(token)
       });
       if (res.ok) {
         const data = await res.json();
@@ -146,12 +147,9 @@ export default function ReservationModule({ token, user, onNavigate, showAlert, 
 
     setLoading(true);
     try {
-      const res = await fetch('http://localhost:5000/api/reservations', {
+      const res = await fetch(`${API_URL}/reservations`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
-        },
+        headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
         body: JSON.stringify(formData)
       });
       const data = await res.json();
@@ -186,12 +184,9 @@ export default function ReservationModule({ token, user, onNavigate, showAlert, 
 
     setLoading(true);
     try {
-      const res = await fetch(`http://localhost:5000/api/reservations/${formData.id}`, {
+      const res = await fetch(`${API_URL}/reservations/${formData.id}`, {
         method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
-        },
+        headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
         body: JSON.stringify(formData)
       });
       const data = await res.json();
@@ -227,12 +222,9 @@ export default function ReservationModule({ token, user, onNavigate, showAlert, 
 
     setLoading(true);
     try {
-      const res = await fetch(`http://localhost:5000/api/reservations/${selectedRes.id}/cancel`, {
+      const res = await fetch(`${API_URL}/reservations/${selectedRes.id}/cancel`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
-        },
+        headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ cancellationReason })
       });
       const data = await res.json();
@@ -265,9 +257,9 @@ export default function ReservationModule({ token, user, onNavigate, showAlert, 
 
     setLoading(true);
     try {
-      const res = await fetch(`http://localhost:5000/api/reservations/${reservation.id}/checkin`, {
+      const res = await fetch(`${API_URL}/reservations/${reservation.id}/checkin`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` }
+        headers: getApiHeaders(token)
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to check in reservation');

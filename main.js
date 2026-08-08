@@ -312,9 +312,20 @@ function createWindow() {
     });
   }
 
+  const targetApiBase = (process.env.VITE_API_BASE_URL || 'http://localhost:5000').replace(/\/+$/, '');
+  const isAllowedOrigin = (testUrl) => {
+    if (!testUrl) return false;
+    if (testUrl.startsWith('http://localhost:5000') || testUrl.startsWith('http://localhost:5173') || testUrl.startsWith(targetApiBase)) return true;
+    try {
+      const hostname = new URL(testUrl).hostname;
+      if (hostname.endsWith('.ngrok-free.dev') || hostname.endsWith('.ngrok.io')) return true;
+    } catch {}
+    return false;
+  };
+
   // ── External links open in system browser ─────────────────────────────────
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('http://localhost:5000') || url.startsWith('http://localhost:5173')) {
+    if (isAllowedOrigin(url)) {
       return { action: 'allow' };
     }
     shell.openExternal(url);
@@ -322,25 +333,23 @@ function createWindow() {
   });
 
   // ── Prevent navigation outside the app ────────────────────────────────────
-  // IMPORTANT: On Windows, path.dirname() returns backslashes but file:// URLs
-  // use forward slashes. We normalise with .replace() to avoid URL mismatches.
   mainWindow.webContents.on('will-navigate', (event, navUrl) => {
     let allowed = false;
     if (isDev) {
-      allowed = navUrl.startsWith(DEV_URL) || navUrl.startsWith('http://localhost:5000');
+      allowed = navUrl.startsWith(DEV_URL) || isAllowedOrigin(navUrl);
     } else {
-      // Convert Windows backslashes → forward slashes for proper URL comparison
       const prodDir = path.dirname(PROD_ENTRY).replace(/\\/g, '/');
       allowed =
         navUrl.startsWith(`file:///${prodDir}`) ||
         navUrl.startsWith(`file://${prodDir}`)  ||
-        navUrl.startsWith('http://localhost:5000');
+        isAllowedOrigin(navUrl);
     }
     if (!allowed) {
       console.log(`[Electron] Navigation blocked: ${navUrl}`);
       event.preventDefault();
     }
   });
+
 
   mainWindow.on('closed', () => { mainWindow = null; });
 

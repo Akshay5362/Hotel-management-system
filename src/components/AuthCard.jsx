@@ -1,4 +1,6 @@
 import React, { useState } from 'react';
+import { API_BASE_URL, getApiHeaders } from '../config/apiConfig';
+
 
 export default function AuthCard({ isAdmin = false, initialIsSignUp = false, onAuthSuccess, showAlert, onNavigate }) {
   const [isSignUp, setIsSignUp] = useState(initialIsSignUp);
@@ -42,11 +44,13 @@ export default function AuthCard({ isAdmin = false, initialIsSignUp = false, onA
       : { username, password };
 
     try {
-      const res = await fetch(`http://localhost:5000${endpoint}`, {
+
+      const res = await fetch(`${API_BASE_URL}${endpoint}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getApiHeaders(null, { 'Content-Type': 'application/json' }),
         body: JSON.stringify(payload)
       });
+
 
       const data = await res.json();
       if (!res.ok) {

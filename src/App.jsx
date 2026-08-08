@@ -23,7 +23,11 @@ import { ReceptionDashboard, KitchenDashboard, PantryDashboard, HousekeepingDash
 import ReceptionPortal from './components/ReceptionPortal';
 import Sidebar from './components/Sidebar';
 import RoomInspectorDrawer from './components/RoomInspectorDrawer';
+import InventoryModule from './components/InventoryModule';
 import { io } from 'socket.io-client';
+import { API_URL, SOCKET_URL, getApiHeaders } from './config/apiConfig';
+
+
 
 // Room inventory: 17 rooms — 3 Premium, 10 Executive, 4 Standard
 // Rooms 13, 15, 18 do NOT exist.
@@ -267,7 +271,7 @@ function AppContent() {
       return;
     }
 
-    const requestUrl = `http://localhost:5000/api/status?_t=${new Date().getTime()}`;
+    const requestUrl = `${API_URL}/status?_t=${new Date().getTime()}`;
     const authHeader = `Bearer ${currentToken}`;
 
     try {
@@ -279,9 +283,7 @@ function AppContent() {
 
       const res = await fetch(requestUrl, { 
         signal: controller.signal,
-        headers: {
-          'Authorization': authHeader
-        }
+        headers: getApiHeaders(currentToken)
       });
       clearTimeout(timeout);
 
@@ -334,8 +336,8 @@ function AppContent() {
     const currentToken = adminToken;
     if (!currentToken) return;
     try {
-      const res = await fetch('http://localhost:5000/api/admin/guest-requests', {
-        headers: { Authorization: `Bearer ${currentToken}` }
+      const res = await fetch(`${API_URL}/admin/guest-requests`, {
+        headers: getApiHeaders(currentToken)
       });
       if (res.ok) {
         const data = await res.json();
@@ -349,7 +351,8 @@ function AppContent() {
     if (!adminUser || adminUser.role !== 'admin' || !adminToken) return;
     fetchRequestCount();
 
-    const socket = io('http://localhost:5000');
+    const socket = io(SOCKET_URL);
+
     let fallbackInterval = null;
 
     socket.on('connect', () => {
@@ -461,8 +464,8 @@ function AppContent() {
     try {
       const currentToken = adminToken;
       if (currentToken) {
-        const res = await fetch('http://localhost:5000/api/status', {
-          headers: { 'Authorization': `Bearer ${currentToken}` }
+        const res = await fetch(`${API_URL}/status`, {
+          headers: getApiHeaders(currentToken)
         });
         if (res.ok) {
           const data = await res.json();
@@ -536,9 +539,10 @@ function AppContent() {
           try {
             const currentToken = adminToken;
             if (currentToken) {
-              const res = await fetch('http://localhost:5000/api/status', {
-                headers: { 'Authorization': `Bearer ${currentToken}` }
+              const res = await fetch(`${API_URL}/status`, {
+                headers: getApiHeaders(currentToken)
               });
+
               if (res.ok) {
                 const data = await res.json();
                 setRooms(data.rooms);
@@ -631,12 +635,9 @@ function AppContent() {
         checkInDate: formatDateString(guestData.checkInDate)
       };
 
-      const res = await fetch(`http://localhost:5000/api/rooms/${roomNumber}/checkin`, {
+      const res = await fetch(`${API_URL}/rooms/${roomNumber}/checkin`, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
+        headers: getApiHeaders(adminToken, { 'Content-Type': 'application/json' }),
         body: JSON.stringify(formattedData)
       });
 
@@ -665,9 +666,9 @@ function AppContent() {
       // ─ Step 1: If cash payment is pending, confirm it now (admin receiving cash = confirmation) ─
       if (room.booking_id) {
         try {
-          await fetch(`http://localhost:5000/api/payments/booking/${room.booking_id}/confirm-cash`, {
+          await fetch(`${API_URL}/payments/booking/${room.booking_id}/confirm-cash`, {
             method: 'PUT',
-            headers: { 'Authorization': `Bearer ${adminToken}` }
+            headers: getApiHeaders(adminToken)
           });
           // Non-fatal: booking can still proceed even if confirm-cash has nothing to confirm
         } catch (cashErr) {
@@ -676,12 +677,9 @@ function AppContent() {
       }
 
       // ─ Step 2: Admin check-in (room status -> occupied) ────────────────────────
-      const res = await fetch(`http://localhost:5000/api/rooms/${roomNumber}/checkin`, {
+      const res = await fetch(`${API_URL}/rooms/${roomNumber}/checkin`, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
+        headers: getApiHeaders(adminToken, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           guestName: room.guestName,
           phone: room.phone,
@@ -709,12 +707,9 @@ function AppContent() {
   // Check-Out core action
   const checkOutGuest = async (roomNumber, balancePaid) => {
     try {
-      const res = await fetch(`http://localhost:5000/api/rooms/${roomNumber}/checkout`, {
+      const res = await fetch(`${API_URL}/rooms/${roomNumber}/checkout`, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
+        headers: getApiHeaders(adminToken, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ balancePaid })
       });
 
@@ -754,12 +749,9 @@ function AppContent() {
         expectedCheckOutDate: formatDateString(modifiedData.expectedCheckOutDate)
       };
 
-      const res = await fetch(`http://localhost:5000/api/rooms/${roomNumber}/checkin`, {
+      const res = await fetch(`${API_URL}/rooms/${roomNumber}/checkin`, {
         method: 'PUT',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
+        headers: getApiHeaders(adminToken, { 'Content-Type': 'application/json' }),
         body: JSON.stringify(formattedData)
       });
 
@@ -804,11 +796,9 @@ function AppContent() {
   // Clean dirty room
   const cleanRoom = async (roomNumber) => {
     try {
-      const res = await fetch(`http://localhost:5000/api/rooms/${roomNumber}/clean`, {
+      const res = await fetch(`${API_URL}/rooms/${roomNumber}/clean`, {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${adminToken}`
-        }
+        headers: getApiHeaders(adminToken)
       });
 
       if (!res.ok) {
@@ -828,12 +818,9 @@ function AppContent() {
   // Shift guest room
   const shiftGuest = async (fromRoomNumber, toRoomNumber) => {
     try {
-      const res = await fetch('http://localhost:5000/api/rooms/shift', {
+      const res = await fetch(`${API_URL}/rooms/shift`, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
+        headers: getApiHeaders(adminToken, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ fromRoomNumber, toRoomNumber })
       });
 
@@ -856,12 +843,9 @@ function AppContent() {
   // Add bill posting ledger item
   const addLedgerItem = async (roomNumber, desc, amount) => {
     try {
-      const res = await fetch(`http://localhost:5000/api/rooms/${roomNumber}/ledger`, {
+      const res = await fetch(`${API_URL}/rooms/${roomNumber}/ledger`, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
+        headers: getApiHeaders(adminToken, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ desc, amount })
       });
 
@@ -894,16 +878,14 @@ function AppContent() {
   // Run Day End audit
   const runDayEnd = async (auditReport) => {
     try {
-      const res = await fetch('http://localhost:5000/api/dayend', {
+      const res = await fetch(`${API_URL}/dayend`, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
+        headers: getApiHeaders(adminToken, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ nextDate: auditReport.nextDate })
       });
 
       if (!res.ok) {
+
         const errData = await res.json();
         showAlert(errData.error || 'Day end run failed', 'Day End Closure Error');
         return;
@@ -1147,7 +1129,13 @@ function AppContent() {
 
           {/* Main Workspace Scrollable Body */}
           {adminTab === 'housekeeping' && <AdminHousekeeping onBack={() => setAdminTab('frontdesk')} />}
+          {adminTab === 'inventory' && (
+            <div className="dashboard-body">
+              <InventoryModule />
+            </div>
+          )}
           {adminTab === 'guests' && (
+
             <div className="dashboard-body">
               <AdminGuests token={adminToken} />
             </div>

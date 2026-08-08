@@ -19,7 +19,10 @@ function formatTime(date) {
 
 export const checkIn = async (req, res) => {
   const { number } = req.params;
-  const { guestName, phone, pax, deposit, checkInDate, manual_override, paymentMethod, transactionId } = req.body;
+  const {
+    guestName, phone, pax, deposit, checkInDate, manual_override, paymentMethod, transactionId,
+    billing_instruction, meal_plan
+  } = req.body;
   // Input Validation
   if (!number || typeof number !== "string" || number.trim() === "") return res.status(400).json({ error: "Room number is required" });
   if (!guestName || typeof guestName !== "string" || guestName.trim() === "") return res.status(400).json({ error: "Guest name is required" });
@@ -43,7 +46,9 @@ export const checkIn = async (req, res) => {
       manualOverride: manual_override,
       checkInDate,
       resolvedUserId,
-      isGuestSelfCheckIn: false
+      isGuestSelfCheckIn: false,
+      billingInstruction: billing_instruction,
+      mealPlan: meal_plan
     });
     await connection.commit();
     res.json({ message: `Successfully checked in to Room ${number}`, bookingId });
@@ -893,7 +898,9 @@ export const modifyCheckIn = async (req, res) => {
     pincode,
     country,
     arrival_from,
-    departure_to
+    departure_to,
+    billing_instruction,
+    meal_plan
   } = req.body;
 
   if (!number) {
@@ -949,15 +956,28 @@ export const modifyCheckIn = async (req, res) => {
     const parsedPax = pax ? parseInt(pax, 10) : booking.adults;
     const parsedDeposit = deposit !== undefined ? parseInt(deposit, 10) : booking.advance_amount;
 
+    // Allowed values for optional fields
+    const ALLOWED_BILLING = ['Direct to Guest', 'Bill to Company', 'Room Tariff Only'];
+    const ALLOWED_MEAL    = ['EP', 'CP', 'MAP', 'AP'];
+    const resolvedBilling  = billing_instruction && ALLOWED_BILLING.includes(billing_instruction)
+      ? billing_instruction
+      : booking.billing_instruction || 'Direct to Guest';
+    const resolvedMealPlan = meal_plan && ALLOWED_MEAL.includes(meal_plan)
+      ? meal_plan
+      : booking.meal_plan || 'EP';
+
     await connection.query(`
       UPDATE bookings 
-      SET check_in_date = ?, expected_check_out_date = ?, adults = ?, advance_amount = ?
+      SET check_in_date = ?, expected_check_out_date = ?, adults = ?, advance_amount = ?,
+          billing_instruction = ?, meal_plan = ?
       WHERE id = ?
     `, [
       checkInDate || booking.check_in_date, 
       expectedCheckOutDate || booking.expected_check_out_date || '',
       parsedPax, 
       parsedDeposit,
+      resolvedBilling,
+      resolvedMealPlan,
       booking.id
     ]);
 

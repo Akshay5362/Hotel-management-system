@@ -6,6 +6,8 @@ export default function CheckInModal({ isOpen, onClose, room, onCheckIn, showAle
   const [pax, setPax] = useState('1');
   const [deposit, setDeposit] = useState('0');
   const [checkInDate, setCheckInDate] = useState('');
+  const [billingInstruction, setBillingInstruction] = useState('Direct to Guest');
+  const [mealPlan, setMealPlan] = useState('EP');
 
   // Reset or initialize state when room changes or modal opens
   useEffect(() => {
@@ -14,6 +16,8 @@ export default function CheckInModal({ isOpen, onClose, room, onCheckIn, showAle
       setPhone('');
       setPax('1');
       setDeposit('0');
+      setBillingInstruction('Direct to Guest');
+      setMealPlan('EP');
       // Set to today's date formatted as YYYY-MM-DD
       const today = new Date().toISOString().split('T')[0];
       setCheckInDate(today);
@@ -33,7 +37,9 @@ export default function CheckInModal({ isOpen, onClose, room, onCheckIn, showAle
       phone,
       pax: parseInt(pax, 10),
       deposit: parseFloat(deposit) || 0,
-      checkInDate
+      checkInDate,
+      billing_instruction: billingInstruction,
+      meal_plan: mealPlan
     });
   };
 
@@ -116,6 +122,32 @@ export default function CheckInModal({ isOpen, onClose, room, onCheckIn, showAle
                   value={deposit}
                   onChange={(e) => setDeposit(e.target.value)}
                 />
+              </div>
+              <div className="form-group">
+                <label>Billing Instructions</label>
+                <select
+                  value={billingInstruction}
+                  onChange={(e) => setBillingInstruction(e.target.value)}
+                >
+                  <option value="Direct to Guest">Direct to Guest</option>
+                  <option value="Bill to Company">Bill to Company</option>
+                  <option value="Room Tariff Only">Room Tariff Only</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="form-row">
+              <div className="form-group">
+                <label>Meal Plan</label>
+                <select
+                  value={mealPlan}
+                  onChange={(e) => setMealPlan(e.target.value)}
+                >
+                  <option value="EP">EP Plan (Room Only)</option>
+                  <option value="CP">CP Plan (+ Breakfast)</option>
+                  <option value="MAP">MAP Plan (+ Breakfast &amp; Dinner)</option>
+                  <option value="AP">AP Plan (All Meals)</option>
+                </select>
               </div>
               <div className="form-group">
                 <label>Check-in Date</label>

@@ -19,6 +19,7 @@ export const sidebarConfig = {
     { label: 'Reservations',     icon: '📅', tab: 'reservations' },
     { label: 'Guests',           icon: '👥', tab: 'guests'       },
     { label: 'Housekeeping',     icon: '🧹', tab: 'housekeeping' },
+    { label: 'Inventory',        icon: '📦', tab: 'inventory'    },
     { label: 'Reports',          icon: '📈', action: 'reports'   },
     { label: 'Analytics',        icon: '📉', action: 'analytics' },
     { label: 'Cash Management',  icon: '💰', action: 'cash'      },

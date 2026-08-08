@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { io } from 'socket.io-client';
 
-const API_URL = 'http://localhost:5000/api';
+import { API_URL, SOCKET_URL, getApiHeaders } from '../config/apiConfig';
 let socket;
+
 
 export default function AdminHousekeeping({ onBack }) {
   const [rooms, setRooms] = useState([]);
@@ -34,7 +35,7 @@ export default function AdminHousekeeping({ onBack }) {
 
   useEffect(() => {
     fetchRooms();
-    socket = io('http://localhost:5000');
+    socket = io(SOCKET_URL);
     socket.on('housekeeping_update', (data) => {
       fetchRooms();
     });
@@ -45,7 +46,7 @@ export default function AdminHousekeeping({ onBack }) {
     try {
       await fetch(`${API_URL}/housekeeping/update-status`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('adminToken')}` },
+        headers: getApiHeaders(localStorage.getItem('adminToken'), { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ roomId, status: newStatus })
       });
       fetchRooms();
@@ -58,10 +59,11 @@ export default function AdminHousekeeping({ onBack }) {
     try {
       await fetch(`${API_URL}/housekeeping/assign`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('adminToken')}` },
+        headers: getApiHeaders(localStorage.getItem('adminToken'), { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ roomId, priority: newPriority })
       });
       fetchRooms();
+
     } catch (err) {
       console.error(err);
     }

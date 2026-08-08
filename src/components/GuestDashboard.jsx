@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { API_URL, getApiHeaders } from '../config/apiConfig';
+
 import GuestBookingWizard from './GuestBookingWizard';
 import GuestActiveStayOverview from './GuestActiveStayOverview';
 import GuestBilling from './GuestBilling';
@@ -92,9 +94,9 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
 
   // ΓöÇΓöÇΓöÇ Phase 2 API Helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   const apiFetch = useCallback(async (path, opts = {}) => {
-    const res = await fetch(`http://localhost:5000/api${path}`, {
+    const res = await fetch(`${API_URL}${path}`, {
       ...opts,
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}`, ...(opts.headers || {}) }
+      headers: getApiHeaders(token, { 'Content-Type': 'application/json', ...(opts.headers || {}) })
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Request failed');
@@ -1148,11 +1150,12 @@ export default function GuestDashboard({ user, token, rooms, systemDate, onLogou
                       fd.append('idDocument', reuploadFile);
                       fd.append('governmentId', reuploadGovId.trim());
                       fd.append('idType', reuploadIdType);
-                      const res = await fetch('http://localhost:5000/api/guest/upload-id', {
+                      const res = await fetch(`${API_URL}/guest/upload-id`, {
                         method: 'POST',
-                        headers: { 'Authorization': `Bearer ${token}` },
+                        headers: getApiHeaders(token),
                         body: fd
                       });
+
                       const data = await res.json();
                       if (!res.ok) throw new Error(data.error || data.message || 'Upload failed');
                       setReuploadSuccess(true);

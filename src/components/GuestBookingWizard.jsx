@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
 import PaymentPanel from './PaymentPanel';
+import { API_URL, getApiHeaders } from '../config/apiConfig';
+
 
 export default function GuestBookingWizard({
   user,
@@ -342,13 +344,11 @@ export default function GuestBookingWizard({
     try {
       const activeExtraGuests = extraGuests.slice(0, numGuests - 1);
 
-      const res = await fetch(`http://localhost:5000/api/rooms/${selectedRoomNumber}/book`, {
+      const res = await fetch(`${API_URL}/rooms/${selectedRoomNumber}/book`, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
+        headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({
+
           guestName: guestName.trim(),
           phone: guestPhone.trim(),
           email: guestEmail.trim(),

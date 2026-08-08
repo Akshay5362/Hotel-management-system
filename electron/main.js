@@ -386,26 +386,35 @@ function createWindow() {
     });
   }
 
+  const targetApiBase = (process.env.VITE_API_BASE_URL || 'http://localhost:5000').replace(/\/+$/, '');
+  const isAllowedOrigin = (testUrl) => {
+    if (!testUrl) return false;
+    if (testUrl.startsWith('http://localhost:5000') || testUrl.startsWith('http://localhost:5173') || testUrl.startsWith(targetApiBase)) return true;
+    try {
+      const hostname = new URL(testUrl).hostname;
+      if (hostname.endsWith('.ngrok-free.dev') || hostname.endsWith('.ngrok.io')) return true;
+    } catch {}
+    return false;
+  };
+
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('http://localhost:5000') || url.startsWith('http://localhost:5173'))
-      return { action: 'allow' };
+    if (isAllowedOrigin(url)) return { action: 'allow' };
     shell.openExternal(url);
     return { action: 'deny' };
   });
 
   mainWindow.webContents.on('will-navigate', (event, navUrl) => {
-    // USES_VITE modes (local/docker-dev) navigate within the Vite dev server;
-    // docker/production modes navigate within the dist/ file:// origin.
     let allowed = USES_VITE
-      ? (navUrl.startsWith(DEV_URL) || navUrl.startsWith('http://localhost:5000'))
+      ? (navUrl.startsWith(DEV_URL) || isAllowedOrigin(navUrl))
       : (() => {
           const prodDir = path.dirname(PROD_ENTRY).replace(/\\/g, '/');
           return navUrl.startsWith(`file:///${prodDir}`) ||
                  navUrl.startsWith(`file://${prodDir}`)  ||
-                 navUrl.startsWith('http://localhost:5000');
+                 isAllowedOrigin(navUrl);
         })();
     if (!allowed) { L('NAV', `Blocked navigation to: ${navUrl}`); event.preventDefault(); }
   });
+
 
   mainWindow.on('closed', () => { mainWindow = null; });
 

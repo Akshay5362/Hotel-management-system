@@ -19,19 +19,19 @@ import autoTable from 'jspdf-autotable';
  *   Balance Due = 0
  *   Status = PAID
  */
+import { API_URL, getApiHeaders } from '../config/apiConfig';
+
 export const generateInvoicePDF = async (room, action = 'download') => {
   try {
     const token = localStorage.getItem('adminToken') || localStorage.getItem('token');
     
     // Fetch or reserve a sequential invoice number from the server
-    const res = await fetch(`http://localhost:5000/api/invoices/generate/${room.booking_id}`, {
+    const res = await fetch(`${API_URL}/invoices/generate/${room.booking_id}`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(token ? { 'Authorization': `Bearer ${token}` } : {})
-      }
+      headers: getApiHeaders(token, { 'Content-Type': 'application/json' })
     });
     const data = await res.json();
+
     const invoiceNumber = data.invoiceNumber || `INV-TEMP-${Math.floor(Math.random() * 10000)}`;
 
     const doc = new jsPDF();

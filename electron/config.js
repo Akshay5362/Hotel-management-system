@@ -63,8 +63,9 @@ export const SPAWNS_BACKEND = ELECTRON_MODE === MODES.PRODUCTION;
 /** Vite dev server — fixed to :5173 with strictPort, never drifts */
 export const VITE_URL = 'http://localhost:5173';
 
-/** Express backend API base URL — identical in every mode */
-export const API_BASE_URL = 'http://localhost:5000';
+/** Express backend API base URL — reads VITE_API_BASE_URL or defaults to localhost:5000 */
+export const API_BASE_URL = (process.env.VITE_API_BASE_URL || 'http://localhost:5000').replace(/\/+$/, '');
+
 
 /** Backend health check endpoint polled before window opens */
 export const HEALTH_URL = `${API_BASE_URL}/api/health`;

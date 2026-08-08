@@ -1,4 +1,6 @@
-﻿import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { API_URL, getApiHeaders } from '../config/apiConfig';
+
 
 /**
  * Parses a PMS date string like "17-Jul-2026" or "2026-07-17" into a JS Date (midnight UTC).
@@ -78,8 +80,8 @@ export default function RefundCheckoutModal({ isOpen, onClose, room, token, onRe
     if (!token) return;
     try {
       setLoadingPolicy(true);
-      const res = await fetch('http://localhost:5000/api/refund-policy', {
-        headers: { Authorization: `Bearer ${token}` }
+      const res = await fetch(`${API_URL}/refund-policy`, {
+        headers: getApiHeaders(token)
       });
       if (res.ok) {
         const data = await res.json();
@@ -110,9 +112,9 @@ export default function RefundCheckoutModal({ isOpen, onClose, room, token, onRe
     if (vals.slice(0,3).some(v => v < 0 || v > 100)) { showAlert('Percentages must be between 0–100.', 'Validation Error'); return; }
     try {
       setSavingPolicy(true);
-      const res = await fetch('http://localhost:5000/api/refund-policy', {
+      const res = await fetch(`${API_URL}/refund-policy`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ noStayPct: vals[0], partialStayPct: vals[1], fullStayPct: vals[2], partialHours: vals[3] })
       });
       if (res.ok) { setPolicyDirty(false); showAlert('Refund policy saved successfully.', 'Policy Updated'); }
@@ -130,9 +132,9 @@ export default function RefundCheckoutModal({ isOpen, onClose, room, token, onRe
     if (!confirmed) return;
     try {
       setProcessing(true);
-      const res = await fetch(`http://localhost:5000/api/rooms/${room.number}/refund-checkout`, {
+      const res = await fetch(`${API_URL}/rooms/${room.number}/refund-checkout`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ refundAmount: finalRefund, reason })
       });
       if (res.ok) { onRefundComplete(room.number, finalRefund); }
