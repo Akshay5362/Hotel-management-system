@@ -2,6 +2,7 @@ import pool from '../db.js';
 import { BusinessDateService } from '../services/businessDateService.js';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
+import { db, auth, isFirebaseConfigured } from '../config/firebaseAdmin.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'hotel-pms-super-secret-key-12345!';
 
@@ -102,14 +103,28 @@ export const signUp = async (req, res) => {
     };
 
     const token = generateToken(user);
-    res.status(201).json({ message: 'Account registered successfully', user, token });
+    res.status(201).json({
+      message: 'Account registered successfully',
+      user,
+      token
+    });
+
   } catch (error) {
-    if (connection) { try { await connection.rollback(); } catch (e) { } }
-    if (error.code === 'ER_DUP_ENTRY') {
-      return res.status(400).json({ error: 'An account with this phone number already exists. Try signing in instead.' });
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (e) {}
     }
+
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(400).json({
+        error: 'An account with this phone number already exists. Try signing in instead.'
+      });
+    }
+
     console.error('Error during signUp:', error);
     res.status(500).json({ error: 'Internal Server Error' });
+
   } finally {
     if (connection) connection.release();
   }
@@ -178,6 +193,12 @@ export const signIn = async (req, res) => {
     }
 
     const { password: _omit, ...safeUser } = user;
+
+    // Phase 1: Guest Lazy Auth Migration Trigger
+    if ((safeUser.role === 'guest' || !safeUser.role) && process.env.ENABLE_FIREBASE_AUTH === 'true') {
+      await ensureGuestLazyAuthMigration(safeUser, password);
+    }
+
     const token = generateToken(safeUser);
 
     const businessDate = await BusinessDateService.getBusinessDate(pool);
@@ -193,6 +214,119 @@ export const signIn = async (req, res) => {
   }
 };
 
+/**
+ * Idempotent Guest Lazy Auth Migration Helper
+ * Dynamically creates/links MySQL guests profile, provisions Firebase Auth user,
+ * assigns custom claims { role: "guest", user_type: "guest", mysql_id },
+ * and writes/syncs Firestore /guests/guest_${mysql_guest_id} document.
+ */
+export async function ensureGuestLazyAuthMigration(user, cleartextPassword) {
+  if (!user || !user.id) return;
+  const isEnabled = process.env.ENABLE_FIREBASE_AUTH === 'true';
+  if (!isEnabled || !isFirebaseConfigured || !auth || !db) return;
+
+  try {
+    // Step 1: Ensure dedicated MySQL guests table record exists for user.id
+    const [existingGuests] = await pool.query(
+      `SELECT id, full_name, email, phone, loyalty_tier, loyalty_points, created_at FROM guests WHERE user_id = ?`,
+      [user.id]
+    );
+
+    let mysqlGuestId = null;
+    let guestProfile = null;
+
+    if (existingGuests.length > 0) {
+      mysqlGuestId = existingGuests[0].id;
+      guestProfile = existingGuests[0];
+    } else {
+      // Create new dedicated guest profile for this customer
+      const [insertRes] = await pool.query(
+        `INSERT INTO guests (full_name, phone, user_id) VALUES (?, ?, ?)`,
+        [user.fullName || user.username, user.phone || null, user.id]
+      );
+      mysqlGuestId = insertRes.insertId;
+      guestProfile = {
+        id: mysqlGuestId,
+        full_name: user.fullName || user.username,
+        phone: user.phone || null,
+        email: null,
+        loyalty_tier: 'Bronze',
+        loyalty_points: 0,
+        created_at: new Date()
+      };
+    }
+
+    // Step 2: Ensure Firebase Auth user exists
+    const expectedUid = `guest_${user.id}`;
+    const emailToUse = (user.username && user.username.includes('@'))
+      ? user.username.toLowerCase()
+      : `${user.username || 'guest_' + user.id}@hpms-sky5.internal`;
+
+    let authUser = null;
+    try {
+      authUser = await auth.getUser(expectedUid);
+    } catch (e) {
+      try {
+        authUser = await auth.getUserByEmail(emailToUse);
+      } catch (e2) {}
+    }
+
+    if (!authUser) {
+      authUser = await auth.createUser({
+        uid: expectedUid,
+        email: emailToUse,
+        emailVerified: true,
+        password: cleartextPassword || 'GuestPassword123!',
+        displayName: user.fullName || user.username
+      });
+    }
+
+    const actualUid = authUser.uid;
+
+    // Step 3: Ensure Custom Claims are set
+    const currentClaims = authUser.customClaims || {};
+    if (currentClaims.role !== 'guest' || currentClaims.user_type !== 'guest' || Number(currentClaims.mysql_id) !== user.id) {
+      await auth.setCustomUserClaims(actualUid, {
+        role: 'guest',
+        user_type: 'guest',
+        mysql_id: user.id
+      });
+    }
+
+    // Step 4: Ensure Firestore document /guests/guest_${mysqlGuestId} is created/synced
+    const docRef = db.collection('guests').doc(`guest_${mysqlGuestId}`);
+    const docSnap = await docRef.get();
+
+    const firestoreData = {
+      mysql_guest_id: mysqlGuestId,
+      mysql_user_id: user.id,
+      user_uid: actualUid,
+      full_name: guestProfile.full_name || user.fullName || user.username,
+      email: guestProfile.email || emailToUse,
+      phone: guestProfile.phone || user.phone || null,
+      loyalty_tier: guestProfile.loyalty_tier || 'Bronze',
+      loyalty_points: guestProfile.loyalty_points || 0,
+      updated_at: new Date().toISOString()
+    };
+
+    if (!docSnap.exists) {
+      firestoreData.created_at = (guestProfile.created_at instanceof Date)
+        ? guestProfile.created_at.toISOString()
+        : new Date().toISOString();
+      await docRef.set(firestoreData);
+    } else {
+      await docRef.update({
+        user_uid: actualUid,
+        updated_at: firestoreData.updated_at
+      });
+    }
+
+    console.log(`[GuestLazyAuth] Idempotent migration success for User ID ${user.id} -> Guest ID ${mysqlGuestId} -> UID '${actualUid}'`);
+  } catch (err) {
+    console.error(`[GuestLazyAuth Error] Failed lazy migration for User ID ${user?.id}:`, err);
+  }
+}
+
 // ── Middleware ─────────────────────────────────────────────────────────────
 
 export const authenticate = async (req, res, next) => {
@@ -205,6 +339,32 @@ export const authenticate = async (req, res, next) => {
   }
 
   const token = parts[1];
+
+  // Dual Auth Resolution: Attempt Firebase ID token verification if feature flag is enabled
+  const isFirebaseAuthEnabled = process.env.ENABLE_FIREBASE_AUTH === 'true';
+
+  if (isFirebaseAuthEnabled && isFirebaseConfigured && auth) {
+    try {
+      const decodedFirebase = await auth.verifyIdToken(token);
+      if (decodedFirebase) {
+        req.firebaseUser = decodedFirebase;
+        req.user = {
+          uid: decodedFirebase.uid,
+          email: decodedFirebase.email || null,
+          role: decodedFirebase.role || 'guest',
+          type: decodedFirebase.user_type || (decodedFirebase.role === 'guest' ? 'guest' : 'staff'),
+          id: decodedFirebase.mysql_id || null,
+          mysql_id: decodedFirebase.mysql_id || null,
+          authProvider: 'firebase'
+        };
+        return next();
+      }
+    } catch (fbError) {
+      // Fallback to legacy JWT verification below if Firebase token verification fails
+    }
+  }
+
+  // Legacy HMAC-SHA256 JWT verification fallback
   const decoded = verifyToken(token);
   if (!decoded) return res.status(401).json({ error: 'Invalid or expired token' });
 
@@ -254,4 +414,82 @@ export const hasPermission = async (req, permissionName) => {
     WHERE LOWER(r.name) = ? AND p.name = ?
   `, [roleName, permissionName]);
   return rows.length > 0;
+};
+
+/**
+ * Role Normalization Helper
+ * Maps legacy database/staff roles to normalized canonical role names:
+ * - Root user admin (users.id = 1, role = 'admin', type !== 'staff') -> 'super_admin'
+ * - Staff ADMIN (type === 'staff', role === 'ADMIN' | 'admin') -> 'admin'
+ * - Staff RECEPTIONIST -> 'receptionist'
+ * - Staff CLEANER -> 'housekeeper'
+ * - Staff CHEF / KITCHEN_HELPER / PANTRY_BOY -> 'kitchen'
+ * - Guest -> 'guest'
+ */
+export function normalizeUserRole(user) {
+  if (!user) return null;
+  const isStaff = user.type === 'staff';
+  const rawRole = String(user.role || '').toUpperCase().trim();
+
+  // Root Super Admin check: user in users table with role 'admin' and not staff
+  if (!isStaff && rawRole === 'ADMIN') {
+    return 'super_admin';
+  }
+
+  // Staff role mapping
+  if (isStaff) {
+    if (rawRole === 'ADMIN') return 'admin';
+    if (rawRole === 'RECEPTIONIST') return 'receptionist';
+    if (rawRole === 'CLEANER') return 'housekeeper';
+    if (['CHEF', 'KITCHEN_HELPER', 'PANTRY_BOY'].includes(rawRole)) return 'kitchen';
+    return rawRole.toLowerCase();
+  }
+
+  return rawRole.toLowerCase();
+}
+
+/**
+ * Flexible multi-role authorization middleware supporting feature flag ENABLE_STRICT_RBAC.
+ *
+ * When process.env.ENABLE_STRICT_RBAC === 'true':
+ *   - Enforces strict canonical role matching.
+ * When process.env.ENABLE_STRICT_RBAC !== 'true' (default/absent):
+ *   - Preserves legacy requireAdmin authorization behavior for backwards compatibility.
+ */
+export const requireRole = (...allowedRoles) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authorization token required' });
+    }
+
+    const isStrictEnabled = process.env.ENABLE_STRICT_RBAC === 'true';
+
+    if (!isStrictEnabled) {
+      // Legacy backwards-compatible behavior: allow if admin or staff
+      if (req.user.role === 'admin' || req.user.type === 'staff') {
+        return next();
+      }
+      return res.status(403).json({ error: 'Forbidden: Admin or Staff access required' });
+    }
+
+    // Strict RBAC behavior
+    const normalizedRole = normalizeUserRole(req.user);
+
+    // super_admin inherits admin privileges
+    const effectiveRoles = [normalizedRole];
+    if (normalizedRole === 'super_admin') {
+      effectiveRoles.push('admin');
+    }
+
+    const isAllowed = allowedRoles.some(role => effectiveRoles.includes(role.toLowerCase()));
+
+    if (isAllowed) {
+      return next();
+    }
+
+    return res.status(403).json({
+      error: `Forbidden: Access restricted. Requires one of: [${allowedRoles.join(', ')}]`,
+      code: 'INSUFFICIENT_ROLE_PRIVILEGES'
+    });
+  };
 };

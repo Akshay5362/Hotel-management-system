@@ -11,17 +11,15 @@
   "type": "module",
   "main": "electron/main.js",
   "scripts": {
-    "dev":     "vite",
-    "build":   "vite build",
+    "dev": "vite",
+    "build": "vite build",
     "preview": "vite preview",
-
     "backend:dev": "cd backend && node server.js",
-
-    "electron:local":      "wait-on http://localhost:5173 http://localhost:5000/api/health --timeout 60000 && cross-env ELECTRON_MODE=local NODE_ENV=development electron .",
+    "electron:local": "wait-on http://localhost:5173 http://localhost:5000/api/health --timeout 60000 && cross-env ELECTRON_MODE=local NODE_ENV=development electron .",
     "electron:docker-dev": "wait-on http://localhost:5173 http://localhost:5000/api/health --timeout 120000 && cross-env ELECTRON_MODE=docker-dev NODE_ENV=development electron .",
-    "electron:docker":     "wait-on http://localhost:5000/api/health --timeout 120000 && cross-env ELECTRON_MODE=docker NODE_ENV=development electron .",
-    "electron:prod":       "npm run build && cross-env ELECTRON_MODE=production NODE_ENV=production electron .",
-    "electron:build":      "npm run build && electron-builder --win"
+    "electron:docker": "wait-on http://localhost:5000/api/health --timeout 120000 && cross-env ELECTRON_MODE=docker NODE_ENV=development electron .",
+    "electron:prod": "npm run build && cross-env ELECTRON_MODE=production NODE_ENV=production electron .",
+    "electron:build": "npm run build && electron-builder --win"
   },
   "build": {
     "appId": "com.webline.pms",
@@ -88,24 +86,25 @@
     }
   },
   "dependencies": {
-    "jspdf":            "^4.2.1",
-    "jspdf-autotable":  "^5.0.8",
-    "lucide-react":     "^1.25.0",
-    "react":            "^18.3.1",
-    "react-dom":        "^18.3.1",
-    "recharts":         "^3.10.0",
+    "firebase": "^12.17.1",
+    "jspdf": "^4.2.1",
+    "jspdf-autotable": "^5.0.8",
+    "lucide-react": "^1.25.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^3.10.0",
     "socket.io-client": "^4.8.3",
-    "xlsx":             "^0.18.5"
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
-    "@types/react":         "^18.3.3",
-    "@types/react-dom":     "^18.3.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
-    "concurrently":         "^10.0.3",
-    "cross-env":            "^10.1.0",
-    "electron":             "^43.1.1",
-    "electron-builder":     "^26.15.3",
-    "vite":                 "^5.3.1",
-    "wait-on":              "^9.0.10"
+    "concurrently": "^10.0.3",
+    "cross-env": "^10.1.0",
+    "electron": "^43.1.1",
+    "electron-builder": "^26.15.3",
+    "vite": "^5.3.1",
+    "wait-on": "^9.0.10"
   }
 }

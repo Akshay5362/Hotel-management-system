@@ -70,4 +70,7 @@ release/
 win-unpacked/
 win-unpacked.tmp/
 dist-electron/
-*.exe
+*.exebackups/
+node_modules/
+.env
+/backups/

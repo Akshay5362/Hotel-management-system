@@ -1,4 +1,5 @@
-import React, { createContext, useState } from 'react';
+import React, { createContext, useState, useEffect } from 'react';
+import { auth, signOut, onAuthStateChanged } from '../config/firebaseClient';
 
 export const AdminAuthContext = createContext(null);
 
@@ -12,6 +13,22 @@ export function AdminAuthProvider({ children }) {
     return localStorage.getItem('adminToken') || '';
   });
 
+  useEffect(() => {
+    if (!auth) return;
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (firebaseUser) {
+        try {
+          const freshToken = await firebaseUser.getIdToken(true);
+          setAdminToken(freshToken);
+          localStorage.setItem('adminToken', freshToken);
+        } catch (e) {
+          console.warn('[AdminAuthContext] Token refresh failed:', e.message);
+        }
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
   const login = (userData, tokenData) => {
     localStorage.setItem('adminUser', JSON.stringify(userData));
     localStorage.setItem('adminToken', tokenData);
@@ -19,7 +36,14 @@ export function AdminAuthProvider({ children }) {
     setAdminToken(tokenData);
   };
 
-  const logout = () => {
+  const logout = async () => {
+    if (auth) {
+      try {
+        await signOut(auth);
+      } catch (e) {
+        console.warn('[AdminAuthContext] Firebase signOut warning:', e.message);
+      }
+    }
     localStorage.removeItem('adminUser');
     localStorage.removeItem('adminToken');
     setAdminUser(null);

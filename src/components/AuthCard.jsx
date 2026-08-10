@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { API_BASE_URL, getApiHeaders } from '../config/apiConfig';
+import { auth, signInWithEmailAndPassword, isClientConfigured } from '../config/firebaseClient';
 
 
 export default function AuthCard({ isAdmin = false, initialIsSignUp = false, onAuthSuccess, showAlert, onNavigate }) {
@@ -36,6 +37,57 @@ export default function AuthCard({ isAdmin = false, initialIsSignUp = false, onA
     }
 
     setIsLoading(true);
+
+    if (isAdmin && isClientConfigured && auth) {
+      let emailToUse = username.trim().toLowerCase();
+      if (!emailToUse.includes('@')) {
+        const USERNAME_EMAIL_MAP = {
+          'admin': 'admin@hotelsky5.com',
+          'superadmin': 'admin@hpms-sky5.internal',
+          'reception_morning': 'reception.morning@hotelsky5.com',
+          'reception_evening': 'reception.evening@hotelsky5.com',
+          'reception_night': 'reception.night@hotelsky5.com',
+          'chef': 'chef@hotelsky5.com',
+          'helper': 'helper@hotelsky5.com',
+          'pantry1': 'pantry1@hotelsky5.com',
+          'pantry2': 'pantry2@hotelsky5.com',
+          'cleaner1': 'cleaner1@hotelsky5.com',
+          'cleaner2': 'cleaner2@hotelsky5.com',
+          'reception2': 'reception2@hotelsky5.com'
+        };
+        emailToUse = USERNAME_EMAIL_MAP[emailToUse] || `${emailToUse}@hotelsky5.com`;
+      }
+
+      try {
+        const userCredential = await signInWithEmailAndPassword(auth, emailToUse, password);
+        const idToken = await userCredential.user.getIdToken(true);
+
+        const verifyRes = await fetch(`${API_BASE_URL}/api/status`, {
+          method: 'GET',
+          headers: getApiHeaders(idToken)
+        });
+
+        const verifyData = await verifyRes.json();
+        if (!verifyRes.ok) {
+          throw new Error(verifyData.error || 'Server authorization failed');
+        }
+
+        const verifiedUser = verifyData.user || {
+          username: userCredential.user.displayName || emailToUse,
+          role: emailToUse === 'admin@hpms-sky5.internal' ? 'super_admin' : 'admin',
+          loginType: 'staff'
+        };
+
+        showAlert('Logged in successfully via Firebase Auth!', 'Authentication Success');
+        onAuthSuccess(verifiedUser, idToken);
+        return;
+      } catch (fbErr) {
+        console.warn('[AuthCard] Firebase Client Auth login attempt failed/fallback:', fbErr.message);
+      } finally {
+        setIsLoading(false);
+      }
+    }
+
     const endpoint = (!isAdmin && isSignUp) ? '/api/auth/signup' : '/api/auth/signin';
     
     // The frontend must not send the role for guest sign up
@@ -44,13 +96,11 @@ export default function AuthCard({ isAdmin = false, initialIsSignUp = false, onA
       : { username, password };
 
     try {
-
       const res = await fetch(`${API_BASE_URL}${endpoint}`, {
         method: 'POST',
         headers: getApiHeaders(null, { 'Content-Type': 'application/json' }),
         body: JSON.stringify(payload)
       });
-
 
       const data = await res.json();
       if (!res.ok) {

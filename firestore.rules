@@ -1,0 +1,94 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Global Deny-by-Default Fallback ──────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ── Helper Functions ──────────────────────────────────────────────────────
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserRole() {
+      return isAuthenticated() && request.auth.token.role != null
+        ? request.auth.token.role
+        : 'guest';
+    }
+
+    function isAdmin() {
+      return getUserRole() == 'admin';
+    }
+
+    function isStaff() {
+      return getUserRole() == 'admin' || getUserRole() == 'staff' || getUserRole() == 'receptionist';
+    }
+
+    function isOwner(userUid) {
+      return isAuthenticated() && request.auth.uid == userUid;
+    }
+
+    // ── Collection Rules ──────────────────────────────────────────────────────
+    match /settings/{settingId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    match /users/{userUid} {
+      allow read: if isOwner(userUid) || isStaff();
+      allow write: if isOwner(userUid) || isAdmin();
+    }
+
+    match /guests/{guestId} {
+      allow read: if isStaff() || (isAuthenticated() && resource.data.user_uid == request.auth.uid);
+      allow write: if isStaff() || (isAuthenticated() && request.resource.data.user_uid == request.auth.uid);
+    }
+
+    match /rooms/{roomId} {
+      allow read: if isAuthenticated();
+      allow write: if isStaff();
+    }
+
+    match /bookings/{bookingId} {
+      allow read: if isStaff() || (isAuthenticated() && resource.data.guest_user_uid == request.auth.uid);
+      allow write: if isStaff();
+
+      match /ledger_items/{itemId} {
+        allow read: if isStaff() || (isAuthenticated() && get(/databases/$(database)/documents/bookings/$(bookingId)).data.guest_user_uid == request.auth.uid);
+        allow write: if isStaff();
+      }
+
+      match /payments/{paymentId} {
+        allow read: if isStaff() || (isAuthenticated() && get(/databases/$(database)/documents/bookings/$(bookingId)).data.guest_user_uid == request.auth.uid);
+        allow write: if isStaff();
+      }
+    }
+
+    match /reservations/{reservationId} {
+      allow read, write: if isStaff();
+    }
+
+    match /stay_extensions/{extensionId} {
+      allow read: if isStaff() || (isAuthenticated() && resource.data.guest_user_uid == request.auth.uid);
+      allow create: if isAuthenticated() && request.resource.data.guest_user_uid == request.auth.uid;
+      allow update, delete: if isStaff();
+    }
+
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated() && resource.data.user_uid == request.auth.uid;
+      allow write: if isStaff();
+    }
+
+    // Highly Sensitive Collections: Server-Side / Admin SDK Only
+    match /checkout_snapshots/{snapshotId} {
+      allow read, write: if false; // Accessed strictly via Admin SDK in Cloud Functions
+    }
+
+    match /daily_analytics/{analyticsId} {
+      allow read: if isStaff();
+      allow write: if false; // Updated strictly via Cloud Function triggers
+    }
+  }
+}
