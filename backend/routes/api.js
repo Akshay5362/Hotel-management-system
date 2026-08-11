@@ -15,6 +15,7 @@ import reservationRoutes from './reservationRoutes.js';
 
 import factoryResetRoutes from './factoryResetRoutes.js';
 import inventoryRoutes from './inventoryRoutes.js';
+import roomTypeRoutes from './roomTypeRoutes.js';
 
 const router = express.Router();
 
@@ -114,6 +115,9 @@ router.use('/reservations', reservationRoutes);
 
 // ── Inventory Module ────────────────────────────────────────────────────────
 router.use('/inventory', authenticate, inventoryRoutes);
+
+// ── Room Types Module (Phase 3B Pilot) ─────────────────────────────────────
+router.use('/room-types', roomTypeRoutes);
 
 // ── Factory Reset Module (Phase 1 Architecture) ─────────────────────────────
 router.use('/system/factory-reset', factoryResetRoutes);

@@ -8,6 +8,8 @@ import pool from '../db.js';
 import { BusinessDateService } from '../services/businessDateService.js';
 import { VALID_UNITS, VALID_STATUSES } from '../utils/inventoryConstants.js';
 import { removeOldProductPhoto } from '../middleware/inventoryUploadMiddleware.js';
+import { enqueue } from '../services/outboxService.js';
+import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
 
 /**
  * GET /api/inventory/categories
@@ -22,6 +24,170 @@ export const getCategories = async (req, res) => {
   } catch (error) {
     console.error('getCategories error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+/**
+ * POST /api/inventory/categories
+ * Creates a new inventory category.
+ */
+export const createCategory = async (req, res) => {
+  const { name, department } = req.body;
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ error: 'Category name is required.' });
+  }
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const catName = name.trim();
+    const catDept = (department && typeof department === 'string' && department.trim()) ? department.trim() : 'General';
+
+    const [result] = await connection.query(
+      'INSERT INTO inventory_categories (name, department) VALUES (?, ?)',
+      [catName, catDept]
+    );
+
+    const catId = result.insertId;
+
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'INVENTORY_CATEGORY_CREATED',
+        aggregate_type: 'INVENTORY_CATEGORY',
+        aggregate_id: catName,
+        payload: {
+          name: catName,
+          department: catDept,
+          mysql_category_id: catId,
+          updated_at: new Date().toISOString()
+        }
+      });
+    }
+
+    await connection.commit();
+    return res.status(201).json({ message: 'Category created successfully.', category: { id: catId, name: catName, department: catDept } });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: `Category '${name.trim()}' already exists.` });
+    }
+    console.error('createCategory error:', error);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+/**
+ * PUT /api/inventory/categories/:id
+ * Updates an inventory category.
+ */
+export const updateCategory = async (req, res) => {
+  const { id } = req.params;
+  const { name, department } = req.body;
+
+  if (!id) return res.status(400).json({ error: 'Category ID is required.' });
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [existing] = await connection.query('SELECT * FROM inventory_categories WHERE id = ? FOR UPDATE', [id]);
+    if (existing.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Category not found.' });
+    }
+
+    const currentCat = existing[0];
+    const catName = (name && typeof name === 'string' && name.trim()) ? name.trim() : currentCat.name;
+    const catDept = (department && typeof department === 'string' && department.trim()) ? department.trim() : currentCat.department;
+
+    await connection.query(
+      'UPDATE inventory_categories SET name = ?, department = ? WHERE id = ?',
+      [catName, catDept, id]
+    );
+
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'INVENTORY_CATEGORY_UPDATED',
+        aggregate_type: 'INVENTORY_CATEGORY',
+        aggregate_id: catName,
+        payload: {
+          name: catName,
+          department: catDept,
+          mysql_category_id: Number(id),
+          updated_at: new Date().toISOString()
+        }
+      });
+    }
+
+    await connection.commit();
+    return res.json({ message: 'Category updated successfully.', category: { id: Number(id), name: catName, department: catDept } });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: `Category name '${name}' is already taken.` });
+    }
+    console.error('updateCategory error:', error);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+/**
+ * DELETE /api/inventory/categories/:id
+ * Deletes an inventory category.
+ */
+export const deleteCategory = async (req, res) => {
+  const { id } = req.params;
+  if (!id) return res.status(400).json({ error: 'Category ID is required.' });
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [existing] = await connection.query('SELECT * FROM inventory_categories WHERE id = ? FOR UPDATE', [id]);
+    if (existing.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Category not found.' });
+    }
+
+    const catRecord = existing[0];
+
+    const [prods] = await connection.query('SELECT COUNT(*) as count FROM inventory_products WHERE category_id = ?', [id]);
+    if (prods[0].count > 0) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Cannot delete category that contains inventory products.' });
+    }
+
+    await connection.query('DELETE FROM inventory_categories WHERE id = ?', [id]);
+
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'INVENTORY_CATEGORY_DELETED',
+        aggregate_type: 'INVENTORY_CATEGORY',
+        aggregate_id: catRecord.name,
+        payload: {
+          name: catRecord.name,
+          docId: `cat_${catRecord.name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')}`,
+          mysql_category_id: Number(id)
+        }
+      });
+    }
+
+    await connection.commit();
+    return res.json({ message: 'Category deleted successfully.' });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.error('deleteCategory error:', error);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -261,6 +427,31 @@ export const createProduct = async (req, res) => {
       [userId, `Created inventory product: SKU=${sku.trim().toUpperCase()}, Name=${name.trim()}, InitialStock=${currentStockNum}`, businessDate]
     );
 
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'INVENTORY_PRODUCT_CREATED',
+        aggregate_type: 'INVENTORY_PRODUCT',
+        aggregate_id: sku.trim().toUpperCase(),
+        payload: {
+          sku: sku.trim().toUpperCase(),
+          name: name.trim(),
+          category_id: catIdNum,
+          mysql_category_id: catIdNum,
+          unit_of_measure,
+          unit: unit_of_measure,
+          minimum_stock_level: minStockNum,
+          reorder_level: minStockNum,
+          current_stock: currentStockNum,
+          stock_quantity: currentStockNum,
+          unit_price: priceNum,
+          photo_url,
+          status: prodStatus,
+          mysql_product_id: productId,
+          updated_at: new Date().toISOString()
+        }
+      });
+    }
+
     await connection.commit();
 
     return res.status(201).json({
@@ -384,6 +575,29 @@ export const updateProduct = async (req, res) => {
       [userId, `Updated inventory product: SKU=${currentProduct.sku}, Name=${updates.name}`, businessDate]
     );
 
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'INVENTORY_PRODUCT_UPDATED',
+        aggregate_type: 'INVENTORY_PRODUCT',
+        aggregate_id: currentProduct.sku,
+        payload: {
+          sku: currentProduct.sku,
+          name: updates.name,
+          category_id: updates.category_id,
+          mysql_category_id: updates.category_id,
+          unit_of_measure: updates.unit_of_measure,
+          unit: updates.unit_of_measure,
+          minimum_stock_level: updates.minimum_stock_level,
+          reorder_level: updates.minimum_stock_level,
+          unit_price: updates.unit_price,
+          photo_url: updates.photo_url,
+          status: updates.status,
+          mysql_product_id: Number(id),
+          updated_at: new Date().toISOString()
+        }
+      });
+    }
+
     await connection.commit();
 
     // Safely remove old photo if it was replaced (post-commit to ensure DB safety)
@@ -442,6 +656,21 @@ export const deleteProduct = async (req, res) => {
       `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'INVENTORY_PRODUCT_DEACTIVATED', ?, ?)`,
       [userId, `Deactivated inventory product: SKU=${product.sku}, Name=${product.name}`, businessDate]
     );
+
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'INVENTORY_PRODUCT_DEACTIVATED',
+        aggregate_type: 'INVENTORY_PRODUCT',
+        aggregate_id: product.sku,
+        payload: {
+          sku: product.sku,
+          name: product.name,
+          status: 'Inactive',
+          mysql_product_id: Number(id),
+          updated_at: new Date().toISOString()
+        }
+      });
+    }
 
     await connection.commit();
 

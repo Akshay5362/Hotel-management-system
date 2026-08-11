@@ -3,6 +3,8 @@ import { BusinessDateService } from '../services/businessDateService.js';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import { db, auth, isFirebaseConfigured } from '../config/firebaseAdmin.js';
+import { enqueue } from '../services/outboxService.js';
+import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'hotel-pms-super-secret-key-12345!';
 
@@ -89,6 +91,23 @@ export const signUp = async (req, res) => {
       `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'SIGNUP', ?, ?)`,
       [userId, `Guest account registered: ${cleanUsername} (${cleanFullName})`, businessDate]
     );
+
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'GUEST_CREATED',
+        aggregate_type: 'GUEST',
+        aggregate_id: cleanPhone,
+        payload: {
+          full_name: cleanFullName,
+          phone: cleanPhone,
+          email: null,
+          loyalty_tier: 'Bronze',
+          loyalty_points: 0,
+          mysql_user_id: userId,
+          updated_at: new Date().toISOString()
+        }
+      });
+    }
 
     await connection.commit();
 

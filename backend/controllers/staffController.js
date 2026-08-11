@@ -11,6 +11,8 @@
 import pool from '../db.js';
 import bcrypt from 'bcryptjs';
 import { generateToken } from './authController.js';
+import { enqueue } from '../services/outboxService.js';
+import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
 
 const BCRYPT_ROUNDS = 12;
 
@@ -60,14 +62,14 @@ function validateStaffPayload(body, requirePassword = true) {
   return errors;
 }
 
-// Strip sensitive fields before returning
+// Strip sensitive fields before returning or sending to outbox
 function sanitize(staff) {
-  const { password_hash, deleted, ...safe } = staff;
+  if (!staff) return null;
+  const { password_hash, password, deleted, ...safe } = staff;
   return safe;
 }
 
 // ── POST /api/staff/auth/login ─────────────────────────────────────────────────
-// Email + bcrypt password only. Username is a display name, NOT a login key.
 export const staffLogin = async (req, res) => {
   const { email, password } = req.body;
 
@@ -87,7 +89,6 @@ export const staffLogin = async (req, res) => {
 
     const staff = rows[0];
 
-    // Block inactive accounts before doing bcrypt (saves CPU on disabled accounts)
     if (staff.status === 'Inactive')
       return res.status(403).json({ error: 'Your account is inactive. Please contact an administrator.' });
 
@@ -95,14 +96,12 @@ export const staffLogin = async (req, res) => {
     if (!passwordMatch)
       return res.status(401).json({ error: 'Invalid email or password.' });
 
-    // Update last_login timestamp (fire-and-forget — never block the login response)
     pool.query('UPDATE staff SET last_login = NOW() WHERE id = ?', [staff.id]).catch(() => {});
 
-    // Build a signed token. type:'staff' distinguishes it from admin/guest tokens.
     const tokenPayload = {
       id:   staff.id,
-      role: staff.role,       // e.g. 'RECEPTIONIST'
-      type: 'staff',          // sentinel — allows middleware to identify staff tokens
+      role: staff.role,
+      type: 'staff',
     };
     const token = generateToken(tokenPayload);
 
@@ -177,10 +176,14 @@ export const createStaff = async (req, res) => {
 
   const { full_name, username, email, password, role, department, shift, phone, status } = req.body;
 
+  let connection;
   try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
     const password_hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
-    const [result] = await pool.query(
+    const [result] = await connection.query(
       `INSERT INTO staff (full_name, username, email, password_hash, role, department, shift, phone, status)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
@@ -196,9 +199,27 @@ export const createStaff = async (req, res) => {
       ]
     );
 
-    const [rows] = await pool.query('SELECT * FROM staff WHERE id = ?', [result.insertId]);
-    return res.status(201).json({ message: 'Staff member created successfully.', staff: sanitize(rows[0]) });
+    const [rows] = await connection.query('SELECT * FROM staff WHERE id = ?', [result.insertId]);
+    const staffRecord = rows[0];
+    const safeStaff = sanitize(staffRecord);
+
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'STAFF_CREATED',
+        aggregate_type: 'STAFF',
+        aggregate_id: safeStaff.username,
+        payload: {
+          ...safeStaff,
+          mysql_staff_id: safeStaff.id,
+          updated_at: new Date().toISOString()
+        }
+      });
+    }
+
+    await connection.commit();
+    return res.status(201).json({ message: 'Staff member created successfully.', staff: safeStaff });
   } catch (error) {
+    if (connection) await connection.rollback();
     if (error.code === 'ER_DUP_ENTRY') {
       if (error.message.includes('username'))
         return res.status(409).json({ error: 'Username is already taken. Please choose a different username.' });
@@ -207,6 +228,8 @@ export const createStaff = async (req, res) => {
     }
     console.error('createStaff error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -214,13 +237,19 @@ export const createStaff = async (req, res) => {
 export const updateStaff = async (req, res) => {
   const { id } = req.params;
 
-  // For updates, password is optional
   const errors = validateStaffPayload(req.body, !!req.body.password);
   if (errors.length) return res.status(400).json({ error: 'Validation failed.', details: errors });
 
+  let connection;
   try {
-    const [existing] = await pool.query('SELECT id FROM staff WHERE id = ? AND deleted = 0', [id]);
-    if (existing.length === 0) return res.status(404).json({ error: 'Staff member not found.' });
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [existing] = await connection.query('SELECT * FROM staff WHERE id = ? AND deleted = 0 FOR UPDATE', [id]);
+    if (existing.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Staff member not found.' });
+    }
 
     const { full_name, username, email, password, role, department, shift, phone, status } = req.body;
 
@@ -239,11 +268,29 @@ export const updateStaff = async (req, res) => {
       updates.password_hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     }
 
-    await pool.query('UPDATE staff SET ? WHERE id = ?', [updates, id]);
+    await connection.query('UPDATE staff SET ? WHERE id = ?', [updates, id]);
 
-    const [rows] = await pool.query('SELECT * FROM staff WHERE id = ?', [id]);
-    return res.json({ message: 'Staff member updated successfully.', staff: sanitize(rows[0]) });
+    const [rows] = await connection.query('SELECT * FROM staff WHERE id = ?', [id]);
+    const updatedStaffRecord = rows[0];
+    const safeStaff = sanitize(updatedStaffRecord);
+
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'STAFF_UPDATED',
+        aggregate_type: 'STAFF',
+        aggregate_id: safeStaff.username,
+        payload: {
+          ...safeStaff,
+          mysql_staff_id: safeStaff.id,
+          updated_at: new Date().toISOString()
+        }
+      });
+    }
+
+    await connection.commit();
+    return res.json({ message: 'Staff member updated successfully.', staff: safeStaff });
   } catch (error) {
+    if (connection) await connection.rollback();
     if (error.code === 'ER_DUP_ENTRY') {
       if (error.message.includes('username'))
         return res.status(409).json({ error: 'Username is already taken.' });
@@ -252,6 +299,8 @@ export const updateStaff = async (req, res) => {
     }
     console.error('updateStaff error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -263,15 +312,41 @@ export const updateStaffStatus = async (req, res) => {
   if (!status || !VALID_STATUSES.includes(status))
     return res.status(400).json({ error: `status must be one of: ${VALID_STATUSES.join(', ')}.` });
 
+  let connection;
   try {
-    const [existing] = await pool.query('SELECT id FROM staff WHERE id = ? AND deleted = 0', [id]);
-    if (existing.length === 0) return res.status(404).json({ error: 'Staff member not found.' });
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
 
-    await pool.query('UPDATE staff SET status = ? WHERE id = ?', [status, id]);
+    const [existing] = await connection.query('SELECT * FROM staff WHERE id = ? AND deleted = 0 FOR UPDATE', [id]);
+    if (existing.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Staff member not found.' });
+    }
+
+    const staffRecord = existing[0];
+    await connection.query('UPDATE staff SET status = ? WHERE id = ?', [status, id]);
+
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'STAFF_STATUS_CHANGED',
+        aggregate_type: 'STAFF',
+        aggregate_id: staffRecord.username,
+        payload: {
+          username: staffRecord.username,
+          status,
+          updated_at: new Date().toISOString()
+        }
+      });
+    }
+
+    await connection.commit();
     return res.json({ message: `Staff status updated to ${status}.` });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.error('updateStaffStatus error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -279,18 +354,45 @@ export const updateStaffStatus = async (req, res) => {
 export const deleteStaff = async (req, res) => {
   const { id } = req.params;
 
+  let connection;
   try {
-    const [existing] = await pool.query('SELECT id FROM staff WHERE id = ? AND deleted = 0', [id]);
-    if (existing.length === 0) return res.status(404).json({ error: 'Staff member not found.' });
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
 
-    // Soft delete: mark deleted=1 and set status=Inactive. Record is preserved for audit.
-    await pool.query(
+    const [existing] = await connection.query('SELECT * FROM staff WHERE id = ? AND deleted = 0 FOR UPDATE', [id]);
+    if (existing.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Staff member not found.' });
+    }
+
+    const staffRecord = existing[0];
+
+    // Soft delete: mark deleted=1 and set status=Inactive.
+    await connection.query(
       "UPDATE staff SET deleted = 1, status = 'Inactive' WHERE id = ?",
       [id]
     );
+
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'STAFF_DELETED',
+        aggregate_type: 'STAFF',
+        aggregate_id: staffRecord.username,
+        payload: {
+          username: staffRecord.username,
+          docId: `staff_${staffRecord.username}`,
+          id: staffRecord.id
+        }
+      });
+    }
+
+    await connection.commit();
     return res.json({ message: 'Staff member removed. Record retained for audit trail.' });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.error('deleteStaff error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    if (connection) connection.release();
   }
 };

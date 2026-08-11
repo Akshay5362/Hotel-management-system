@@ -1,5 +1,7 @@
 import db from '../db.js';
 import { BusinessDateService } from '../services/businessDateService.js';
+import { enqueue } from '../services/outboxService.js';
+import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
 
 export const getHousekeepingRooms = async (req, res) => {
   try {
@@ -27,25 +29,51 @@ export const assignHousekeeper = async (req, res) => {
   
   if (!roomId) return res.status(400).json({ error: 'Room ID is required' });
 
+  let connection;
   try {
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const [roomRows] = await connection.query('SELECT number FROM rooms WHERE id = ?', [roomId]);
+    const roomNumber = roomRows.length > 0 ? roomRows[0].number : String(roomId);
+
     const updateQuery = `
       UPDATE rooms 
       SET housekeeping_assigned_to = ?, housekeeping_priority = COALESCE(?, housekeeping_priority)
       WHERE id = ?
     `;
-    await db.query(updateQuery, [userId || null, priority, roomId]);
+    await connection.query(updateQuery, [userId || null, priority, roomId]);
 
     let staffName = 'Unassigned';
     if (userId) {
-      const [uRows] = await db.query('SELECT name FROM users WHERE id = ?', [userId]);
+      const [uRows] = await connection.query('SELECT fullName as name FROM users WHERE id = ?', [userId]);
       if (uRows.length > 0) staffName = uRows[0].name;
     }
 
     const action = userId ? `Assigned to ${staffName}` : 'Unassigned';
-    await db.query(`
+    const [logResult] = await connection.query(`
       INSERT INTO housekeeping_logs (room_id, action, performed_by, notes)
       VALUES (?, ?, ?, ?)
     `, [roomId, action, performedBy, priority ? `Priority updated to ${priority}` : null]);
+
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'HOUSEKEEPING_LOG_CREATED',
+        aggregate_type: 'HOUSEKEEPING',
+        aggregate_id: String(roomNumber),
+        payload: {
+          room_id: String(roomId),
+          room_number: String(roomNumber),
+          action: action,
+          assigned_to: userId ? String(userId) : null,
+          priority: priority || 'Normal',
+          mysql_housekeeping_id: logResult.insertId,
+          updated_at: new Date().toISOString()
+        }
+      });
+    }
+
+    await connection.commit();
 
     if (req.io) {
       req.io.emit('housekeeping_update', { roomId, action, userId, priority });
@@ -53,8 +81,13 @@ export const assignHousekeeper = async (req, res) => {
 
     res.json({ success: true, message: 'Assignment updated successfully' });
   } catch (error) {
+    if (connection) {
+      try { await connection.rollback(); } catch (e) {}
+    }
     console.error('Error assigning housekeeper:', error);
     res.status(500).json({ error: 'Failed to assign housekeeper' });
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -64,25 +97,32 @@ export const updateHousekeepingStatus = async (req, res) => {
   
   if (!roomId || !status) return res.status(400).json({ error: 'Room ID and status are required' });
 
+  let connection;
   try {
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
     // Fetch current room data — NEVER touch occupancy status (rooms.status), only housekeeping_status
-    const [roomRows] = await db.query(
+    const [roomRows] = await connection.query(
       'SELECT r.number, r.housekeeping_status FROM rooms r WHERE r.id = ?',
       [roomId]
     );
-    if (roomRows.length === 0) return res.status(404).json({ error: 'Room not found' });
+    if (roomRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Room not found' });
+    }
     const oldHkStatus = roomRows[0].housekeeping_status;
     const roomNumber  = roomRows[0].number;
 
     // Resolve performer's name for the audit trail
     let performerName = 'System';
     if (performedBy) {
-      const [userRows] = await db.query('SELECT name FROM users WHERE id = ?', [performedBy]);
+      const [userRows] = await connection.query('SELECT fullName as name FROM users WHERE id = ?', [performedBy]);
       if (userRows.length > 0) performerName = userRows[0].name;
     }
 
     // Get business date
-    const businessDate = await BusinessDateService.getBusinessDate(db);
+    const businessDate = await BusinessDateService.getBusinessDate(connection);
 
     // Build update — only housekeeping_status is changed, occupancy status is never touched
     let updateFields = 'housekeeping_status = ?';
@@ -92,29 +132,62 @@ export const updateHousekeepingStatus = async (req, res) => {
       updateFields += ', last_cleaned_at = CURRENT_TIMESTAMP';
     }
 
-    await db.query(`UPDATE rooms SET ${updateFields} WHERE id = ?`, [...params, roomId]);
+    await connection.query(`UPDATE rooms SET ${updateFields} WHERE id = ?`, [...params, roomId]);
 
     // Housekeeping action log
-    await db.query(`
+    const [logResult] = await connection.query(`
       INSERT INTO housekeeping_logs (room_id, action, performed_by, notes)
       VALUES (?, ?, ?, ?)
     `, [roomId, `Status changed from ${oldHkStatus} to ${status}`, performedBy, notes || null]);
 
-    // Req 3 (new): Structured audit log — consistent JSON format across all room status changes
+    // Structured audit log
     const structuredDetails = JSON.stringify({
       Room:             roomNumber,
-      Occupancy_Before: 'unchanged',  // HK panel never modifies occupancy status
+      Occupancy_Before: 'unchanged',
       Occupancy_After:  'unchanged',
       HK_Before:        oldHkStatus,
       HK_After:         status,
       User:             performerName,
       Business_Date:    businessDate
     });
-    await db.query(
+    await connection.query(
       `INSERT INTO audit_logs (user_id, action, details, business_date)
        VALUES (?, 'HK_STATUS_CHANGE', ?, ?)`,
       [performedBy, structuredDetails, businessDate]
     );
+
+    // Enqueue Transactional Outbox Event if feature flag enabled
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'ROOM_STATUS_CHANGED',
+        aggregate_type: 'ROOM',
+        aggregate_id: String(roomNumber),
+        payload: {
+          number: String(roomNumber),
+          room_number: String(roomNumber),
+          housekeeping_status: status,
+          cleaning_status: status,
+          updated_at: new Date().toISOString()
+        }
+      });
+
+      await enqueue(connection, {
+        event_type: 'HOUSEKEEPING_STATUS_UPDATED',
+        aggregate_type: 'HOUSEKEEPING',
+        aggregate_id: String(roomNumber),
+        payload: {
+          room_id: String(roomId),
+          room_number: String(roomNumber),
+          status: status,
+          notes: notes || null,
+          performed_by: performerName,
+          mysql_housekeeping_id: logResult.insertId,
+          updated_at: new Date().toISOString()
+        }
+      });
+    }
+
+    await connection.commit();
 
     if (req.io) {
       req.io.emit('housekeeping_update', { roomId, status });
@@ -122,8 +195,13 @@ export const updateHousekeepingStatus = async (req, res) => {
 
     res.json({ success: true, message: 'Status updated successfully' });
   } catch (error) {
+    if (connection) {
+      try { await connection.rollback(); } catch (e) {}
+    }
     console.error('Error updating status:', error);
     res.status(500).json({ error: 'Failed to update status' });
+  } finally {
+    if (connection) connection.release();
   }
 };
 

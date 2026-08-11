@@ -5,6 +5,8 @@ import { AvailabilityService } from '../services/AvailabilityService.js';
 import pool from '../db.js';
 import fs from 'fs';
 import path from 'path';
+import { enqueue } from '../services/outboxService.js';
+import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
 import { extractOCRData, verifyDocumentData } from '../services/ocrService.js';
 
 // Helper to format time (e.g. 09:30 AM)
@@ -104,7 +106,8 @@ export const checkOut = async (req, res) => {
     const [bookingRows] = await connection.query(
       `SELECT b.*, g.full_name as guestName FROM bookings b
        JOIN guests g ON b.guest_id = g.id
-       WHERE b.room_id = ? AND b.booking_status = 'Checked In'`,
+       WHERE b.room_id = ? AND b.booking_status = 'Checked In'
+       FOR UPDATE`,
       [room.id]
     );
 
@@ -388,31 +391,27 @@ export const shift = async (req, res) => {
     connection = await pool.getConnection();
     await connection.beginTransaction();
 
-    const [fromRooms] = await connection.query(`
+    // Lock source and target rooms in deterministic ID order to avoid deadlocks
+    const [lockedRooms] = await connection.query(`
       SELECT r.*, rt.base_rate as rate, rt.code as type
       FROM rooms r
       JOIN room_types rt ON r.room_type_id = rt.id
-      WHERE r.number = ?
+      WHERE r.number IN (?, ?)
+      ORDER BY r.id ASC
       FOR UPDATE
-    `, [fromRoomNumber]);
-    if (fromRooms.length === 0 || fromRooms[0].status !== 'occupied') {
+    `, [fromRoomNumber, toRoomNumber]);
+
+    const sourceRoom = lockedRooms.find(r => r.number === fromRoomNumber);
+    if (!sourceRoom || sourceRoom.status !== 'occupied') {
       await connection.rollback();
       return res.status(400).json({ error: `Source Room ${fromRoomNumber} is not occupied` });
     }
-    const sourceRoom = fromRooms[0];
 
-    const [toRooms] = await connection.query(`
-      SELECT r.*, rt.base_rate as rate, rt.code as type
-      FROM rooms r
-      JOIN room_types rt ON r.room_type_id = rt.id
-      WHERE r.number = ?
-      FOR UPDATE
-    `, [toRoomNumber]);
-    if (toRooms.length === 0 || toRooms[0].status !== 'vacant') {
+    const targetRoom = lockedRooms.find(r => r.number === toRoomNumber);
+    if (!targetRoom || targetRoom.status !== 'vacant') {
       await connection.rollback();
       return res.status(400).json({ error: `Target Room ${toRoomNumber} is not vacant` });
     }
-    const targetRoom = toRooms[0];
 
     // Validate target room availability using AvailabilityService
     const avail = await AvailabilityService.checkRoomAvailability(connection, {
@@ -429,7 +428,7 @@ export const shift = async (req, res) => {
 
     // Find the active check-in booking
     const [bookings] = await connection.query(
-      "SELECT * FROM bookings WHERE room_id = ? AND booking_status = 'Checked In'",
+      "SELECT * FROM bookings WHERE room_id = ? AND booking_status = 'Checked In' FOR UPDATE",
       [sourceRoom.id]
     );
     if (bookings.length === 0) {
@@ -856,6 +855,33 @@ export const bookRoom = async (req, res) => {
       );
     }
 
+    // Enqueue Transactional Outbox Event for Phase 3K-2 if feature flag enabled
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'BOOKING_CREATED',
+        aggregate_type: 'BOOKING',
+        aggregate_id: bookingNumber,
+        payload: {
+          booking_number: String(bookingNumber),
+          guest_id: String(guestId),
+          guest_name: guestNameUpper,
+          room_id: String(room.id),
+          room_number: String(number),
+          check_in_date: String(checkInDate || businessDate),
+          check_out_date: expectedCheckOutStr || null,
+          expected_check_out_date: String(expectedCheckOutStr),
+          adults: parsedPax,
+          children: 0,
+          booking_status: 'Reserved',
+          payment_status: parsedDeposit >= bookingTotal ? 'Paid' : 'Partial',
+          total_amount: bookingTotal,
+          advance_amount: parsedDeposit,
+          mysql_booking_id: bookingId,
+          updated_at: new Date().toISOString()
+        }
+      });
+    }
+
     await connection.commit();
     res.json({ 
       message: `Successfully booked Room ${number}`,
@@ -913,7 +939,7 @@ export const modifyCheckIn = async (req, res) => {
     await connection.beginTransaction();
 
     const [roomRows] = await connection.query(`
-      SELECT id, status FROM rooms WHERE number = ?
+      SELECT id, status FROM rooms WHERE number = ? FOR UPDATE
     `, [number]);
     if (roomRows.length === 0) {
       await connection.rollback();
@@ -924,7 +950,7 @@ export const modifyCheckIn = async (req, res) => {
     const [bookingRows] = await connection.query(`
       SELECT * FROM bookings 
       WHERE room_id = ? AND booking_status IN ('Checked In', 'Reserved')
-      ORDER BY id DESC LIMIT 1
+      ORDER BY id DESC LIMIT 1 FOR UPDATE
     `, [room.id]);
 
     if (bookingRows.length === 0) {
@@ -990,6 +1016,31 @@ export const modifyCheckIn = async (req, res) => {
        VALUES (?, 'MODIFY_CHECKIN', ?, ?)`,
       [resolvedUserId, `Modified check-in details for Room ${number}. Booking ID: ${booking.id}`, systemDate]
     );
+
+    // Enqueue Transactional Outbox Event for Phase 3K-2 if feature flag enabled
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'BOOKING_UPDATED',
+        aggregate_type: 'BOOKING',
+        aggregate_id: booking.booking_number,
+        payload: {
+          booking_number: String(booking.booking_number),
+          guest_id: String(booking.guest_id),
+          room_id: String(booking.room_id),
+          check_in_date: String(checkInDate || booking.check_in_date),
+          expected_check_out_date: String(expectedCheckOutDate || booking.expected_check_out_date || ''),
+          adults: parsedPax,
+          advance_amount: parsedDeposit,
+          total_amount: Number(booking.total_amount || 0),
+          booking_status: String(booking.booking_status),
+          payment_status: String(booking.payment_status || 'Pending'),
+          billing_instruction: resolvedBilling,
+          meal_plan: resolvedMealPlan,
+          mysql_booking_id: booking.id,
+          updated_at: new Date().toISOString()
+        }
+      });
+    }
 
     await connection.commit();
     res.json({ message: `Successfully modified check-in details for Room ${number}` });
@@ -2219,6 +2270,23 @@ export const updateRoomStatus = async (req, res) => {
         'INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, ?, ?, ?)',
         [resolvedUserId, 'UPDATE_ROOM_STATUS', structuredDetails, businessDate]
       );
+    }
+
+    // Enqueue Transactional Outbox Event for Phase 3C if feature flag enabled
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(connection, {
+        event_type: 'ROOM_STATUS_CHANGED',
+        aggregate_type: 'ROOM',
+        aggregate_id: String(number),
+        payload: {
+          number: String(number),
+          room_number: String(number),
+          status: newStatus,
+          housekeeping_status: newHkStatus,
+          cleaning_status: newHkStatus,
+          updated_at: new Date().toISOString()
+        }
+      });
     }
 
     await connection.commit();
