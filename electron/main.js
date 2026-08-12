@@ -333,7 +333,9 @@ function createWindow() {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.show();
         L('SHOW', 'mainWindow.show() completed');
-        if (isDev) mainWindow.webContents.openDevTools({ mode: 'detach' });
+        if (isDev && process.env.ELECTRON_MODE !== 'production') {
+          mainWindow.webContents.openDevTools({ mode: 'detach' });
+        }
       }
     } catch (e) { LERR('SHOW', 'mainWindow.show() threw', e); }
   };
