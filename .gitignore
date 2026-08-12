@@ -74,3 +74,4 @@ dist-electron/
 node_modules/
 .env
 /backups/
+scratch/
