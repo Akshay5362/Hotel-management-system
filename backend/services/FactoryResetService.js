@@ -118,7 +118,7 @@ const DELETE_SEQUENCE = [
   { table: 'stay_extension_requests', label: 'stayExtensions'    },
   { table: 'feedback',                label: 'feedback'          },
   { table: 'maintenance',             label: 'maintenance'       },
-  { table: 'housekeeping',            label: 'housekeeping'      },
+  { table: 'housekeeping_logs',       label: 'housekeepingLogs'  },
   { table: 'ledger_items',            label: 'ledgerItems'       },
   { table: 'payments',                label: 'payments'          },
   { table: 'invoices',                label: 'invoices'          },
@@ -133,7 +133,7 @@ const DELETE_SEQUENCE = [
 // Tables on which AUTO_INCREMENT is reset after the committed transaction
 const AI_RESET_TABLES = [
   'room_status_history', 'booking_history', 'stay_extension_requests',
-  'feedback', 'maintenance', 'housekeeping', 'ledger_items',
+  'feedback', 'maintenance', 'housekeeping_logs', 'ledger_items',
   'payments', 'invoices', 'cash_logs', 'audit_logs', 'notifications',
   'reservations', 'bookings', 'guests',
 ];
@@ -177,16 +177,18 @@ export class FactoryResetService {
         counts.guestUsersDeleted = r.affectedRows;
       }
 
-      // Reset all rooms to 'vacant'
-      const [roomsResult] = await conn.query("UPDATE rooms SET status = 'vacant'");
+      // Reset all rooms to 'vacant' and housekeeping status to 'Clean'
+      const [roomsResult] = await conn.query(
+        "UPDATE rooms SET status = 'vacant', housekeeping_status = 'Clean', housekeeping_assigned_to = NULL, housekeeping_priority = 'Normal', last_cleaned_at = CURRENT_TIMESTAMP"
+      );
       counts.roomsReset = roomsResult.affectedRows;
 
-      // Re-seed one 'Clean' housekeeping row per room
+      // Re-seed one 'Clean' housekeeping_logs row per room
       const [roomRows] = await conn.query('SELECT id FROM rooms');
       for (const { id } of roomRows) {
         await conn.query(
-          "INSERT INTO housekeeping (room_id, status, notes, business_date) VALUES (?, 'Clean', 'Post factory reset — room ready for check-in.', ?)",
-          [id, todayStr]
+          "INSERT INTO housekeeping_logs (room_id, action, notes) VALUES (?, 'Clean', 'Post factory reset — room ready for check-in.')",
+          [id]
         );
       }
       counts.housekeepingReseeded = roomRows.length;
@@ -251,7 +253,7 @@ export class FactoryResetService {
       `  Notifications       : ${counts.notifications} deleted\n` +
       `  Audit logs          : ${counts.auditLogs} deleted\n` +
       `  Maintenance         : ${counts.maintenance} deleted\n` +
-      `  Housekeeping        : ${counts.housekeeping} deleted\n` +
+      `  Housekeeping logs   : ${counts.housekeepingLogs || 0} deleted\n` +
       `  Stay extensions     : ${counts.stayExtensions} deleted\n` +
       `  Feedback            : ${counts.feedback} deleted\n` +
       `  Rooms reset         : ${counts.roomsReset} → vacant\n` +
@@ -274,7 +276,7 @@ export class FactoryResetService {
         notificationsDeleted:  counts.notifications,
         maintenanceDeleted:    counts.maintenance,
         auditLogsDeleted:      counts.auditLogs,
-        housekeepingDeleted:   counts.housekeeping,
+        housekeepingDeleted:   counts.housekeepingLogs || 0,
         roomServiceDeleted:    (counts.stayExtensions || 0) + (counts.feedback || 0),
         roomsReset:            counts.roomsReset,
         businessDateReset:     counts.businessDateReset,

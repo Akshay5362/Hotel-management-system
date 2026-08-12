@@ -131,7 +131,7 @@ export const processCheckIn = async (connection, {
   const guestNameUpper = guestName ? guestName.trim().toUpperCase() : 'UNKNOWN';
   
   if (!finalGuestId) {
-    const [existingGuests] = await connection.query('SELECT id FROM guests WHERE phone = ? LIMIT 1', [phone || '']);
+    const [existingGuests] = await connection.query('SELECT id FROM guests WHERE phone = ? LIMIT 1 FOR UPDATE', [phone || '']);
     if (existingGuests.length > 0) {
       finalGuestId = existingGuests[0].id;
     } else {

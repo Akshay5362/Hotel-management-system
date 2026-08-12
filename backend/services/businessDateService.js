@@ -33,6 +33,8 @@
  */
 
 import pool from '../db.js';
+import { enqueue } from './outboxService.js';
+import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 export const BD_ERRORS = {
@@ -220,6 +222,21 @@ export const BusinessDateService = {
       "UPDATE system_settings SET value_val = ? WHERE key_name = 'system_date'",
       [newIso]
     );
+
+    if (isFirestoreDualWriteEnabled()) {
+      await enqueue(conn, {
+        event_type: 'SYSTEM_DATE_UPDATED',
+        aggregate_type: 'SYSTEM_SETTING',
+        aggregate_id: 'system_date',
+        payload: {
+          key_name: 'system_date',
+          current_date: newIso,
+          system_date: newIso,
+          value_val: newIso,
+          updated_at: new Date().toISOString()
+        }
+      });
+    }
   },
 
   /**

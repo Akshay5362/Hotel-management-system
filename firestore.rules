@@ -30,6 +30,14 @@ service cloud.firestore {
       return isAuthenticated() && request.auth.uid == userUid;
     }
 
+    function isHousekeeping() {
+      return getUserRole() == 'housekeeping';
+    }
+
+    function isManager() {
+      return getUserRole() == 'manager' || isAdmin();
+    }
+
     // ── Collection Rules ──────────────────────────────────────────────────────
     match /settings/{settingId} {
       allow read: if isAuthenticated();
@@ -64,6 +72,12 @@ service cloud.firestore {
         allow read: if isStaff() || (isAuthenticated() && get(/databases/$(database)/documents/bookings/$(bookingId)).data.guest_user_uid == request.auth.uid);
         allow write: if isStaff();
       }
+
+      match /history/{historyId} {
+        allow read: if isStaff() || (isAuthenticated() && get(/databases/$(database)/documents/bookings/$(bookingId)).data.guest_user_uid == request.auth.uid);
+        allow create: if isStaff();
+        allow update, delete: if false; // Immutable — Admin SDK only
+      }
     }
 
     match /reservations/{reservationId} {
@@ -79,6 +93,90 @@ service cloud.firestore {
     match /notifications/{notificationId} {
       allow read: if isAuthenticated() && resource.data.user_uid == request.auth.uid;
       allow write: if isStaff();
+    }
+
+    // ── Phase 2 — Previously Uncovered Collections ───────────────────────────
+
+    match /room_types/{typeId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isStaff();
+      allow delete: if isAdmin();
+    }
+
+    match /staff/{staffId} {
+      allow read: if isStaff();
+      allow create, update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /inventory_categories/{categoryId} {
+      allow read: if isStaff();
+      allow create, delete: if isAdmin();
+      allow update: if isStaff();
+    }
+
+    match /inventory_products/{productId} {
+      allow read: if isStaff();
+      allow create, delete: if isAdmin();
+      allow update: if isStaff();
+    }
+
+    match /cash_logs/{logId} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /cash_submissions/{submissionId} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update, delete: if isAdmin();
+    }
+
+    match /audit_logs/{logId} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update, delete: if false;
+    }
+
+    match /invoices/{invoiceId} {
+      allow read: if isStaff() || (isAuthenticated() && resource.data.guest_user_uid == request.auth.uid);
+      allow create: if isStaff();
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /housekeeping/{recordId} {
+      allow read: if isStaff() || isHousekeeping();
+      allow create: if isStaff();
+      allow update: if isStaff() || isHousekeeping();
+      allow delete: if isAdmin();
+    }
+
+    match /booking_history/{historyId} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update, delete: if false;
+    }
+
+    match /payments/{paymentId} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /ledger_items/{itemId} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /razorpay_transactions/{txId} {
+      allow read: if isAdmin();
+      allow write: if false;
     }
 
     // Highly Sensitive Collections: Server-Side / Admin SDK Only

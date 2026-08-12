@@ -86,7 +86,7 @@ function useTime() {
 async function apiCall(method, path, body, token) {
   const opts = {
     method,
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
   };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(`${API}${path}`, opts);
@@ -94,6 +94,7 @@ async function apiCall(method, path, body, token) {
   if (!res.ok) throw new Error(data.error || data.message || 'Request failed');
   return data;
 }
+
 
 // ── Inline field styles ───────────────────────────────────────────────────────
 const inputStyle = {
