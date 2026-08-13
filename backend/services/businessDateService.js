@@ -35,6 +35,11 @@
 import pool from '../db.js';
 import { enqueue } from './outboxService.js';
 import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
+import {
+  createCompoundEventBuilder,
+  formatLedgerItemId,
+  formatBookingId,
+} from './compoundEventBuilder.js';
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 export const BD_ERRORS = {
@@ -313,6 +318,10 @@ export const BusinessDateService = {
       WHERE r.status = 'occupied'
     `);
 
+    // B7: Accumulate tariff insertIds for compound event construction.
+    // Each entry records { insertId, bookingId, roomNumber, tariff }.
+    const newTariffRecords = [];
+
     for (const room of occupiedRooms) {
       const tariff = room.rate;
       // GST is included in the room rate — no separate tax line
@@ -328,10 +337,14 @@ export const BusinessDateService = {
         [room.number, nextIso, bookingId]
       );
       if (existingTariff.length === 0) {
-        await conn.query(
+        // ── B7 Change 1: Capture insertId from tariff INSERT ──────────────
+        const [tariffResult] = await conn.query(
           "INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)",
           [room.number, 'Room Tariff (Rollover, Incl. GST)', tariff, nextIso, bookingId]
         );
+        const insertedId = tariffResult.insertId;
+        // Accumulate for compound event (only newly-inserted rows)
+        newTariffRecords.push({ insertedId, bookingId, roomNumber: room.number, tariff });
         console.log(`[DayEnd] Ledger: Room Tariff for Room ${room.number} on ${nextIso}`);
       }
     }
@@ -359,6 +372,95 @@ export const BusinessDateService = {
       "INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'DAY_END', ?, ?)",
       [auditorId, auditDetail, nextIso]
     );
+
+    // ── B7 Changes 2/3/4: Build and enqueue compound Outbox event ─────────
+    // Guarded by feature flag. Runs BEFORE connection.commit() in the controller.
+    if (isFirestoreDualWriteEnabled()) {
+      // B7 Change 4: Generate frozen timestamp exactly once during event construction.
+      // Must NOT be recalculated on Firestore retry to enable isStaleUpdate() guard.
+      const eventOccurredAt = new Date().toISOString();
+
+      const builder = createCompoundEventBuilder({
+        event_type:     'COMPOUND_NIGHT_AUDIT',
+        aggregate_type: 'SYSTEM',
+        aggregate_id:   `day_end_${nextIso}`,
+        occurred_at:    eventOccurredAt,
+        business_date:  nextIso,
+      });
+
+      // B7 Change 3: settings/system_date write — all 4 absolute counter values.
+      // Includes frozen updated_at (Change 4) to enable isStaleUpdate() guard.
+      builder.addRootWrite({
+        collection:  'settings',
+        document_id: 'system_date',
+        operation:   'set_merge',
+        data: {
+          current_date:    nextIso,
+          system_date:     nextIso,
+          today_checkins:  0,
+          today_checkouts: 0,
+          continued_rooms: occupiedRooms.length,
+          updated_at:      eventOccurredAt,
+        },
+      });
+
+      // B7 Change 2: One dual-write per newly-inserted tariff ledger item.
+      // Root:         /ledger_items/{ledger_id}
+      // Subcollection: /bookings/{bkg_id}/ledger_items/{ledger_id}
+      for (const record of newTariffRecords) {
+        const ledgerDocId = formatLedgerItemId(record.insertedId);
+        const bkgDocId    = record.bookingId ? formatBookingId(record.bookingId) : null;
+
+        const ledgerData = {
+          item_id:         ledgerDocId,
+          booking_id:      bkgDocId,
+          mysql_booking_id: record.bookingId,
+          room_number:     record.roomNumber,
+          description:     'Room Tariff (Rollover, Incl. GST)',
+          desc:            'Room Tariff (Rollover, Incl. GST)',
+          qty:             1,
+          quantity:        1,
+          amount:          record.tariff,
+          type:            'CHARGE',
+          status:          'Pending',
+          business_date:   nextIso,
+          mysql_ledger_id: record.insertedId,
+          created_at:      eventOccurredAt,
+        };
+
+        if (bkgDocId) {
+          // Dual write: root + subcollection under the booking
+          builder.addDualWrite({
+            rootCollection:   'ledger_items',
+            document_id:       ledgerDocId,
+            parentCollection:  'bookings',
+            parent_id:         bkgDocId,
+            subcollection:     'ledger_items',
+            operation:         'set_merge',
+            data:              ledgerData,
+          });
+        } else {
+          // No booking (edge case) — root write only
+          builder.addRootWrite({
+            collection:  'ledger_items',
+            document_id: ledgerDocId,
+            operation:   'set_merge',
+            data:        ledgerData,
+          });
+        }
+      }
+
+      const compoundPayload = builder.build();
+
+      await enqueue(conn, {
+        event_type:     compoundPayload.event_type,
+        aggregate_type: compoundPayload.aggregate_type,
+        aggregate_id:   compoundPayload.aggregate_id,
+        payload:        compoundPayload,
+      });
+
+      console.log(`[DayEnd] Compound outbox event enqueued: ${compoundPayload.operation_id} (${compoundPayload.writes.length} writes, ${newTariffRecords.length} new tariffs)`);
+    }
 
     console.log(`[DayEnd] Complete. Business Date is now ${nextIso}.`);
   },

@@ -1,4 +1,6 @@
 import { processCheckIn } from '../services/checkInService.js';
+import { processCheckOut } from '../services/checkOutService.js';
+import { processRoomShift } from '../services/roomShiftService.js';
 import { BusinessDateService } from '../services/businessDateService.js';
 import { CheckoutRecoveryService } from '../services/CheckoutRecoveryService.js';
 import { AvailabilityService } from '../services/AvailabilityService.js';
@@ -8,6 +10,12 @@ import path from 'path';
 import { enqueue } from '../services/outboxService.js';
 import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
 import { extractOCRData, verifyDocumentData } from '../services/ocrService.js';
+import {
+  CompoundEventBuilder,
+  formatBookingId,
+  formatRoomId,
+  formatGuestId
+} from '../services/compoundEventBuilder.js';
 
 // Helper to format time (e.g. 09:30 AM)
 function formatTime(date) {
@@ -84,150 +92,10 @@ export const checkOut = async (req, res) => {
     connection = await pool.getConnection();
     await connection.beginTransaction();
 
-    const [roomRows] = await connection.query(`
-      SELECT r.*, rt.base_rate as rate, rt.code as type
-      FROM rooms r
-      JOIN room_types rt ON r.room_type_id = rt.id
-      WHERE r.number = ?
-      FOR UPDATE
-    `, [number]);
-    if (roomRows.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ error: `Room ${number} not found` });
-    }
-
-    const room = roomRows[0];
-    if (room.status !== 'occupied') {
-      await connection.rollback();
-      return res.status(400).json({ error: `Room ${number} is not occupied` });
-    }
-
-    // Fetch active Checked In booking
-    const [bookingRows] = await connection.query(
-      `SELECT b.*, g.full_name as guestName FROM bookings b
-       JOIN guests g ON b.guest_id = g.id
-       WHERE b.room_id = ? AND b.booking_status = 'Checked In'
-       FOR UPDATE`,
-      [room.id]
-    );
-
-    if (bookingRows.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ error: `No active Checked In booking found for Room ${number}` });
-    }
-
-    const activeBooking = bookingRows[0];
-
-    // Business date via centralised service
-    const businessDate = await BusinessDateService.getBusinessDate(connection);
-
-    // Insert cash log transaction if there's any transaction amount
-    if (parsedBalancePaid !== 0) {
-      const timeStr = formatTime(new Date());
-      const transactionType = parsedBalancePaid > 0 ? 'Checkout Settlement' : 'Checkout Refund';
-      await connection.query(
-        `INSERT INTO cash_logs (time, room, guest, type, amount, business_date, booking_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [timeStr, number, activeBooking.guestName, transactionType, Math.abs(parsedBalancePaid), businessDate, activeBooking.id]
-      );
-
-      // Log Payment transaction
-      await connection.query(
-        `INSERT INTO payments (booking_id, amount, payment_method, payment_type, business_date)
-         VALUES (?, ?, 'Cash', ?, ?)`,
-        [activeBooking.id, Math.abs(parsedBalancePaid), transactionType, businessDate]
-      );
-    }
-
-    // Update booking status to Checked Out
-    // Payment is always 'Paid' — receptionist collects all dues before pressing Settle & Check Out.
-    const totalCollected = (activeBooking.advance_amount || 0) + parsedBalancePaid;
-    await connection.query(
-      `UPDATE bookings
-       SET booking_status = 'Checked Out', payment_status = 'Paid',
-           total_amount = ?, check_out_date = ?
-       WHERE id = ?`,
-      [totalCollected, businessDate, activeBooking.id]
-    );
-
-    // Create invoice with balance_due = 0 (Paid in full)
-    const invoiceNumber = `INV-${businessDate.replace(/-/g, '')}-${String(activeBooking.id).padStart(4, '0')}`;
-    await connection.query(
-      `INSERT INTO invoices
-         (invoice_number, booking_id, total_amount, paid_amount, balance_due, status, business_date)
-       VALUES (?, ?, ?, ?, 0, 'Paid', ?)
-       ON DUPLICATE KEY UPDATE paid_amount = VALUES(paid_amount), balance_due = 0, status = 'Paid'`,
-      [invoiceNumber, activeBooking.id, totalCollected, totalCollected, businessDate]
-    );
-
-    // Update Room Status History
-    await connection.query(
-      `INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date)
-       VALUES (?, 'occupied', 'dirty', ?, ?)`,
-      [room.id, resolvedUserId, businessDate]
-    );
-
-    // Insert Audit Log entry
-    await connection.query(
-      `INSERT INTO audit_logs (user_id, action, details, business_date)
-       VALUES (?, 'CHECK_OUT', ?, ?)`,
-      [resolvedUserId, `Checked out Room ${number}. Booking ID: ${activeBooking.id}. Balance paid: ₹${parsedBalancePaid}`, businessDate]
-    );
-
-    // Update room status to dirty and housekeeping to Dirty (High Priority)
-    await connection.query(
-      `UPDATE rooms SET status = 'dirty', housekeeping_status = 'Dirty', housekeeping_priority = 'High Priority' WHERE id = ?`,
-      [room.id]
-    );
-
-    // Log CHECKED_OUT event in booking_history
-    await connection.query(
-      `INSERT INTO booking_history (booking_id, action, old_room_id, new_room_id, changed_by, business_date, notes)
-       VALUES (?, 'CHECKED_OUT', ?, ?, ?, ?, ?)`,
-      [activeBooking.id, room.id, room.id, resolvedUserId, businessDate,
-       `Checkout settled. Total collected: ₹${totalCollected}. Payment status: Paid.`]
-    );
-
-    // Notify the guest about checkout completion and request feedback
-    // Fetch the guest's user_id so we can send them a notification
-    const [guestUserRows] = await connection.query(
-      `SELECT g.user_id FROM guests g WHERE g.id = ?`,
-      [activeBooking.guest_id]
-    );
-    const guestUserId = guestUserRows[0]?.user_id;
-    if (guestUserId) {
-      await connection.query(
-        `INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)`,
-        [guestUserId,
-         '🏨 Thank You for Staying With Us!',
-         `Your checkout from Room ${number} is complete. We hope you had a wonderful stay! Please take a moment to share your experience — your feedback helps us serve you better.`]
-      );
-    }
-
-    // Increment todayCheckouts count
-    await connection.query(
-      `UPDATE system_settings 
-       SET value_val = CAST(CAST(value_val AS UNSIGNED) + 1 AS CHAR)
-       WHERE key_name = 'today_checkouts'`
-    );
-
-    // ── Phase 1: Snapshot capture (immediately before commit) ─────────────────
-    // Stores an immutable copy of all checkout state for future Undo support.
-    // A snapshot failure is caught inside createSnapshot() — checkout proceeds.
-    const [ledgerItemsForSnapshot] = await connection.query(
-      'SELECT * FROM ledger_items WHERE booking_id = ? ORDER BY id ASC',
-      [activeBooking.id]
-    );
-    await CheckoutRecoveryService.createSnapshot(connection, {
-      bookingId:      activeBooking.id,
-      roomId:         room.id,
-      guestId:        activeBooking.guest_id,
-      userId:         resolvedUserId,
-      room,
-      booking:        activeBooking,
-      ledgerItems:    ledgerItemsForSnapshot,
-      totalCollected,
-      businessDate,
+    await processCheckOut(connection, {
+      number,
+      parsedBalancePaid,
+      resolvedUserId
     });
 
     await connection.commit();
@@ -242,7 +110,7 @@ export const checkOut = async (req, res) => {
       }
     }
     console.error('Error during checkout controller:', error);
-    res.status(500).json({ error: 'Internal Server Error' });
+    res.status(error.status || 500).json({ error: error.message || 'Internal Server Error' });
   } finally {
     if (connection) {
       connection.release();
@@ -391,107 +259,11 @@ export const shift = async (req, res) => {
     connection = await pool.getConnection();
     await connection.beginTransaction();
 
-    // Lock source and target rooms in deterministic ID order to avoid deadlocks
-    const [lockedRooms] = await connection.query(`
-      SELECT r.*, rt.base_rate as rate, rt.code as type
-      FROM rooms r
-      JOIN room_types rt ON r.room_type_id = rt.id
-      WHERE r.number IN (?, ?)
-      ORDER BY r.id ASC
-      FOR UPDATE
-    `, [fromRoomNumber, toRoomNumber]);
-
-    const sourceRoom = lockedRooms.find(r => r.number === fromRoomNumber);
-    if (!sourceRoom || sourceRoom.status !== 'occupied') {
-      await connection.rollback();
-      return res.status(400).json({ error: `Source Room ${fromRoomNumber} is not occupied` });
-    }
-
-    const targetRoom = lockedRooms.find(r => r.number === toRoomNumber);
-    if (!targetRoom || targetRoom.status !== 'vacant') {
-      await connection.rollback();
-      return res.status(400).json({ error: `Target Room ${toRoomNumber} is not vacant` });
-    }
-
-    // Validate target room availability using AvailabilityService
-    const avail = await AvailabilityService.checkRoomAvailability(connection, {
-      roomId: targetRoom.id,
-      roomNumber: toRoomNumber,
-      arrivalDate: businessDate,
-      departureDate: businessDate,
-      forUpdate: true
+    await processRoomShift(connection, {
+      fromRoomNumber,
+      toRoomNumber,
+      resolvedUserId
     });
-    if (!avail.available && avail.code !== 'ROOM_OCCUPIED_BOOKING') {
-      await connection.rollback();
-      return res.status(400).json({ error: `Target Room ${toRoomNumber} is not available for shift: ${avail.reason}` });
-    }
-
-    // Find the active check-in booking
-    const [bookings] = await connection.query(
-      "SELECT * FROM bookings WHERE room_id = ? AND booking_status = 'Checked In' FOR UPDATE",
-      [sourceRoom.id]
-    );
-    if (bookings.length === 0) {
-      await connection.rollback();
-      return res.status(400).json({ error: `No active checkin found for Room ${fromRoomNumber}` });
-    }
-    const booking = bookings[0];
-
-    // Get current business date
-    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
-    const businessDate = settings[0]?.value_val || '11-Jul-2026';
-
-    // Update booking room_id
-    await connection.query(
-      "UPDATE bookings SET room_id = ? WHERE id = ?",
-      [targetRoom.id, booking.id]
-    );
-
-    // Update room statuses
-    await connection.query("UPDATE rooms SET status = 'occupied' WHERE id = ?", [targetRoom.id]);
-    await connection.query("UPDATE rooms SET status = 'vacant' WHERE id = ?", [sourceRoom.id]);
-
-    // Delete current business date's tariff/tax from source room
-    await connection.query(
-      `DELETE FROM ledger_items 
-       WHERE room_number = ? AND business_date = ? AND (\`desc\` LIKE '%Tariff%' OR \`desc\` LIKE '%Taxes%')`,
-      [fromRoomNumber, businessDate]
-    );
-
-    // Move all ledger items of this booking to the target room number
-    await connection.query(
-      'UPDATE ledger_items SET room_number = ? WHERE booking_id = ?',
-      [toRoomNumber, booking.id]
-    );
-
-    // Insert target room's tariff for the current business date (GST included in rate)
-    const targetTariff = targetRoom.rate;
-
-    await connection.query(
-      'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-      [toRoomNumber, `Room Tariff — ${targetRoom.type} (Incl. GST)`, targetTariff, businessDate, booking.id]
-    );
-
-    // Log Room Status History for source room
-    await connection.query(
-      `INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date)
-       VALUES (?, 'occupied', 'vacant', ?, ?)`,
-      [sourceRoom.id, resolvedUserId, businessDate]
-    );
-
-    // Log Room Status History for target room
-    await connection.query(
-      `INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date)
-       VALUES (?, 'vacant', 'occupied', ?, ?)`,
-      [targetRoom.id, resolvedUserId, businessDate]
-    );
-
-    // Insert Audit Log entry
-    await connection.query(
-      `INSERT INTO audit_logs (user_id, action, details, business_date)
-       VALUES (?, 'SHIFT_ROOM', ?, ?)`,
-      [resolvedUserId, `Shifted guest reservation (Booking ID: ${booking.id}) from Room ${fromRoomNumber} to ${toRoomNumber}`, businessDate]
-    );
 
     await connection.commit();
     res.json({ message: `Successfully shifted guest from Room ${fromRoomNumber} to ${toRoomNumber}` });
@@ -504,7 +276,7 @@ export const shift = async (req, res) => {
       }
     }
     console.error('Error during room shifting controller:', error);
-    res.status(500).json({ error: 'Internal Server Error' });
+    res.status(error.status || 500).json({ error: error.message || 'Internal Server Error' });
   } finally {
     if (connection) {
       connection.release();
@@ -800,6 +572,9 @@ export const bookRoom = async (req, res) => {
       }
     }
 
+    // Phase 4G-A: hoisted to outer scope so PAYMENT_CREATED enqueue can use it
+    let advPaymentMysqlId = 0;
+
     // Insert cash log transaction if deposit paid
     if (parsedDeposit > 0) {
       const timeStr = formatTime(new Date());
@@ -810,11 +585,13 @@ export const bookRoom = async (req, res) => {
       );
 
       // Log Payment transaction
-      await connection.query(
+      // Phase 4G-A: capture insertId (previously discarded) for PAYMENT_CREATED outbox event
+      const [advPaymentResult] = await connection.query(
         `INSERT INTO payments (booking_id, amount, payment_method, payment_type, business_date)
          VALUES (?, ?, 'Cash', 'Advance Deposit', ?)`,
         [bookingId, parsedDeposit, businessDate]
       );
+      advPaymentMysqlId = advPaymentResult.insertId;
     }
 
     // Log Room Status History
@@ -855,8 +632,10 @@ export const bookRoom = async (req, res) => {
       );
     }
 
-    // Enqueue Transactional Outbox Event for Phase 3K-2 if feature flag enabled
+    // Enqueue Transactional Outbox Events if feature flag enabled
+    // Uses the same acquired connection — both enqueue() calls run BEFORE commit()
     if (isFirestoreDualWriteEnabled()) {
+      // Phase 3K-2: BOOKING_CREATED (existing event — unchanged)
       await enqueue(connection, {
         event_type: 'BOOKING_CREATED',
         aggregate_type: 'BOOKING',
@@ -880,6 +659,58 @@ export const bookRoom = async (req, res) => {
           updated_at: new Date().toISOString()
         }
       });
+
+      // Phase 4G-A: PAYMENT_CREATED — advance deposit payment (separate event)
+      // Only enqueued when an advance deposit was actually inserted.
+      // Uses the same connection. Uses advPaymentMysqlId captured from INSERT result.
+      // Note: advPaymentMysqlId is declared in the outer scope via let so it is
+      // accessible here even when parsedDeposit === 0 (in which case it is undefined
+      // and the guard below prevents the enqueue).
+      if (parsedDeposit > 0 && typeof advPaymentMysqlId === 'number' && advPaymentMysqlId > 0) {
+        await enqueue(connection, {
+          event_type: 'PAYMENT_CREATED',
+          aggregate_type: 'PAYMENT',
+          aggregate_id: advPaymentMysqlId,
+          payload: {
+            // payment_id: numeric — dispatcher will format as payment_{id}
+            payment_id: advPaymentMysqlId,
+            // booking_id: bkg_-prefixed string (matches paymentsRepository parentId logic)
+            booking_id: 'bkg_' + String(bookingNumber),
+            mysql_booking_id: bookingId,
+            amount: parsedDeposit,
+            currency: 'INR',
+            payment_method: 'Cash',
+            payment_status: 'Pending',
+            payment_type: 'Advance Deposit',
+            payment_source: 'guest_portal',
+            payment_gateway: 'Internal',
+            transaction_id: null,
+            business_date: businessDate,
+            mysql_payment_id: advPaymentMysqlId,
+            created_at: new Date().toISOString()
+          }
+        });
+      }
+
+      // Phase 4G-C: GUEST_UPDATED — propagate loyalty_points and loyalty_tier
+      // Uses the same connection and runs BEFORE commit(). Deterministic doc ID via
+      // formatGuestId(phone || guestId). Mirrors BOOKING_CREATED (non-compound, same pattern).
+      // No FieldValue.increment() — updatedPoints and updatedTier are absolute MySQL values.
+      if (guestId) {
+        const guestDocKey = phone || String(guestId);
+        await enqueue(connection, {
+          event_type:     'GUEST_UPDATED',
+          aggregate_type: 'GUEST',
+          aggregate_id:   String(guestId),
+          payload: {
+            guest_id:        formatGuestId(guestDocKey),
+            mysql_guest_id:  guestId,
+            loyalty_points:  updatedPoints,
+            loyalty_tier:    updatedTier,
+            updated_at:      new Date().toISOString()
+          }
+        });
+      }
     }
 
     await connection.commit();
@@ -1869,6 +1700,72 @@ export const processRefundCheckout = async (req, res) => {
          '💰 Cancellation Processed',
          `Your cancellation for Room ${number} has been processed. A refund of ₹${parsedRefund} will be returned to you. Reason: ${refundReason}.`]
       );
+    }
+
+    // ── Phase 4G-C: Outbox — COMPOUND_REFUND_CHECKOUT ────────────────────────
+    // Placed AFTER all MySQL mutations and BEFORE commit().
+    // Reads today_checkouts AFTER the increment to get the absolute post-increment
+    // value — never uses FieldValue.increment() in Firestore.
+    if (isFirestoreDualWriteEnabled()) {
+      const eventOccurredAt = new Date().toISOString();
+
+      // Read the post-increment counter value (absolute, deterministic)
+      const [[checkoutRow]] = await connection.query(
+        `SELECT value_val FROM system_settings WHERE key_name = 'today_checkouts'`
+      );
+      const todayCheckoutsAbsolute = parseInt(checkoutRow?.value_val || '0', 10);
+
+      const refundEvent = new CompoundEventBuilder({
+        event_type:     'COMPOUND_REFUND_CHECKOUT',
+        aggregate_type: 'BOOKING',
+        aggregate_id:   booking.booking_number || String(booking.id)
+      });
+
+      // Write 1: booking → Checked Out / Refunded
+      refundEvent.addRootWrite({
+        collection:  'bookings',
+        document_id: formatBookingId(booking.booking_number || String(booking.id)),
+        operation:   'set_merge',
+        data: {
+          booking_status:   'Checked Out',
+          payment_status:   'Refunded',
+          check_out_date:   businessDate,
+          refund_amount:    parsedRefund,
+          refund_reason:    refundReason,
+          updated_at:       eventOccurredAt
+        }
+      });
+
+      // Write 2: room → dirty
+      refundEvent.addRootWrite({
+        collection:  'rooms',
+        document_id: formatRoomId(number),
+        operation:   'set_merge',
+        data: {
+          status:     'dirty',
+          updated_at: eventOccurredAt
+        }
+      });
+
+      // Write 3: settings counter — absolute today_checkouts
+      refundEvent.addRootWrite({
+        collection:  'settings',
+        document_id: 'system_date',
+        operation:   'set_merge',
+        data: {
+          today_checkouts: todayCheckoutsAbsolute,
+          updated_at:      eventOccurredAt
+        }
+      });
+
+      const refundPayload = refundEvent.build();
+      await enqueue(connection, {
+        event_type:     refundPayload.event_type,
+        aggregate_type: refundPayload.aggregate_type,
+        aggregate_id:   refundPayload.aggregate_id,
+        payload:        refundPayload
+      });
+      console.log(`[processRefundCheckout] Compound outbox event enqueued: ${refundPayload.operation_id} (${refundPayload.writes.length} writes)`);
     }
 
     await connection.commit();

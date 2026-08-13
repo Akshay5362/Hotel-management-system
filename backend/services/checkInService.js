@@ -1,5 +1,17 @@
 import { formatTime } from '../utils/dateUtils.js';
 import { BusinessDateService } from './businessDateService.js';
+import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
+import { enqueue } from './outboxService.js';
+import {
+  createCompoundEventBuilder,
+  formatBookingId,
+  formatRoomId,
+  formatGuestId,
+  formatReservationId,
+  formatLedgerItemId,
+  formatPaymentId,
+  formatCashLogId
+} from './compoundEventBuilder.js';
 
 // Allowed values for the two new optional fields
 const ALLOWED_BILLING_INSTRUCTIONS = ['Direct to Guest', 'Bill to Company', 'Room Tariff Only'];
@@ -171,12 +183,16 @@ export const processCheckIn = async (connection, {
   // 7. Ledger Items — GST is INCLUDED in the room rate (no separate tax line)
   const tariffAmount = room.rate || 0;
 
-  await connection.query(
+  const [ledgerResult] = await connection.query(
     "INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)",
     [roomNumber, 'Room Tariff (Incl. GST)', tariffAmount, businessDate, bookingId]
   );
+  const ledgerMysqlId = ledgerResult.insertId;
 
   // 8. Payments & Cash Logs
+  // Declared in outer scope so compound event builder can access them below.
+  let paymentMysqlId  = null;
+  let cashLogMysqlId  = null;
   if (deposit > 0) {
     if (paymentMethod === 'Razorpay' && transactionId) {
       await connection.query(
@@ -186,17 +202,19 @@ export const processCheckIn = async (connection, {
     }
     const timeStr = formatTime(new Date());
     if (paymentMethod === 'Cash') {
-      await connection.query(
+      const [cashLogResult] = await connection.query(
         `INSERT INTO cash_logs (time, room, guest, type, amount, business_date, booking_id)
         VALUES (?, ?, ?, 'Advance Deposit', ?, ?, ?)`,
         [timeStr, roomNumber, guestNameUpper, deposit, businessDate, bookingId]
       );
+      cashLogMysqlId = cashLogResult.insertId;
     }
-    await connection.query(
+    const [paymentResult] = await connection.query(
       `INSERT INTO payments (booking_id, amount, payment_method, payment_type, business_date)
       VALUES (?, ?, ?, 'Advance Deposit', ?)`,
       [bookingId, deposit, paymentMethod, businessDate]
     );
+    paymentMysqlId = paymentResult.insertId;
   }
 
   // 9. Update Room & Counters
@@ -210,6 +228,12 @@ export const processCheckIn = async (connection, {
   await connection.query(
     "UPDATE system_settings SET value_val = CAST(CAST(value_val AS UNSIGNED) + 1 AS CHAR) WHERE key_name = 'today_checkins'"
   );
+  // Read the absolute post-increment value inside this transaction.
+  // The compound event must contain the final MySQL value — never FieldValue.increment().
+  const [[checkinCounterRow]] = await connection.query(
+    "SELECT value_val FROM system_settings WHERE key_name = 'today_checkins'"
+  );
+  const todayCheckinsAbsolute = Number(checkinCounterRow.value_val);
 
   // 10. Audit Log & Notifications
   if (isGuestSelfCheckIn) {
@@ -226,6 +250,199 @@ export const processCheckIn = async (connection, {
       "INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'CHECK_IN', ?, ?)",
       [resolvedUserId, `Checked in guest ${guestNameUpper} into Room ${roomNumber}. Booking ID: ${bookingId}`, businessDate]
     );
+  }
+
+  // ── Phase 4E-B3: Compound Outbox Event ──────────────────────────────────────
+  // The compound event is enqueued on the SAME connection as the business
+  // mutations. If enqueue throws, the entire transaction rolls back — no partial
+  // Firestore state is possible.
+  //
+  // The event is only processed by the Outbox worker when
+  // ENABLE_FIRESTORE_OUTBOX_WORKER=true (currently false in production).
+  if (isFirestoreDualWriteEnabled()) {
+    const eventOccurredAt = new Date().toISOString();
+    const bkgDocId  = formatBookingId(bookingNumber);
+    // Canonical guest document ID: the guest repository uses phone as the key
+    // for phone-based guests, or the MySQL guest PK as fallback (walk-ins without phone).
+    const guestDocId = formatGuestId(phone || finalGuestId);
+
+    const builder = createCompoundEventBuilder({
+      event_type:     'COMPOUND_CHECKIN',
+      aggregate_type: 'BOOKING',
+      aggregate_id:   bookingNumber,
+      operation_id:   `op_checkin_${bookingNumber}_${bookingId}`,
+      occurred_at:    eventOccurredAt,
+      business_date:  businessDate
+    });
+
+    // 1. Booking document (root)
+    builder.addRootWrite({
+      collection:  'bookings',
+      document_id: bkgDocId,
+      operation:   'set_merge',
+      data: {
+        booking_number:           bookingNumber,
+        guest_id:                 guestDocId,
+        mysql_guest_id:           finalGuestId,
+        guest_name:               guestNameUpper,
+        room_id:                  formatRoomId(roomNumber),
+        mysql_room_id:            room.id,
+        room_number:              roomNumber,
+        check_in_date:            actualCheckInDate,
+        expected_check_out_date:  departureDate || actualCheckInDate,
+        check_out_date:           null,
+        adults:                   pax,
+        children,
+        booking_status:           'Checked In',
+        payment_status:           deposit > 0 ? 'Partial' : 'Pending',
+        total_amount:             tariffAmount,
+        advance_amount:           deposit,
+        billing_instruction:      resolvedBilling,
+        meal_plan:                resolvedMealPlan,
+        mysql_booking_id:         bookingId,
+        created_at:               eventOccurredAt,
+        updated_at:               eventOccurredAt
+      }
+    });
+
+    // 2. Room document (root)
+    builder.addRootWrite({
+      collection:  'rooms',
+      document_id: formatRoomId(roomNumber),
+      operation:   'set_merge',
+      data: {
+        status:             'occupied',
+        current_booking_id: bkgDocId,
+        updated_at:         eventOccurredAt
+      }
+    });
+
+    // 3. Guest document (root)
+    builder.addRootWrite({
+      collection:  'guests',
+      document_id: guestDocId,
+      operation:   'set_merge',
+      data: {
+        full_name:      guestNameUpper,
+        phone:          phone || '',
+        email:          email || '',
+        address:        address || '',
+        country:        country || '',
+        mysql_guest_id: finalGuestId,
+        updated_at:     eventOccurredAt
+      }
+    });
+
+    // 4. Reservation document (root, conditional)
+    if (reservation) {
+      builder.addRootWrite({
+        collection:  'reservations',
+        document_id: formatReservationId(reservation.id),
+        operation:   'set_merge',
+        data: {
+          status:           'Checked-In',
+          booking_id:       bkgDocId,
+          mysql_booking_id: bookingId,
+          updated_at:       eventOccurredAt
+        }
+      });
+    }
+
+    // 5+6. Ledger item (root + booking subcollection — dual write)
+    const ledgerDocId  = formatLedgerItemId(ledgerMysqlId);
+    const ledgerData   = {
+      item_id:          ledgerDocId,
+      booking_id:       bkgDocId,
+      mysql_booking_id: bookingId,
+      room_number:      roomNumber,
+      description:      'Room Tariff (Incl. GST)',
+      desc:             'Room Tariff (Incl. GST)',
+      qty:              1,
+      quantity:         1,
+      amount:           tariffAmount,
+      type:             'CHARGE',
+      status:           'Pending',
+      business_date:    businessDate,
+      mysql_ledger_id:  ledgerMysqlId,
+      created_at:       eventOccurredAt
+    };
+    builder.addDualWrite({
+      rootCollection:   'ledger_items',
+      document_id:       ledgerDocId,
+      parentCollection:  'bookings',
+      parent_id:         bkgDocId,
+      subcollection:     'ledger_items',
+      operation:         'set_merge',
+      data:              ledgerData
+    });
+
+    // 7+8. Payment (root + booking subcollection — dual write, conditional)
+    if (deposit > 0) {
+      const paymentDocId = formatPaymentId(paymentMysqlId);
+      const paymentData  = {
+        payment_id:       paymentDocId,
+        booking_id:       bkgDocId,
+        mysql_booking_id: bookingId,
+        amount:           deposit,
+        payment_method:   paymentMethod,
+        payment_status:   'Completed',
+        payment_type:     'Advance Deposit',
+        business_date:    businessDate,
+        mysql_payment_id: paymentMysqlId,
+        created_at:       eventOccurredAt
+      };
+      builder.addDualWrite({
+        rootCollection:   'payments',
+        document_id:       paymentDocId,
+        parentCollection:  'bookings',
+        parent_id:         bkgDocId,
+        subcollection:     'payments',
+        operation:         'set_merge',
+        data:              paymentData
+      });
+
+      // 9. Cash log (root only, conditional — cash_logs collection has no subcollection)
+      if (paymentMethod === 'Cash' && cashLogMysqlId !== null) {
+        builder.addRootWrite({
+          collection:  'cash_logs',
+          document_id: formatCashLogId(cashLogMysqlId),
+          operation:   'set_merge',
+          data: {
+            log_id:           formatCashLogId(cashLogMysqlId),
+            amount:           deposit,
+            type:             'Advance Deposit',
+            category:         'Room Payment',
+            description:      `Advance Deposit for ${roomNumber} — ${guestNameUpper}`,
+            booking_id:       bkgDocId,
+            mysql_booking_id: bookingId,
+            business_date:    businessDate,
+            mysql_cash_log_id: cashLogMysqlId,
+            created_at:       eventOccurredAt
+          }
+        });
+      }
+    }
+
+    // 10. Settings/counter document — absolute today_checkins
+    builder.addRootWrite({
+      collection:  'settings',
+      document_id: 'system_date',
+      operation:   'set_merge',
+      data: {
+        today_checkins: todayCheckinsAbsolute
+      }
+    });
+
+    const compoundPayload = builder.build();
+
+    await enqueue(connection, {
+      event_type:     compoundPayload.event_type,
+      aggregate_type: compoundPayload.aggregate_type,
+      aggregate_id:   compoundPayload.aggregate_id,
+      payload:        compoundPayload
+    });
+
+    console.log(`[checkInService] Compound outbox event enqueued: ${compoundPayload.operation_id} (${compoundPayload.writes.length} writes)`);
   }
 
   return { bookingId, roomNumber };

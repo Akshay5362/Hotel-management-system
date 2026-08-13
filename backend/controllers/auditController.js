@@ -4,6 +4,9 @@ import path from 'path';
 import { RoomStatusService } from '../services/roomStatusService.js';
 import { BusinessDateService, BD_ERRORS } from '../services/businessDateService.js';
 import { AvailabilityService } from '../services/AvailabilityService.js';
+import { enqueue } from '../services/outboxService.js';
+import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
+import { CompoundEventBuilder } from '../services/compoundEventBuilder.js';
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -412,6 +415,85 @@ export const undoDayEnd = async (req, res) => {
       "INSERT INTO audit_logs (user_id, action, details, business_date, previous_business_date, new_business_date) VALUES (?, 'UNDO_DAY_END', ?, ?, ?, ?)",
       [adminId, undoDetail, previousDate, rolledToDate, previousDate]
     );
+
+    // ── Phase 4G-C: Restore daily counters ───────────────────────────────────
+    // Day End reset today_checkins and today_checkouts to 0, and set
+    // continued_rooms = occupied count. Undo must restore these counters
+    // to the values they held immediately before the Day End ran.
+    //
+    // The data guard above ensures ZERO operations occurred after the Day End,
+    // so we can safely count from the DB:
+    //   today_checkins  = bookings created on previousDate (checked-in)
+    //   today_checkouts = bookings whose check_out_date falls on previousDate
+    //   continued_rooms = rooms currently occupied (unchanged since Day End)
+    const [[checkinCountRow]] = await connection.query(
+      `SELECT COUNT(*) as cnt FROM bookings
+       WHERE DATE(created_at) = ? AND booking_status NOT IN ('Cancelled', 'Reserved')`,
+      [previousDate]
+    );
+    const restoredCheckins = Number(checkinCountRow.cnt);
+
+    const [[checkoutCountRow]] = await connection.query(
+      `SELECT COUNT(*) as cnt FROM bookings
+       WHERE DATE(check_out_date) = ? AND booking_status = 'Checked Out'`,
+      [previousDate]
+    );
+    const restoredCheckouts = Number(checkoutCountRow.cnt);
+
+    const [[occupiedCountRow]] = await connection.query(
+      `SELECT COUNT(*) as cnt FROM rooms WHERE status = 'occupied'`
+    );
+    const restoredContinuedRooms = Number(occupiedCountRow.cnt);
+
+    await connection.query(
+      `UPDATE system_settings SET value_val = ? WHERE key_name = 'today_checkins'`,
+      [String(restoredCheckins)]
+    );
+    await connection.query(
+      `UPDATE system_settings SET value_val = ? WHERE key_name = 'today_checkouts'`,
+      [String(restoredCheckouts)]
+    );
+    await connection.query(
+      `UPDATE system_settings SET value_val = ? WHERE key_name = 'continued_rooms'`,
+      [String(restoredContinuedRooms)]
+    );
+    console.log(`[UndoDayEnd] Counters restored: checkins=${restoredCheckins}, checkouts=${restoredCheckouts}, continued_rooms=${restoredContinuedRooms}`);
+
+    // ── Phase 4G-C: Outbox — COMPOUND_UNDO_DAY_END ───────────────────────────
+    // Enqueued AFTER all MySQL mutations and BEFORE commit().
+    // Uses restored absolute counter values — no FieldValue.increment().
+    if (isFirestoreDualWriteEnabled()) {
+      const eventOccurredAt = new Date().toISOString();
+
+      const undoEvent = new CompoundEventBuilder({
+        event_type:     'COMPOUND_UNDO_DAY_END',
+        aggregate_type: 'SYSTEM',
+        aggregate_id:   `undo_day_end_${previousDate}`
+      });
+
+      undoEvent.addRootWrite({
+        collection:  'settings',
+        document_id: 'system_date',
+        operation:   'set_merge',
+        data: {
+          current_date:    previousDate,
+          system_date:     previousDate,
+          today_checkins:  restoredCheckins,
+          today_checkouts: restoredCheckouts,
+          continued_rooms: restoredContinuedRooms,
+          updated_at:      eventOccurredAt
+        }
+      });
+
+      const undoPayload = undoEvent.build();
+      await enqueue(connection, {
+        event_type:     undoPayload.event_type,
+        aggregate_type: undoPayload.aggregate_type,
+        aggregate_id:   undoPayload.aggregate_id,
+        payload:        undoPayload
+      });
+      console.log(`[UndoDayEnd] Compound outbox event enqueued: ${undoPayload.operation_id}`);
+    }
 
     await connection.commit();
 

@@ -1,5 +1,11 @@
 import pool from '../db.js';
 import { BusinessDateService } from '../services/businessDateService.js';
+import { enqueue } from '../services/outboxService.js';
+import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
+import {
+  CompoundEventBuilder,
+  formatCashSubmissionId
+} from '../services/compoundEventBuilder.js';
 
 // â”€â”€ Helper: format current time â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function formatTime(date) {
@@ -105,6 +111,50 @@ export const submitCash = async (req, res) => {
       `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'CASH_HANDOVER', ?, ?)`,
       [req.user?.type === 'staff' ? null : (req.user?.id || null), structuredDetails, businessDate]
     );
+
+    // ── Phase 4G-C: Outbox — COMPOUND_CASH_SUBMITTED ──────────────────────
+    // Placed AFTER all MySQL mutations and BEFORE commit().
+    // receiptId (e.g. CS-20260813-0001) is deterministic — generated from
+    // business_date + sequential count. formatCashSubmissionId() produces
+    // cs_{receiptId}. No Math.random(), no Date.now(), no randomUUID().
+    if (isFirestoreDualWriteEnabled()) {
+      const eventOccurredAt = new Date().toISOString();
+
+      const cashEvent = new CompoundEventBuilder({
+        event_type:     'COMPOUND_CASH_SUBMITTED',
+        aggregate_type: 'CASH_SUBMISSION',
+        aggregate_id:   receiptId
+      });
+
+      cashEvent.addRootWrite({
+        collection:  'cash_submissions',
+        document_id: formatCashSubmissionId(receiptId),
+        operation:   'set_merge',
+        data: {
+          receipt_id:        receiptId,
+          business_date:     businessDate,
+          submitted_at:      submittedAt.toISOString(),
+          receptionist_name: receptionistName,
+          receiver_name:     receiverName,
+          shift:             shiftLabel,
+          amount:            parsedAmount,
+          remaining_cash:    remainingCash,
+          remarks:           combinedRemarks,
+          mysql_submission_id: insertResult.insertId,
+          created_at:        eventOccurredAt,
+          updated_at:        eventOccurredAt
+        }
+      });
+
+      const cashPayload = cashEvent.build();
+      await enqueue(connection, {
+        event_type:     cashPayload.event_type,
+        aggregate_type: cashPayload.aggregate_type,
+        aggregate_id:   cashPayload.aggregate_id,
+        payload:        cashPayload
+      });
+      console.log(`[submitCash] Compound outbox event enqueued: ${cashPayload.operation_id}`);
+    }
 
     await connection.commit();
     connection.release();

@@ -18,10 +18,24 @@
  * Future hooks (UPI / Card / Razorpay):
  *   - Add initiateGatewayPayment() and confirmGatewayPayment() here.
  *   - No changes required to this file's existing handlers.
+ *
+ * Phase 4G-A additions:
+ *   - finalizePayment() wrapped in MySQL transaction + COMPOUND_PAYMENT_FINALIZED
+ *   - confirmCashPayment() wrapped in MySQL transaction + COMPOUND_CASH_PAYMENT_CONFIRMED
+ *   - All Outbox enqueue() calls use the same acquired connection, run before commit,
+ *     and are fully gated by isFirestoreDualWriteEnabled().
  */
 
 import pool from '../db.js';
 import crypto from 'crypto';
+import { enqueue } from '../services/outboxService.js';
+import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
+import {
+  CompoundEventBuilder,
+  formatPaymentId,
+  formatInvoiceId,
+  formatBookingId
+} from '../services/compoundEventBuilder.js';
 
 // ---------------------------------------------------------------------------
 // Helper: Generate a unique internal transaction ID
@@ -43,6 +57,9 @@ function generateTransactionId() {
  * NOTE: Only 'Cash' is functional in Phase 2. Other methods are accepted
  *       by this endpoint so they can be persisted for future processing.
  *       The actual gateway call (for non-cash) is NOT made here yet.
+ *
+ * Phase 4G-A: Wrapped in a MySQL transaction. Enqueues COMPOUND_PAYMENT_FINALIZED
+ * when isFirestoreDualWriteEnabled() === true.
  */
 export const finalizePayment = async (req, res) => {
   const { bookingId, paymentMethod } = req.body;
@@ -67,10 +84,19 @@ export const finalizePayment = async (req, res) => {
 
   const userId = req.user?.id || null;
 
+  // Freeze timestamp once — used for all event payloads (idempotency on retry)
+  const eventOccurredAt = new Date().toISOString();
+
+  let connection;
   try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
     // Find the most recent Pending payment for this booking
-    const [rows] = await pool.query(
-      `SELECT id, amount FROM payments
+    const [rows] = await connection.query(
+      `SELECT id, amount, payment_method, payment_type, payment_source,
+              payment_gateway, business_date, created_at
+       FROM payments
        WHERE booking_id = ?
          AND payment_status = 'Pending'
        ORDER BY id DESC
@@ -80,6 +106,7 @@ export const finalizePayment = async (req, res) => {
 
     if (rows.length === 0) {
       // Booking may have no pending payment (edge case or already finalised).
+      await connection.rollback();
       return res.status(200).json({
         success: true,
         message: 'No pending payment found — booking may already be finalised.',
@@ -93,7 +120,7 @@ export const finalizePayment = async (req, res) => {
     const transactionId = generateTransactionId();
 
     // Update the payment record
-    await pool.query(
+    await connection.query(
       `UPDATE payments
        SET payment_method   = ?,
            payment_status   = 'Pending',
@@ -110,7 +137,7 @@ export const finalizePayment = async (req, res) => {
     );
 
     // Keep invoice as 'Issued' / 'Partially Paid' until admin confirms
-    await pool.query(
+    await connection.query(
       `UPDATE invoices
        SET status    = CASE
              WHEN balance_due <= 0 THEN 'Paid'
@@ -121,6 +148,120 @@ export const finalizePayment = async (req, res) => {
        WHERE booking_id = ?`,
       [bookingId]
     );
+
+    // ── Outbox: COMPOUND_PAYMENT_FINALIZED ──────────────────────────────────
+    if (isFirestoreDualWriteEnabled()) {
+      // Obtain invoice_number (required for deterministic Firestore docId)
+      const [invRows] = await connection.query(
+        'SELECT id, invoice_number, status, paid_amount, balance_due FROM invoices WHERE booking_id = ? LIMIT 1',
+        [bookingId]
+      );
+
+      // Obtain booking_number (required for subcollection parent path)
+      const [bkgRows] = await connection.query(
+        'SELECT booking_number FROM bookings WHERE id = ? LIMIT 1',
+        [bookingId]
+      );
+
+      if (invRows.length > 0 && bkgRows.length > 0) {
+        const invoice        = invRows[0];
+        const bookingNumber  = bkgRows[0].booking_number;
+        const invoiceNumber  = invoice.invoice_number;
+
+        const paymentDocId  = formatPaymentId(payment.id);
+        const invoiceDocId  = formatInvoiceId(invoiceNumber);
+        const bookingDocId  = formatBookingId(bookingNumber);
+
+        // Derive the final invoice status (mirrors the CASE expression above)
+        const finalInvoiceStatus = invoice.balance_due <= 0
+          ? 'Paid'
+          : invoice.paid_amount > 0
+            ? 'Partially Paid'
+            : 'Issued';
+
+        const paymentData = {
+          payment_id:       paymentDocId,
+          booking_id:       bookingDocId,
+          mysql_booking_id: Number(bookingId),
+          amount:           Number(payment.amount),
+          currency:         'INR',
+          payment_method:   method,
+          payment_status:   finalStatus,
+          payment_type:     payment.payment_type     || 'Advance Deposit',
+          payment_source:   'guest_portal',
+          payment_gateway:  gateway,
+          transaction_id:   transactionId,
+          business_date:    payment.business_date
+            ? String(payment.business_date).substring(0, 10)
+            : eventOccurredAt.substring(0, 10),
+          mysql_payment_id: payment.id,
+          remarks:          remarks,
+          created_at:       payment.created_at
+            ? new Date(payment.created_at).toISOString()
+            : eventOccurredAt,
+          updated_at:       eventOccurredAt
+        };
+
+        const invoiceData = {
+          // Both field names required: MySQL uses 'status'; Firestore model uses 'invoice_status'
+          status:         finalInvoiceStatus,
+          invoice_status: finalInvoiceStatus,
+          updated_at:     eventOccurredAt
+        };
+
+        // Add issued_at only when set (mirrors the COALESCE logic)
+        if (finalInvoiceStatus !== 'Issued') {
+          invoiceData.issued_at = eventOccurredAt;
+        }
+
+        const builder = new CompoundEventBuilder({
+          event_type:     'COMPOUND_PAYMENT_FINALIZED',
+          aggregate_type: 'PAYMENT',
+          aggregate_id:   paymentDocId,
+          occurred_at:    eventOccurredAt,
+          business_date:  paymentData.business_date
+        });
+
+        // Write 1: payments/{payment_id}  (root)
+        builder.addRootWrite({
+          collection:  'payments',
+          document_id: paymentDocId,
+          operation:   'set_merge',
+          data:        paymentData
+        });
+
+        // Write 2: bookings/{bkg_X}/payments/{payment_id}  (subcollection mirror)
+        builder.addSubcollectionWrite({
+          collection:    'bookings',
+          parent_id:     bookingDocId,
+          subcollection: 'payments',
+          document_id:   paymentDocId,
+          operation:     'set_merge',
+          data:          paymentData
+        });
+
+        // Write 3: invoices/{inv_invoiceNumber}  (root — invoices have NO subcollection)
+        builder.addRootWrite({
+          collection:  'invoices',
+          document_id: invoiceDocId,
+          operation:   'set_merge',
+          data:        invoiceData
+        });
+
+        const compoundPayload = builder.build();
+
+        // enqueue() MUST use the same connection and run BEFORE commit()
+        await enqueue(connection, {
+          event_type:     compoundPayload.event_type,
+          aggregate_type: compoundPayload.aggregate_type,
+          aggregate_id:   compoundPayload.aggregate_id,
+          payload:        compoundPayload
+        });
+      }
+      // If no invoice or booking found, skip Firestore event but do not fail the tx
+    }
+
+    await connection.commit();
 
     return res.status(200).json({
       success: true,
@@ -135,8 +276,13 @@ export const finalizePayment = async (req, res) => {
     });
 
   } catch (err) {
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
     console.error('finalizePayment error:', err);
     return res.status(500).json({ success: false, message: 'Payment finalisation failed.' });
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -256,15 +402,35 @@ export const getMyPayments = async (req, res) => {
  * Admin calls this after physically receiving cash from the guest at reception.
  * Sets payment_status = 'Paid', payment_date = NOW(), received_by = admin user.
  * This unblocks the guest's "Check In Now" button.
+ *
+ * Phase 4G-A: Wrapped in a MySQL transaction. Enqueues COMPOUND_CASH_PAYMENT_CONFIRMED
+ * when isFirestoreDualWriteEnabled() === true.
+ *
+ * The notification INSERT is intentionally kept OUTSIDE the financial transaction
+ * because:
+ *  (a) it is not part of the financial projection replicated to Firestore, and
+ *  (b) a notification failure should not roll back the payment confirmation.
+ * The notification runs after a successful commit.
  */
 export const confirmCashPayment = async (req, res) => {
   const { bookingId } = req.params;
   const adminId = req.user?.id;
 
+  // Freeze timestamp once — used for all event payloads (idempotency on retry)
+  const eventOccurredAt = new Date().toISOString();
+
+  let connection;
+  // Capture booking info for notification (populated inside tx, used outside)
+  let bookingForNotification = null;
+  let paymentAmountForNotification = 0;
+
   try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
     // Find the pending Cash payment for this booking
-    const [rows] = await pool.query(
-      `SELECT id, amount FROM payments
+    const [rows] = await connection.query(
+      `SELECT id, amount, business_date, created_at FROM payments
        WHERE booking_id    = ?
          AND payment_method = 'Cash'
          AND payment_status = 'Pending'
@@ -273,13 +439,15 @@ export const confirmCashPayment = async (req, res) => {
     );
 
     if (rows.length === 0) {
+      await connection.rollback();
       return res.status(404).json({ success: false, message: 'No pending Cash payment found for this booking.' });
     }
 
     const payment = rows[0];
+    paymentAmountForNotification = payment.amount;
 
     // Mark as Paid
-    await pool.query(
+    await connection.query(
       `UPDATE payments
        SET payment_status = 'Paid',
            payment_date   = NOW(),
@@ -290,8 +458,8 @@ export const confirmCashPayment = async (req, res) => {
       [adminId, payment.id]
     );
 
-    // Sync invoice
-    await pool.query(
+    // Sync invoice — uses aggregate across ALL relevant payments (preserved exactly)
+    await connection.query(
       `UPDATE invoices i
        INNER JOIN (
          SELECT booking_id,
@@ -309,26 +477,175 @@ export const confirmCashPayment = async (req, res) => {
       [bookingId]
     );
 
-    // Create notification for guest that payment is confirmed
-    const [booking] = await pool.query(
-      `SELECT b.id, g.user_id, r.number as room_number, p.amount
-       FROM bookings b
-       JOIN guests g ON b.guest_id = g.id
-       JOIN rooms r ON b.room_id = r.id
-       JOIN payments p ON p.booking_id = b.id AND p.id = ?
-       WHERE b.id = ?`,
-      [payment.id, bookingId]
-    );
-
-    if (booking.length > 0) {
-      await pool.query(
-        `INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)`,
-        [
-          booking[0].user_id,
-          '✅ Cash Payment Confirmed!',
-          `Your advance cash payment of ₹${payment.amount} for Room ${booking[0].room_number} has been received at the reception. You can now check in via the Guest Portal.`
-        ]
+    // ── Outbox: COMPOUND_CASH_PAYMENT_CONFIRMED ──────────────────────────────
+    if (isFirestoreDualWriteEnabled()) {
+      // Read final invoice state from MySQL (AFTER the UPDATE above — authoritative)
+      const [invRows] = await connection.query(
+        `SELECT id, invoice_number, status, paid_amount, balance_due, total_amount
+         FROM invoices WHERE booking_id = ? LIMIT 1`,
+        [bookingId]
       );
+
+      // Read booking_number for subcollection parent path and booking status update
+      const [bkgRows] = await connection.query(
+        `SELECT booking_number, payment_status FROM bookings WHERE id = ? LIMIT 1`,
+        [bookingId]
+      );
+
+      if (invRows.length > 0 && bkgRows.length > 0) {
+        const invoice        = invRows[0];
+        const bookingNumber  = bkgRows[0].booking_number;
+        const invoiceNumber  = invoice.invoice_number;
+
+        const paymentDocId  = formatPaymentId(payment.id);
+        const invoiceDocId  = formatInvoiceId(invoiceNumber);
+        const bookingDocId  = formatBookingId(bookingNumber);
+
+        const finalInvoiceStatus = invoice.balance_due <= 0
+          ? 'Paid'
+          : invoice.paid_amount > 0
+            ? 'Partially Paid'
+            : 'Issued';
+
+        // Booking payment_status: derive from the settled invoice
+        const finalBookingPaymentStatus = invoice.balance_due <= 0 ? 'Paid' : 'Partial';
+
+        const paymentData = {
+          payment_id:       paymentDocId,
+          booking_id:       bookingDocId,
+          mysql_booking_id: Number(bookingId),
+          amount:           Number(payment.amount),
+          currency:         'INR',
+          payment_method:   'Cash',
+          payment_status:   'Paid',
+          payment_type:     'Advance Deposit',
+          payment_source:   'front_desk',
+          payment_gateway:  'Internal',
+          transaction_id:   null,
+          business_date:    payment.business_date
+            ? String(payment.business_date).substring(0, 10)
+            : eventOccurredAt.substring(0, 10),
+          mysql_payment_id: payment.id,
+          remarks:          'Cash received at reception',
+          received_by:      adminId ? String(adminId) : null,
+          created_at:       payment.created_at
+            ? new Date(payment.created_at).toISOString()
+            : eventOccurredAt,
+          updated_at:       eventOccurredAt
+        };
+
+        const invoiceData = {
+          // Both field names required: MySQL 'status' and Firestore 'invoice_status'
+          status:         finalInvoiceStatus,
+          invoice_status: finalInvoiceStatus,
+          paid_amount:    Number(invoice.paid_amount),
+          outstanding_amount: Number(invoice.balance_due),
+          balance_due:    Number(invoice.balance_due),
+          updated_at:     eventOccurredAt
+        };
+
+        const bookingData = {
+          payment_status: finalBookingPaymentStatus,
+          updated_at:     eventOccurredAt
+        };
+
+        const builder = new CompoundEventBuilder({
+          event_type:     'COMPOUND_CASH_PAYMENT_CONFIRMED',
+          aggregate_type: 'PAYMENT',
+          aggregate_id:   paymentDocId,
+          occurred_at:    eventOccurredAt,
+          business_date:  paymentData.business_date
+        });
+
+        // Write 1: payments/{payment_id}  (root)
+        builder.addRootWrite({
+          collection:  'payments',
+          document_id: paymentDocId,
+          operation:   'set_merge',
+          data:        paymentData
+        });
+
+        // Write 2: bookings/{bkg_X}/payments/{payment_id}  (subcollection mirror)
+        builder.addSubcollectionWrite({
+          collection:    'bookings',
+          parent_id:     bookingDocId,
+          subcollection: 'payments',
+          document_id:   paymentDocId,
+          operation:     'set_merge',
+          data:          paymentData
+        });
+
+        // Write 3: invoices/{inv_invoiceNumber}  (root — invoices have NO subcollection)
+        builder.addRootWrite({
+          collection:  'invoices',
+          document_id: invoiceDocId,
+          operation:   'set_merge',
+          data:        invoiceData
+        });
+
+        // Write 4: bookings/{bkg_X}  (payment_status field only — set_merge is safe)
+        builder.addRootWrite({
+          collection:  'bookings',
+          document_id: bookingDocId,
+          operation:   'set_merge',
+          data:        bookingData
+        });
+
+        const compoundPayload = builder.build();
+
+        // enqueue() MUST use the same connection and run BEFORE commit()
+        await enqueue(connection, {
+          event_type:     compoundPayload.event_type,
+          aggregate_type: compoundPayload.aggregate_type,
+          aggregate_id:   compoundPayload.aggregate_id,
+          payload:        compoundPayload
+        });
+
+        // Capture notification data for use after commit (uses data already read in tx)
+        bookingForNotification = {
+          // We'll re-read this below in the pool query which is safer for notification
+          // than carrying the full guest data through the transaction scope.
+          // See notification block after connection.commit().
+          _payment_id: payment.id,
+          _booking_id: bookingId
+        };
+      }
+    } else {
+      // Flag off: still capture for notification query
+      bookingForNotification = { _payment_id: payment.id, _booking_id: bookingId };
+    }
+
+    await connection.commit();
+
+    // ── Notification INSERT (outside financial transaction — intentional) ────
+    // The notification is not part of the Firestore financial projection.
+    // We only send it if the financial transaction committed successfully.
+    if (bookingForNotification) {
+      try {
+        const [booking] = await pool.query(
+          `SELECT b.id, g.user_id, r.number as room_number, p.amount
+           FROM bookings b
+           JOIN guests g ON b.guest_id = g.id
+           JOIN rooms r ON b.room_id = r.id
+           JOIN payments p ON p.booking_id = b.id AND p.id = ?
+           WHERE b.id = ?`,
+          [bookingForNotification._payment_id, bookingForNotification._booking_id]
+        );
+
+        if (booking.length > 0) {
+          await pool.query(
+            `INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)`,
+            [
+              booking[0].user_id,
+              '✅ Cash Payment Confirmed!',
+              `Your advance cash payment of ₹${payment.amount} for Room ${booking[0].room_number} has been received at the reception. You can now check in via the Guest Portal.`
+            ]
+          );
+        }
+      } catch (notifErr) {
+        // Notification failure must never fail the payment confirmation response.
+        console.error('confirmCashPayment notification error (non-fatal):', notifErr);
+      }
     }
 
     return res.status(200).json({
@@ -339,8 +656,13 @@ export const confirmCashPayment = async (req, res) => {
     });
 
   } catch (err) {
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
     console.error('confirmCashPayment error:', err);
     return res.status(500).json({ success: false, message: 'Failed to confirm cash payment.' });
+  } finally {
+    if (connection) connection.release();
   }
 };
 

@@ -80,9 +80,20 @@ app.get('/', (req, res) => {
   res.send('Webline PMS Plus Backend API is running!');
 });
 
-// Health check endpoint — used by wait-on in electron:dev workflow
+import { isFirestoreOutboxWorkerEnabled } from './config/featureFlags.js';
+import { isWorkerRunning, stopOutboxWorker } from './services/outboxWorker.js';
+
+// Health check endpoint — used by wait-on in electron:dev workflow & Docker healthcheck
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', service: 'hotel-pms-backend', port: PORT });
+  res.json({
+    status: 'ok',
+    service: 'hotel-pms-backend',
+    port: PORT,
+    outbox_worker: {
+      enabled: isFirestoreOutboxWorkerEnabled(),
+      running: isWorkerRunning()
+    }
+  });
 });
 
 
@@ -94,4 +105,46 @@ app.use((err, req, res, next) => {
 
 server.listen(PORT, () => {
   console.log(`Backend server is running on http://localhost:${PORT}`);
+
+  // ── Outbox Worker Startup ─────────────────────────────────────────────────
+  // Starts the transactional outbox polling daemon only when
+  // ENABLE_FIRESTORE_OUTBOX_WORKER=true. When the flag is false (current safe
+  // state), startOutboxWorker() logs a message and exits — no interval, no
+  // Firestore writes, zero impact on MySQL business operations.
+  import('./services/outboxWorker.js')
+    .then(({ startOutboxWorker }) => {
+      try {
+        startOutboxWorker();
+      } catch (err) {
+        // Worker startup failure must not disrupt hotel operations.
+        console.error('[Server] Outbox worker failed to start:', err.message);
+      }
+    })
+    .catch(err => {
+      console.error('[Server] Failed to import outboxWorker module:', err.message);
+    });
 });
+
+// ── Graceful Shutdown Handlers (SIGTERM / SIGINT) ───────────────────────────
+// Ensures clean worker termination and HTTP connection draining in Docker/K8s environments.
+const gracefulShutdown = (signal) => {
+  console.log(`[Server] ${signal} signal received. Initiating graceful shutdown...`);
+  try {
+    stopOutboxWorker();
+  } catch (err) {
+    console.error('[Server] Error stopping outbox worker during shutdown:', err.message);
+  }
+  server.close(() => {
+    console.log('[Server] HTTP server closed.');
+    process.exit(0);
+  });
+
+  // Force exit if server hasn't closed in 10s
+  setTimeout(() => {
+    console.error('[Server] Forced shutdown after 10s timeout.');
+    process.exit(1);
+  }, 10000).unref();
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));

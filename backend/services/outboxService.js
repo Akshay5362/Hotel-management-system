@@ -61,48 +61,59 @@ export async function enqueue(conn, eventData) {
 }
 
 /**
- * Concurrency-safe claim strategy for worker daemon.
- * Claims a batch of PENDING or retry-eligible FAILED outbox events.
+ * Concurrency-safe claim strategy for worker daemon using FOR UPDATE SKIP LOCKED.
+ * Claims a batch of PENDING or retry-eligible FAILED outbox events atomically.
  */
 export async function claimNextBatch(conn, batchSize = 10, maxRetries = 5) {
-  const db = conn || pool;
+  const useConn = conn || await pool.getConnection();
+  const isSelfConn = !conn;
 
-  const [candidates] = await db.query(
-    `SELECT id, event_id, event_type, aggregate_type, aggregate_id, payload, attempts
-     FROM dual_write_outbox
-     WHERE (status = 'PENDING' OR (status = 'FAILED' AND attempts < ?))
-       AND available_at <= NOW()
-     ORDER BY id ASC
-     LIMIT ?`,
-    [maxRetries, Number(batchSize)]
-  );
+  try {
+    if (isSelfConn) {
+      await useConn.beginTransaction();
+    }
 
-  if (candidates.length === 0) {
-    return [];
+    const [candidates] = await useConn.query(
+      `SELECT id, event_id, event_type, aggregate_type, aggregate_id, payload, attempts, created_at
+       FROM dual_write_outbox
+       WHERE (status = 'PENDING' OR (status = 'FAILED' AND attempts < ?))
+         AND available_at <= NOW()
+       ORDER BY id ASC
+       LIMIT ?
+       FOR UPDATE SKIP LOCKED`,
+      [maxRetries, Number(batchSize)]
+    );
+
+    if (candidates.length === 0) {
+      if (isSelfConn) await useConn.commit();
+      return [];
+    }
+
+    const idsToClaim = candidates.map(c => c.id);
+    const placeholders = idsToClaim.map(() => '?').join(',');
+
+    await useConn.query(
+      `UPDATE dual_write_outbox
+       SET status = 'PROCESSING', updated_at = NOW()
+       WHERE id IN (${placeholders}) AND (status = 'PENDING' OR status = 'FAILED')`,
+      idsToClaim
+    );
+
+    if (isSelfConn) {
+      await useConn.commit();
+    }
+
+    return candidates;
+  } catch (err) {
+    if (isSelfConn) {
+      try { await useConn.rollback(); } catch (_) {}
+    }
+    throw err;
+  } finally {
+    if (isSelfConn) {
+      useConn.release();
+    }
   }
-
-  const idsToClaim = candidates.map(c => c.id);
-  const placeholders = idsToClaim.map(() => '?').join(',');
-
-  const [updateResult] = await db.query(
-    `UPDATE dual_write_outbox
-     SET status = 'PROCESSING', updated_at = NOW()
-     WHERE id IN (${placeholders}) AND (status = 'PENDING' OR status = 'FAILED')`,
-    idsToClaim
-  );
-
-  if (updateResult.affectedRows === 0) {
-    return [];
-  }
-
-  const [claimed] = await db.query(
-    `SELECT id, event_id, event_type, aggregate_type, aggregate_id, payload, attempts, created_at
-     FROM dual_write_outbox
-     WHERE id IN (${placeholders}) AND status = 'PROCESSING'`,
-    idsToClaim
-  );
-
-  return claimed;
 }
 
 /**
@@ -120,6 +131,7 @@ export async function markProcessed(conn, eventId) {
 
 /**
  * Marks an outbox event as FAILED with exponential backoff or DEAD_LETTER if max attempts reached.
+ * Returns { status, attempts } so callers can detect the DEAD_LETTER transition.
  */
 export async function markFailed(conn, eventId, errorMsg, maxRetries = 5) {
   const db = conn || pool;
@@ -139,8 +151,9 @@ export async function markFailed(conn, eventId, errorMsg, maxRetries = 5) {
        WHERE event_id = ?`,
       [currentAttempts, safeErr, String(eventId)]
     );
+    return { status: 'DEAD_LETTER', attempts: currentAttempts };
   } else {
-    // Exponential backoff: 5s, 10s, 20s, 40s...
+    // Exponential backoff: 10s, 20s, 40s, 80s... capped at 300s
     const backoffSeconds = Math.min(300, Math.pow(2, currentAttempts) * 5);
     await db.query(
       `UPDATE dual_write_outbox
@@ -148,6 +161,7 @@ export async function markFailed(conn, eventId, errorMsg, maxRetries = 5) {
        WHERE event_id = ?`,
       [currentAttempts, safeErr, backoffSeconds, String(eventId)]
     );
+    return { status: 'FAILED', attempts: currentAttempts };
   }
 }
 
@@ -175,4 +189,51 @@ export async function moveToDeadLetter(conn, eventId, errorMsg) {
      WHERE event_id = ?`,
     [String(errorMsg || 'Manually moved to dead-letter').slice(0, 1000), String(eventId)]
   );
+}
+
+/**
+ * Reclaims stale PROCESSING events that have exceeded the lease timeout.
+ *
+ * A PROCESSING event is considered stale when:
+ *   updated_at < NOW() - OUTBOX_PROCESSING_LEASE_MINUTES
+ *
+ * Default lease timeout: 10 minutes.
+ * Configure via environment variable: OUTBOX_PROCESSING_LEASE_MINUTES
+ *
+ * Stale events are moved to FAILED (not directly to PENDING), so the
+ * existing exponential-backoff retry mechanism handles them consistently.
+ * The payload is preserved. The attempts counter is NOT reset, so
+ * events close to maxRetries will correctly proceed to DEAD_LETTER.
+ *
+ * The UPDATE is guarded by:
+ *   AND status = 'PROCESSING'
+ *   AND updated_at < threshold
+ * This prevents incorrectly reclaiming an event that was just claimed by
+ * an active worker (fresh PROCESSING event with a recent updated_at).
+ *
+ * @param {object|null} conn  - Optional MySQL connection. Uses pool if null.
+ * @returns {Promise<number>} - Number of events reclaimed.
+ */
+export async function reclaimStaleProcessing(conn) {
+  const db = conn || pool;
+
+  const leaseMinutes = Number(process.env.OUTBOX_PROCESSING_LEASE_MINUTES) || 10;
+
+  const [result] = await db.query(
+    `UPDATE dual_write_outbox
+     SET
+       status     = 'FAILED',
+       available_at = NOW(),
+       last_error = CONCAT(
+         'Lease expired: event was stuck in PROCESSING for > ',
+         ?,
+         ' minutes (worker crash recovery). Recovered at: ',
+         NOW()
+       )
+     WHERE status = 'PROCESSING'
+       AND updated_at < DATE_SUB(NOW(), INTERVAL ? MINUTE)`,
+    [leaseMinutes, leaseMinutes]
+  );
+
+  return result.affectedRows;
 }

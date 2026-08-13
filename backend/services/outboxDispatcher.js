@@ -1,3 +1,4 @@
+import { db } from '../config/firebaseAdmin.js';
 import {
   createRoomFirestore, updateRoomFirestore, updateRoomStatusFirestore, deleteRoomFirestore, getRoomByIdFirestore, formatRoomId,
   createGuestFirestore, updateGuestFirestore, getGuestByIdFirestore, formatGuestId,
@@ -542,7 +543,292 @@ export async function dispatchEvent(event) {
       return { action: 'STAY_EXTENSION_RESOLVED', booking_id: bkgRef, status: 'recorded' };
     }
 
+    // ── Phase 4E-B1: Generic Compound Events ─────────────────────────────────
+    // All compound event types are routed through the generic WriteBatch dispatcher.
+    // The event payload must contain a `writes[]` array of declarative write
+    // descriptors. No domain-specific logic lives here — the dispatcher is a
+    // pure translator of the declarative write set into Firestore batch operations.
     default:
+      if (eventType.startsWith('COMPOUND_')) {
+        return await dispatchCompoundEvent(payload);
+      }
       throw new DispatcherError(`Unsupported event_type for dispatch: '${eventType}'`, 'UNSUPPORTED_EVENT_TYPE');
   }
+}
+
+// ── Firestore WriteBatch Limits ─────────────────────────────────────────────
+/**
+ * Maximum number of operations allowed in a single Firestore WriteBatch.
+ *
+ * The Firebase Admin SDK hard limit is 500 operations per batch.
+ * We enforce a conservative guard of 490 to leave headroom for any
+ * internal SDK operations and to maintain a clear safety margin.
+ *
+ * Configure via environment variable: FIRESTORE_MAX_BATCH_OPS
+ * Default: 490
+ * Absolute ceiling enforced: 500 (hard Firebase limit)
+ */
+export const FIRESTORE_MAX_BATCH_OPS = Math.min(
+  Number(process.env.FIRESTORE_MAX_BATCH_OPS) || 490,
+  500
+);
+
+/**
+ * Supported write operation types for compound events.
+ * Only these values are accepted in a write descriptor's `operation` field.
+ */
+export const SUPPORTED_WRITE_OPERATIONS = Object.freeze({
+  SET:        'set',        // batch.set(ref, data, { merge: false }) — full overwrite
+  SET_MERGE:  'set_merge',  // batch.set(ref, data, { merge: true })  — partial upsert (preferred for idempotency)
+  UPDATE:     'update',     // batch.update(ref, data)                — update specific fields only
+  DELETE:     'delete',     // batch.delete(ref)                      — delete document
+});
+
+/**
+ * Dispatches a compound outbox event as a single atomic Firestore WriteBatch.
+ *
+ * CONTRACT (Compound Event Payload Schema v1)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The event `payload` must conform to:
+ *
+ * {
+ *   schema_version: 1,                          // (required) Schema version number
+ *   operation_id:   "op_checkin_1234_abc",       // (required) Globally unique operation ID for tracing
+ *   aggregate_type: "BOOKING",                   // (required) Primary domain entity type
+ *   aggregate_id:   "BKG-123456",               // (required) Primary entity identifier
+ *   occurred_at:    "2026-08-12T09:45:00.000Z",  // (optional) Wall-clock ISO at MySQL COMMIT
+ *   business_date:  "2026-08-12",               // (optional) Hotel business date
+ *   writes: [                                    // (required) Ordered array of write descriptors
+ *     {
+ *       seq:           1,              // (optional) Ordering hint for documentation; not enforced
+ *       collection:    "bookings",     // (required) Firestore root collection name
+ *       document_id:   "bkg_BKG-123", // (required) Document ID — MUST be deterministic (no random generation)
+ *       operation:     "set_merge",   // (required) One of: set | set_merge | update | delete
+ *       data:          { ... },        // (required for set/set_merge/update; absent/null for delete)
+ *       subcollection: null,           // (optional) Subcollection name for nested writes
+ *       parent_id:     null,           // (required when subcollection is set)
+ *     }
+ *   ]
+ * }
+ *
+ * IDEMPOTENCY REQUIREMENTS
+ * ─────────────────────────────────────────────────────────────────────────────
+ * - document_id MUST be deterministic — derived from MySQL primary keys, business
+ *   keys, or other stable identifiers. Random IDs are forbidden.
+ * - Data values MUST be absolute. FieldValue.increment() MUST NOT appear in
+ *   compound event payloads (use pre-read absolute counter values from MySQL).
+ * - Preferred operation: `set_merge` — applies fields without erasing others,
+ *   and is safe to replay on already-written documents.
+ *
+ * ATOMICITY
+ * ─────────────────────────────────────────────────────────────────────────────
+ * ALL writes are added to ONE WriteBatch. ONE batch.commit() is called at the
+ * end. If any write descriptor fails validation, NO Firestore write occurs.
+ * If batch.commit() throws, the existing Outbox retry mechanism handles it.
+ *
+ * BATCH LIMIT
+ * ─────────────────────────────────────────────────────────────────────────────
+ * If `writes.length` exceeds FIRESTORE_MAX_BATCH_OPS (default 490), the event
+ * is rejected BEFORE creating the batch. The error propagates through the
+ * existing markFailed() / DEAD_LETTER retry path.
+ *
+ * @param {object} payload - Parsed compound event payload (conforming to schema above)
+ * @returns {Promise<{ committed: number, operation_id: string }>}
+ * @throws {DispatcherError} on validation failure or Firestore commit failure
+ */
+export async function dispatchCompoundEvent(payload) {
+  // ── 1. Top-level payload validation ────────────────────────────────────────
+  if (!payload || typeof payload !== 'object') {
+    throw new DispatcherError(
+      'Compound event payload must be a non-null object',
+      'COMPOUND_INVALID_PAYLOAD'
+    );
+  }
+
+  if (!payload.writes) {
+    throw new DispatcherError(
+      'Compound event payload missing required field: writes',
+      'COMPOUND_MISSING_WRITES'
+    );
+  }
+
+  if (!Array.isArray(payload.writes)) {
+    throw new DispatcherError(
+      'Compound event payload.writes must be an array',
+      'COMPOUND_WRITES_NOT_ARRAY'
+    );
+  }
+
+  if (payload.writes.length === 0) {
+    throw new DispatcherError(
+      'Compound event payload.writes must not be empty',
+      'COMPOUND_EMPTY_WRITES'
+    );
+  }
+
+  // ── 2. Batch operation count guard (before any Firestore interaction) ───────
+  if (payload.writes.length > FIRESTORE_MAX_BATCH_OPS) {
+    throw new DispatcherError(
+      `Compound event contains ${payload.writes.length} write operations which exceeds ` +
+      `the configured maximum of ${FIRESTORE_MAX_BATCH_OPS}. ` +
+      `Split this compound event into smaller batches in the domain builder. ` +
+      `Firebase hard limit: 500; HPMS configured limit: FIRESTORE_MAX_BATCH_OPS=${FIRESTORE_MAX_BATCH_OPS}.`,
+      'COMPOUND_BATCH_LIMIT_EXCEEDED'
+    );
+  }
+
+  const operationId = payload.operation_id || '(unknown)';
+
+  // ── 3. Validate Firestore client is available ───────────────────────────────
+  if (!db) {
+    throw new DispatcherError(
+      'Firestore db instance is not initialised. Check Firebase Admin SDK configuration.',
+      'COMPOUND_DB_NOT_READY'
+    );
+  }
+
+  // ── 4. Validate every write descriptor BEFORE creating the batch ────────────
+  //    A validation failure here means ZERO Firestore writes occur.
+  const validatedRefs = [];
+  for (let i = 0; i < payload.writes.length; i++) {
+    const write = payload.writes[i];
+    const position = `writes[${i}]${write.seq !== undefined ? ` (seq ${write.seq})` : ''}`;
+
+    if (!write || typeof write !== 'object') {
+      throw new DispatcherError(
+        `Compound event ${position}: write descriptor must be a non-null object`,
+        'COMPOUND_INVALID_WRITE_DESCRIPTOR'
+      );
+    }
+
+    // operation
+    const op = typeof write.operation === 'string' ? write.operation.toLowerCase().trim() : null;
+    if (!op || !Object.values(SUPPORTED_WRITE_OPERATIONS).includes(op)) {
+      throw new DispatcherError(
+        `Compound event ${position}: unsupported operation '${write.operation}'. ` +
+        `Supported: ${Object.values(SUPPORTED_WRITE_OPERATIONS).join(', ')}`,
+        'COMPOUND_UNSUPPORTED_OPERATION'
+      );
+    }
+
+    // collection
+    if (!write.collection || typeof write.collection !== 'string' || !write.collection.trim()) {
+      throw new DispatcherError(
+        `Compound event ${position}: missing or invalid 'collection' field`,
+        'COMPOUND_INVALID_COLLECTION'
+      );
+    }
+
+    // document_id
+    if (!write.document_id || typeof write.document_id !== 'string' || !write.document_id.trim()) {
+      throw new DispatcherError(
+        `Compound event ${position}: missing or invalid 'document_id' field`,
+        'COMPOUND_INVALID_DOCUMENT_ID'
+      );
+    }
+
+    // subcollection path consistency
+    if (write.subcollection !== null && write.subcollection !== undefined) {
+      if (typeof write.subcollection !== 'string' || !write.subcollection.trim()) {
+        throw new DispatcherError(
+          `Compound event ${position}: 'subcollection' must be a non-empty string when set`,
+          'COMPOUND_INVALID_SUBCOLLECTION'
+        );
+      }
+      if (!write.parent_id || typeof write.parent_id !== 'string' || !write.parent_id.trim()) {
+        throw new DispatcherError(
+          `Compound event ${position}: 'parent_id' is required when 'subcollection' is set`,
+          'COMPOUND_MISSING_PARENT_ID'
+        );
+      }
+    }
+
+    // data presence (required for set/set_merge/update; must be absent or null for delete)
+    if (op === SUPPORTED_WRITE_OPERATIONS.DELETE) {
+      // data is allowed to be absent/null for deletes
+    } else {
+      if (!write.data || typeof write.data !== 'object' || Array.isArray(write.data)) {
+        throw new DispatcherError(
+          `Compound event ${position}: operation '${op}' requires 'data' to be a non-null object`,
+          'COMPOUND_MISSING_DATA'
+        );
+      }
+      // Guard: data must not be an empty object for set/set_merge/update
+      if (Object.keys(write.data).length === 0) {
+        throw new DispatcherError(
+          `Compound event ${position}: operation '${op}' has an empty 'data' object — ` +
+          'this is likely a build error; use delete operation to remove a document',
+          'COMPOUND_EMPTY_DATA'
+        );
+      }
+    }
+
+    // Build the Firestore DocumentReference
+    let ref;
+    try {
+      if (write.subcollection && write.parent_id) {
+        // Subcollection path: /collection/parent_id/subcollection/document_id
+        ref = db
+          .collection(write.collection.trim())
+          .doc(write.parent_id.trim())
+          .collection(write.subcollection.trim())
+          .doc(write.document_id.trim());
+      } else {
+        // Root path: /collection/document_id
+        ref = db
+          .collection(write.collection.trim())
+          .doc(write.document_id.trim());
+      }
+    } catch (refErr) {
+      throw new DispatcherError(
+        `Compound event ${position}: failed to build Firestore reference — ${refErr.message}`,
+        'COMPOUND_INVALID_REF'
+      );
+    }
+
+    validatedRefs.push({ ref, op, data: write.data || null, position });
+  }
+
+  // ── 5. Build WriteBatch (all validation passed — commit or nothing) ─────────
+  const batch = db.batch();
+
+  for (const { ref, op, data, position } of validatedRefs) {
+    switch (op) {
+      case SUPPORTED_WRITE_OPERATIONS.SET:
+        batch.set(ref, { ...data, updated_at: data.updated_at || new Date().toISOString() });
+        break;
+
+      case SUPPORTED_WRITE_OPERATIONS.SET_MERGE:
+        batch.set(ref, { ...data, updated_at: data.updated_at || new Date().toISOString() }, { merge: true });
+        break;
+
+      case SUPPORTED_WRITE_OPERATIONS.UPDATE:
+        batch.update(ref, { ...data, updated_at: data.updated_at || new Date().toISOString() });
+        break;
+
+      case SUPPORTED_WRITE_OPERATIONS.DELETE:
+        batch.delete(ref);
+        break;
+
+      default:
+        // Unreachable — validated above. Belt-and-suspenders guard.
+        throw new DispatcherError(
+          `Internal: unexpected operation '${op}' at ${position} reached batch building`,
+          'COMPOUND_INTERNAL_ERROR'
+        );
+    }
+  }
+
+  // ── 6. ONE atomic commit ────────────────────────────────────────────────────
+  //    If this throws, the existing outboxWorker processOutboxBatch() catches it
+  //    and calls markFailed() — no markProcessed() will be called. The event
+  //    will be retried with exponential backoff.
+  await batch.commit();
+
+  const count = validatedRefs.length;
+  console.log(
+    `[CompoundDispatcher] Committed ${count} write(s) atomically for operation '${operationId}'.`
+  );
+
+  return { committed: count, operation_id: operationId };
 }

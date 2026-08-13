@@ -1,8 +1,32 @@
+/**
+ * reservationController.js
+ *
+ * Phase 4G-B additions:
+ *   - createReservation()   wrapped with COMPOUND_RESERVATION_CREATED outbox event
+ *   - updateReservation()   wrapped with COMPOUND_RESERVATION_UPDATED outbox event
+ *   - cancelReservation()   wrapped with COMPOUND_RESERVATION_CANCELLED (3-path write set)
+ *
+ * Safety rules:
+ *   - MySQL remains the permanent transactional authority.
+ *   - All enqueue() calls use the same acquired connection, run BEFORE commit().
+ *   - All Firestore logic is completely gated by isFirestoreDualWriteEnabled().
+ *   - Firestore canonical field names: check_in_date / check_out_date
+ *     (translated from MySQL arrival_date / departure_date).
+ *   - No FieldValue.increment(), no random IDs, all operations are set_merge.
+ */
 import pool from '../db.js';
 import { BusinessDateService } from '../services/businessDateService.js';
 import { processCheckIn } from '../services/checkInService.js';
 import { RoomStatusService, isDateOverlap, parseToComparableDate } from '../services/roomStatusService.js';
 import { AvailabilityService } from '../services/AvailabilityService.js';
+import { enqueue } from '../services/outboxService.js';
+import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
+import {
+  CompoundEventBuilder,
+  formatReservationId,
+  formatBookingId,
+  formatRoomId
+} from '../services/compoundEventBuilder.js';
 
 /**
  * Auto-generate Reservation Number: RES-YYYYMMDD-XXXX
@@ -210,6 +234,71 @@ export const createReservation = async (req, res) => {
       ]);
     }
 
+    // ── Phase 4G-B: Outbox — COMPOUND_RESERVATION_CREATED ────────────────────
+    // enqueue() MUST use the same connection and run BEFORE commit().
+    // Firestore canonical field names: check_in_date / check_out_date
+    // (translated from MySQL arrival_date / departure_date).
+    if (isFirestoreDualWriteEnabled()) {
+      // Freeze timestamp once — used for both created_at and updated_at.
+      const eventOccurredAt = new Date().toISOString();
+
+      const reservationEvent = new CompoundEventBuilder({
+        event_type:     'COMPOUND_RESERVATION_CREATED',
+        aggregate_type: 'RESERVATION',
+        aggregate_id:   reservationId
+      })
+        .addRootWrite({
+          collection:  'reservations',
+          document_id: formatReservationId(reservationNumber),
+          operation:   'set_merge',
+          data: {
+            reservation_number:   reservationNumber,
+            guest_name:           guestName.trim(),
+            phone:                phone.trim(),
+            email:                email || null,
+            address:              address || null,
+            nationality:          nationality || 'Indian',
+            company:              company || null,
+            purpose:              purpose || null,
+            room_id:              formatRoomId(selectedRoomNumber),
+            mysql_room_id:        selectedRoomId,
+            room_number:          selectedRoomNumber,
+            room_type:            roomType || 'STANDARD',
+            // ⚠ Firestore uses check_in_date / check_out_date — NOT arrival_date / departure_date
+            check_in_date:        String(arrivalDate),
+            check_out_date:       String(departureDate),
+            arrival_time:         arrivalTime || '12:00 PM',
+            adults:               parseInt(adults, 10) || 1,
+            children:             parseInt(children, 10) || 0,
+            booking_source:       bookingSource || 'Direct',
+            booking_mode:         bookingMode || 'Offline',
+            booked_by:            bookedBy || null,
+            booked_by_contact:    bookedByContact || null,
+            advance_payment:      parsedAdvance,
+            payment_mode:         paymentMode || 'Cash',
+            transport_mode:       transportMode || 'Self',
+            billing_instructions: billingInstructions || null,
+            remarks:              remarks || null,
+            status:               'Reserved',
+            booking_id:           null,
+            mysql_booking_id:     null,
+            mysql_reservation_id: reservationId,
+            created_by:           req.user?.id || null,
+            created_at:           eventOccurredAt,
+            updated_at:           eventOccurredAt
+          }
+        })
+        .build();
+
+      await enqueue(connection, {
+        event_type:     reservationEvent.event_type,
+        aggregate_type: reservationEvent.aggregate_type,
+        aggregate_id:   reservationEvent.aggregate_id,
+        payload:        reservationEvent
+      });
+      console.log(`[reservationController] Compound outbox event enqueued: ${reservationEvent.operation_id} (${reservationEvent.writes.length} write)`);
+    }
+
     await connection.commit();
 
     const [savedRes] = await pool.query('SELECT * FROM reservations WHERE id = ?', [reservationId]);
@@ -303,6 +392,11 @@ export const updateReservation = async (req, res) => {
   try {
     await connection.beginTransaction();
 
+    // Freeze timestamp once — used for updated_at in the outbox payload.
+    // Frozen here (before any SQL) so all retries of this handler produce
+    // the same timestamp-shaped document.
+    const eventOccurredAt = new Date().toISOString();
+
     const { id } = req.params;
     const [existing] = await connection.query('SELECT * FROM reservations WHERE id = ?', [id]);
     if (existing.length === 0) {
@@ -393,6 +487,67 @@ export const updateReservation = async (req, res) => {
       remarks, status, id
     ]);
 
+    // ── Phase 4G-B: Outbox — COMPOUND_RESERVATION_UPDATED ────────────────────
+    // enqueue() MUST use the same connection and run BEFORE commit().
+    // aggregate_id = MySQL reservation integer id (from URL param).
+    // reservation_number is taken from the existing row — it NEVER changes on update.
+    // created_at is intentionally omitted — set_merge preserves the existing value.
+    if (isFirestoreDualWriteEnabled()) {
+      const updateEvent = new CompoundEventBuilder({
+        event_type:     'COMPOUND_RESERVATION_UPDATED',
+        aggregate_type: 'RESERVATION',
+        aggregate_id:   parseInt(id, 10)
+      })
+        .addRootWrite({
+          collection:  'reservations',
+          document_id: formatReservationId(currentRes.reservation_number),
+          operation:   'set_merge',
+          data: {
+            reservation_number:   currentRes.reservation_number,
+            guest_name:           guestName.trim(),
+            phone:                phone.trim(),
+            email:                email || null,
+            address:              address || null,
+            nationality:          nationality || null,
+            company:              company || null,
+            purpose:              purpose || null,
+            room_id:              formatRoomId(roomNumber),
+            mysql_room_id:        selectedRoomId,
+            room_number:          roomNumber,
+            room_type:            roomType || null,
+            // ⚠ Firestore uses check_in_date / check_out_date — NOT arrival_date / departure_date
+            check_in_date:        String(arrivalDate),
+            check_out_date:       String(departureDate),
+            arrival_time:         arrivalTime || null,
+            adults:               parseInt(adults, 10) || 1,
+            children:             parseInt(children, 10) || 0,
+            booking_source:       bookingSource || null,
+            booking_mode:         bookingMode || null,
+            booked_by:            bookedBy || null,
+            booked_by_contact:    bookedByContact || null,
+            advance_payment:      parseInt(advancePayment, 10) || 0,
+            payment_mode:         paymentMode || null,
+            billing_instructions: billingInstructions || null,
+            transport_mode:       transportMode || null,
+            remarks:              remarks || null,
+            status:               status,
+            mysql_reservation_id: parseInt(id, 10),
+            // created_at intentionally excluded — set_merge preserves the existing value
+            updated_at:           eventOccurredAt
+          }
+        })
+        .build();
+
+      // enqueue() MUST run BEFORE commit()
+      await enqueue(connection, {
+        event_type:     updateEvent.event_type,
+        aggregate_type: updateEvent.aggregate_type,
+        aggregate_id:   updateEvent.aggregate_id,
+        payload:        updateEvent
+      });
+      console.log(`[reservationController] Compound outbox event enqueued: ${updateEvent.operation_id} (${updateEvent.writes.length} write)`);
+    }
+
     await connection.commit();
 
     const [updated] = await pool.query('SELECT * FROM reservations WHERE id = ?', [id]);
@@ -426,6 +581,10 @@ export const cancelReservation = async (req, res) => {
 
     const current = existing[0];
 
+    // Variables populated per path — used for compound event construction below.
+    let cancelBooking   = null; // populated in Path B and C
+    let cancelBizDate   = null; // populated in Path B
+
     // If reservation is associated with a booking (Checked-In or Checked-Out)
     if (current.booking_id) {
       const [bookingRows] = await connection.query(
@@ -435,9 +594,11 @@ export const cancelReservation = async (req, res) => {
 
       if (bookingRows.length > 0) {
         const booking = bookingRows[0];
+        cancelBooking = booking; // capture for compound event
         
         // Fetch current system business date
         const businessDate = await BusinessDateService.getBusinessDate(connection);
+        cancelBizDate = businessDate; // capture for compound event (Path B)
 
         const refundVal = refundAmount !== undefined ? parseFloat(refundAmount) : (current.advance_payment || 0);
 
@@ -507,6 +668,87 @@ export const cancelReservation = async (req, res) => {
       'UPDATE reservations SET status = ?, remarks = ? WHERE id = ?',
       ['Cancelled', updatedRemarks, id]
     );
+
+    // ── Phase 4G-B: Outbox — COMPOUND_RESERVATION_CANCELLED ──────────────────
+    // Placed AFTER all MySQL mutations and BEFORE commit().
+    // Three paths determined by booking state:
+    //   Path A: no booking_id              → 1 write (reservation only)
+    //   Path B: booking is Checked In      → 3 writes (reservation + booking + room)
+    //   Path C: booking is not Checked In  → 2 writes (reservation + booking)
+    if (isFirestoreDualWriteEnabled()) {
+      const eventOccurredAt = new Date().toISOString();
+
+      const cancelBuilder = new CompoundEventBuilder({
+        event_type:     'COMPOUND_RESERVATION_CANCELLED',
+        aggregate_type: 'RESERVATION',
+        aggregate_id:   parseInt(id, 10)
+      });
+
+      // Write 1 (all paths): reservation → Cancelled
+      cancelBuilder.addRootWrite({
+        collection:  'reservations',
+        document_id: formatReservationId(current.reservation_number),
+        operation:   'set_merge',
+        data: {
+          status:               'Cancelled',
+          remarks:              updatedRemarks,
+          mysql_reservation_id: parseInt(id, 10),
+          updated_at:           eventOccurredAt
+        }
+      });
+
+      if (cancelBooking) {
+        if (cancelBooking.booking_status === 'Checked In') {
+          // ── Path B: 3 writes ─────────────────────────────────────────────
+          // Write 2: booking → Checked Out / Refunded
+          cancelBuilder.addRootWrite({
+            collection:  'bookings',
+            document_id: formatBookingId(cancelBooking.booking_number),
+            operation:   'set_merge',
+            data: {
+              booking_status: 'Checked Out',
+              payment_status: 'Refunded',
+              check_out_date: cancelBizDate,
+              updated_at:     eventOccurredAt
+            }
+          });
+
+          // Write 3: room → dirty
+          cancelBuilder.addRootWrite({
+            collection:  'rooms',
+            document_id: formatRoomId(current.room_number),
+            operation:   'set_merge',
+            data: {
+              status:     'dirty',
+              updated_at: eventOccurredAt
+            }
+          });
+        } else {
+          // ── Path C: 2 writes ─────────────────────────────────────────────
+          // Write 2: booking → payment_status Refunded only
+          cancelBuilder.addRootWrite({
+            collection:  'bookings',
+            document_id: formatBookingId(cancelBooking.booking_number),
+            operation:   'set_merge',
+            data: {
+              payment_status: 'Refunded',
+              updated_at:     eventOccurredAt
+            }
+          });
+        }
+      }
+      // Path A: no cancelBooking → only the reservation write above (1 write total).
+
+      const cancelEvent = cancelBuilder.build();
+      // enqueue() MUST use the same connection and run BEFORE commit()
+      await enqueue(connection, {
+        event_type:     cancelEvent.event_type,
+        aggregate_type: cancelEvent.aggregate_type,
+        aggregate_id:   cancelEvent.aggregate_id,
+        payload:        cancelEvent
+      });
+      console.log(`[reservationController] Compound outbox event enqueued: ${cancelEvent.operation_id} (${cancelEvent.writes.length} write(s))`);
+    }
 
     await connection.commit();
 

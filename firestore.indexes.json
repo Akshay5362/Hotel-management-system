@@ -4,26 +4,8 @@
       "collectionGroup": "bookings",
       "queryScope": "COLLECTION",
       "fields": [
-        { "fieldPath": "room_id", "order": "ASCENDING" },
         { "fieldPath": "booking_status", "order": "ASCENDING" },
-        { "fieldPath": "check_in_date", "order": "ASCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "reservations",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "room_id", "order": "ASCENDING" },
-        { "fieldPath": "status", "order": "ASCENDING" },
-        { "fieldPath": "arrival_date", "order": "ASCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "ledger_items",
-      "queryScope": "COLLECTION_GROUP",
-      "fields": [
-        { "fieldPath": "booking_id", "order": "ASCENDING" },
-        { "fieldPath": "business_date", "order": "ASCENDING" }
+        { "fieldPath": "created_at", "order": "DESCENDING" }
       ]
     },
     {
@@ -51,6 +33,86 @@
       ]
     },
     {
+      "collectionGroup": "reservations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "check_in_date", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "payments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "booking_id", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "payments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "payment_status", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "invoices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "booking_id", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "invoices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "invoice_status", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "ledger_items",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "booking_id", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "ledger_items",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "type", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "staff",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "role", "order": "ASCENDING" },
+        { "fieldPath": "full_name", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "staff",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "full_name", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "cash_submissions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "business_date", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "notifications",
       "queryScope": "COLLECTION",
       "fields": [
@@ -75,14 +137,6 @@
       ]
     },
     {
-      "collectionGroup": "housekeeping",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "room_id", "order": "ASCENDING" },
-        { "fieldPath": "created_at", "order": "ASCENDING" }
-      ]
-    },
-    {
       "collectionGroup": "inventory_products",
       "queryScope": "COLLECTION",
       "fields": [
@@ -93,4 +147,3 @@
   ],
   "fieldOverrides": []
 }
-
