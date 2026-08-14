@@ -73,7 +73,10 @@ export function waitForBackend(port = 5000, maxWaitMs = 30000, intervalMs = 500)
 
     const check = () => {
       if (resolved) return;
-      const req = http.get(`http://localhost:${port}/api/health`, (res) => {
+      // Use 127.0.0.1 (IPv4 literal) instead of 'localhost'.
+      // On macOS, 'localhost' resolves to ::1 (IPv6) first, but Docker publishes
+      // the port on 0.0.0.0 (IPv4). Using the IPv4 literal guarantees the correct path.
+      const req = http.get(`http://127.0.0.1:${port}/api/health`, (res) => {
         if (resolved) return;
         if (res.statusCode === 200) {
           resolved = true;
@@ -144,7 +147,8 @@ function resolveNodeBin() {
 
 function checkHealthOnce(port = 5000, timeout = 1000) {
   return new Promise((resolve) => {
-    const req = http.get(`http://localhost:${port}/api/health`, (res) => {
+    // Use 127.0.0.1 (IPv4 literal) — see waitForBackend comment above.
+    const req = http.get(`http://127.0.0.1:${port}/api/health`, (res) => {
       resolve(res.statusCode === 200);
     });
     req.on('error', () => resolve(false));

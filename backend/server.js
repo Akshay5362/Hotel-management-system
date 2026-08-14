@@ -103,8 +103,8 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal Server Error' });
 });
 
-server.listen(PORT, () => {
-  console.log(`Backend server is running on http://localhost:${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Backend server is running on http://0.0.0.0:${PORT}`);
 
   // ── Outbox Worker Startup ─────────────────────────────────────────────────
   // Starts the transactional outbox polling daemon only when

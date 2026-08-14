@@ -61,8 +61,15 @@ export const SPAWNS_BACKEND = false;
 /** Vite dev server — fixed to :5173 with strictPort, never drifts */
 export const VITE_URL = 'http://localhost:5173';
 
-/** Express backend API base URL — reads VITE_API_BASE_URL or defaults to localhost:5000 */
-export const API_BASE_URL = (process.env.VITE_API_BASE_URL || 'http://localhost:5000').replace(/\/+$/, '');
+/** Express backend API base URL — reads VITE_API_BASE_URL or defaults to 127.0.0.1:5000
+ *
+ * IMPORTANT: We use 127.0.0.1 (IPv4 literal) not 'localhost' as the fallback.
+ * On macOS, 'localhost' resolves to ::1 (IPv6) first, but Docker publishes
+ * port 5000 on 0.0.0.0 (IPv4 only). The IPv4 literal bypasses that ambiguity.
+ * The Vite build bakes VITE_API_BASE_URL at build time, so this default is only
+ * used in the main process (Electron health check URL).
+ */
+export const API_BASE_URL = (process.env.VITE_API_BASE_URL || 'http://127.0.0.1:5000').replace(/\/+$/, '');
 
 
 /** Backend health check endpoint polled before window opens */

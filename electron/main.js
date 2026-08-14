@@ -388,10 +388,13 @@ function createWindow() {
     });
   }
 
-  const targetApiBase = (process.env.VITE_API_BASE_URL || 'http://localhost:5000').replace(/\/+$/, '');
+  const targetApiBase = (process.env.VITE_API_BASE_URL || 'http://127.0.0.1:5000').replace(/\/+$/, '');
   const isAllowedOrigin = (testUrl) => {
     if (!testUrl) return false;
-    if (testUrl.startsWith('http://localhost:5000') || testUrl.startsWith('http://localhost:5173') || testUrl.startsWith(targetApiBase)) return true;
+    // Allow both localhost and 127.0.0.1 variants — macOS may resolve one or the other
+    if (testUrl.startsWith('http://localhost:5000') || testUrl.startsWith('http://127.0.0.1:5000')) return true;
+    if (testUrl.startsWith('http://localhost:5173') || testUrl.startsWith('http://127.0.0.1:5173')) return true;
+    if (testUrl.startsWith(targetApiBase)) return true;
     try {
       const hostname = new URL(testUrl).hostname;
       if (hostname.endsWith('.ngrok-free.dev') || hostname.endsWith('.ngrok.io')) return true;
