@@ -19,58 +19,30 @@
     "electron:docker-dev": "wait-on http://localhost:5173 http://localhost:5000/api/health --timeout 120000 && cross-env ELECTRON_MODE=docker-dev NODE_ENV=development electron .",
     "electron:docker": "wait-on http://localhost:5000/api/health --timeout 120000 && cross-env ELECTRON_MODE=docker NODE_ENV=development electron .",
     "electron:prod": "npm run build && cross-env ELECTRON_MODE=production NODE_ENV=production electron .",
-    "electron:build": "npm run build && electron-builder --win"
+    "electron:build": "npm run build && electron-builder --win",
+    "electron:build:mac": "npm run build && electron-builder --mac --x64"
   },
   "build": {
     "appId": "com.webline.pms",
     "productName": "Webline PMS Plus",
     "copyright": "Copyright © 2026 Webline",
     "directories": {
-      "output": "C:\\WeblinePMSBuild",
-      "buildResources": "assets"
+      "output": "release"
     },
     "files": [
       "dist/**/*",
       "!dist/win-unpacked/**",
+      "!dist/mac/**",
       "!dist/*.exe",
+      "!dist/*.dmg",
+      "!dist/*.zip",
       "!dist/*.yml",
       "!dist/builder-debug.yml",
       "electron/**/*",
       "package.json"
     ],
-    "extraResources": [
-      {
-        "from": "backend",
-        "to": "backend",
-        "filter": [
-          "**/*",
-          "!node_modules/**",
-          "!*.test.*",
-          "!test_*.mjs",
-          "!test*.js",
-          "!check_*.mjs",
-          "!migrate_*.js",
-          "!seed_*.js",
-          "!cleanup.js",
-          "!update_passwords.js",
-          "!list_dbs.mjs",
-          "!patch.diff",
-          "!missing_chunk*.txt"
-        ]
-      },
-      {
-        "from": "backend/node_modules",
-        "to": "backend/node_modules",
-        "filter": [
-          "**/*",
-          "!.bin/**",
-          "!nodemon/**"
-        ]
-      }
-    ],
     "win": {
       "target": "nsis",
-      "icon": "assets/icons/icon.ico",
       "artifactName": "${productName} Setup ${version}.${ext}",
       "signtoolOptions": {
         "publisherName": "Webline"
@@ -83,6 +55,18 @@
       "createStartMenuShortcut": true,
       "shortcutName": "Webline PMS Plus",
       "deleteAppDataOnUninstall": false
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.business",
+      "identity": null
+    },
+    "dmg": {
+      "title": "${productName} ${version}",
+      "artifactName": "${productName} Setup ${version}-mac-x64.${ext}"
     }
   },
   "dependencies": {

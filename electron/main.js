@@ -123,11 +123,11 @@ L('ENV', `isDev = ${isDev}  (based on app.isPackaged)`);
 //  production   installer (app.isPackaged)  → dist/ + spawns packaged backend
 const ELECTRON_MODE  = process.env.ELECTRON_MODE || (app.isPackaged ? 'production' : 'local');
 const USES_VITE      = ELECTRON_MODE === 'local' || ELECTRON_MODE === 'docker-dev';
-const SPAWNS_BACKEND = ELECTRON_MODE === 'production' || app.isPackaged;
+const SPAWNS_BACKEND = false;
 
 L('ENV', `ELECTRON_MODE  = ${ELECTRON_MODE}`);
 L('ENV', `USES_VITE      = ${USES_VITE}   (true → load http://localhost:5173)`);
-L('ENV', `SPAWNS_BACKEND = ${SPAWNS_BACKEND}  (true → spawn packaged backend/server.js)`);
+L('ENV', `SPAWNS_BACKEND = ${SPAWNS_BACKEND}  (Backend runs via Docker/External service)`);
 
 // ─── Path placeholders ────────────────────────────────────────────────────────
 const DEV_URL = 'http://localhost:5173';
@@ -550,52 +550,10 @@ app.whenReady().then(async () => {
   try { createSplashWindow(); } catch (e) { LERR('SPLASH', 'createSplashWindow threw', e); }
 
   // ── Mode-specific startup — reads ELECTRON_MODE constants set at top of file ─
-  L('MODE', `Startup mode: ${ELECTRON_MODE}  USES_VITE=${USES_VITE}  SPAWNS_BACKEND=${SPAWNS_BACKEND}`);
+  L('MODE', `Startup mode: ${ELECTRON_MODE}  USES_VITE=${USES_VITE}`);
 
-  if (SPAWNS_BACKEND) {
-    // ── PRODUCTION INSTALLER: spawn packaged backend, wait for health ─────────
-    // ONLY executes when app.isPackaged=true or ELECTRON_MODE=production.
-    // Development modes (local/docker-dev/docker) NEVER reach this branch.
-    L('BACKEND', 'Production mode — launching packaged backend from extraResources');
-    try {
-      const backendRoot = app.isPackaged ? process.resourcesPath : path.join(APP_ROOT, '..');
-      const serverPath  = path.join(backendRoot, 'backend', 'server.js');
-      L('BACKEND', `backendRoot  : ${backendRoot}`);
-      L('BACKEND', `server.js    : ${serverPath}`);
-      L('BACKEND', `server exists: ${fs.existsSync(serverPath)}`);
-
-      if (launchBackend) {
-        launchBackend(backendRoot);
-        L('BACKEND', 'launchBackend() called — waiting for health check...');
-      } else {
-        L('BACKEND', 'launchBackend not available (import failed) — assuming backend already running');
-      }
-
-      if (waitForBackend) {
-        await waitForBackend(5000, 30000);
-        L('BACKEND', 'Backend health check PASSED ✓');
-      } else {
-        L('BACKEND', 'waitForBackend not available — skipping health check');
-      }
-    } catch (err) {
-      LERR('BACKEND', 'Packaged backend startup failed', err);
-      closeSplash();
-      try {
-        const { response } = await dialog.showMessageBox({
-          type: 'error', title: 'Backend Failed',
-          message: 'The Webline PMS server failed to start.',
-          detail: `Error: ${err.message}\n\nLog: ${LOG_FILE}`,
-          buttons: ['Continue anyway', 'Exit'],
-        });
-        if (response === 1) { app.quit(); return; }
-        L('BACKEND', 'User chose "Continue anyway" despite backend failure');
-      } catch (de) { LERR('BACKEND', 'dialog.showMessageBox threw', de); }
-    }
-
-  } else if (USES_VITE) {
-    // ── LOCAL / DOCKER-DEV: Vite dev server + external backend ───────────────
-    // wait-on in the npm script guarantees both are up before Electron starts.
-    // These checks are a quick internal re-verification with friendly dialogs.
+  if (USES_VITE) {
+    // ── LOCAL / DOCKER-DEV: Vite dev server verification ─────────────────────
     L('VITE', `[${ELECTRON_MODE}] Verifying Vite on :5173...`);
     try {
       await waitForPort(5173, 15000);
@@ -603,51 +561,50 @@ app.whenReady().then(async () => {
     } catch (err) {
       L('VITE', `Vite :5173 not reachable: ${err.message} — continuing (wait-on should have caught this)`);
     }
+  }
 
+  // ── Universal Backend Health Verification ──────────────────────────────────
+  // Electron connects to the Docker/External backend running at http://localhost:5000
+  let backendReady = false;
+  while (!backendReady) {
     L('BACKEND', `[${ELECTRON_MODE}] Verifying backend health on :5000...`);
-    if (waitForBackend) {
-      try {
+    try {
+      if (waitForBackend) {
         await waitForBackend(5000, 15000);
-        L('BACKEND', 'Backend :5000 health confirmed ✓');
-      } catch (err) {
-        LERR('BACKEND', 'External backend health check failed', err);
-        closeSplash();
-        const hint = ELECTRON_MODE === 'local'
-          ? 'Run "npm run backend:dev" in a separate terminal first.'
-          : 'Run "docker compose up -d" and wait for the backend container to be healthy.';
-        try {
-          const { response } = await dialog.showMessageBox({
-            type: 'error', title: 'Backend Unavailable',
-            message: `Backend not reachable on localhost:5000\n\nMode: ${ELECTRON_MODE}`,
-            detail: `${hint}\n\nError: ${err.message}\nLog: ${LOG_FILE}`,
-            buttons: ['Continue anyway', 'Exit'],
-          });
-          if (response === 1) { app.quit(); return; }
-        } catch (de) { LERR('BACKEND', 'dialog threw', de); }
       }
-    }
+      L('BACKEND', 'Backend :5000 health confirmed ✓');
+      backendReady = true;
+    } catch (err) {
+      LERR('BACKEND', 'Backend health check failed', err);
+      closeSplash();
 
-  } else {
-    // ── DOCKER (production testing): no Vite, no backend spawn ───────────────
-    // wait-on in the npm script already confirmed backend health on :5000.
-    // dist/index.html must exist (run "npm run build" first).
-    L('BACKEND', `[${ELECTRON_MODE}] Verifying Docker backend health on :5000...`);
-    if (waitForBackend) {
+      const hint = USES_VITE && ELECTRON_MODE === 'local'
+        ? 'Please run "npm run backend:dev" in a separate terminal.'
+        : 'Please ensure Docker Desktop is running and start the HPMS services:\n\n  docker compose up -d';
+
       try {
-        await waitForBackend(5000, 15000);
-        L('BACKEND', 'Docker backend :5000 health confirmed ✓');
-      } catch (err) {
-        LERR('BACKEND', 'Docker backend health check failed', err);
-        closeSplash();
-        try {
-          const { response } = await dialog.showMessageBox({
-            type: 'error', title: 'Docker Backend Unavailable',
-            message: 'Docker backend not reachable on localhost:5000',
-            detail: 'Run "docker compose up -d" and wait for the backend\ncontainer healthcheck to pass, then retry electron:docker.\n\nError: ' + err.message,
-            buttons: ['Continue anyway', 'Exit'],
-          });
-          if (response === 1) { app.quit(); return; }
-        } catch (de) { LERR('BACKEND', 'dialog threw', de); }
+        const { response } = await dialog.showMessageBox({
+          type: 'error',
+          title: 'HPMS Backend Unavailable',
+          message: 'Could not connect to the HPMS backend service on port 5000.',
+          detail: `${hint}\n\nClick "Retry" once services are running, or "Exit" to close.\n\nError: ${err.message}`,
+          buttons: ['Retry', 'Exit'],
+          defaultId: 0,
+          cancelId: 1
+        });
+
+        if (response === 1) {
+          L('BACKEND', 'User chose Exit — closing application');
+          app.quit();
+          return;
+        }
+
+        L('BACKEND', 'User chose Retry — re-verifying backend health...');
+        try { createSplashWindow(); } catch {}
+      } catch (de) {
+        LERR('BACKEND', 'dialog.showMessageBox threw', de);
+        app.quit();
+        return;
       }
     }
   }

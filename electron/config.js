@@ -26,7 +26,7 @@
  *
  *  production   electron-builder installer  (app.isPackaged = true)
  *               Loads:    dist/index.html  (bundled in asar)
- *               Backend:  SPAWNED by Electron from extraResources/backend/
+ *               Backend:  DOCKER / EXTERNAL — Electron connects to http://localhost:5000
  *
  * ─────────────────────────────────────────────────────────────────────────────
  */
@@ -51,12 +51,10 @@ export const MODES = Object.freeze({
 export const USES_VITE = ELECTRON_MODE === MODES.LOCAL || ELECTRON_MODE === MODES.DOCKER_DEV;
 
 /**
- * true  → Electron spawns backend/server.js from extraResources (packaged installer only)
- * false → Backend is external (local process or Docker) — Electron NEVER spawns it
- *
- * Development modes MUST NEVER set this to true.
+ * Electron never spawns a local Node child process in production.
+ * The backend runs inside Docker (or as an external service) at http://localhost:5000.
  */
-export const SPAWNS_BACKEND = ELECTRON_MODE === MODES.PRODUCTION;
+export const SPAWNS_BACKEND = false;
 
 // ─── URL constants ────────────────────────────────────────────────────────────
 
