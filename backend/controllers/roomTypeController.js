@@ -1,8 +1,37 @@
 import pool from '../db.js';
+import { db } from '../config/firebaseAdmin.js';
 import { enqueue } from '../services/outboxService.js';
-import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
+import { isFirestoreDualWriteEnabled, isRoomTypesReadCanaryEnabled } from '../config/featureFlags.js';
+import { executeReadCanary } from '../services/dualReadVerificationService.js';
 
 export const getRoomTypes = async (req, res) => {
+  const canaryResult = await executeReadCanary({
+    flagCheckFn: isRoomTypesReadCanaryEnabled,
+    endpointName: '/api/room-types',
+    fetchFirestoreFn: async () => {
+      const snap = await db.collection('room_types').get();
+      return snap.docs.map(doc => ({ ...doc.data(), firestore_id: doc.id }));
+    },
+    validateAndFormatFn: (docs) => {
+      if (!Array.isArray(docs) || docs.length === 0) return null;
+      const formatted = docs.map(d => ({
+        id: d.id || d.mysql_room_type_id || d.firestore_id,
+        code: d.code || 'DELUXE',
+        title: d.title || d.name || 'Room Type',
+        name: d.name || d.title || 'Room Type',
+        description: d.description || '',
+        base_rate: parseFloat(d.base_rate || d.price || 0),
+        image: d.image || null
+      }));
+      formatted.sort((a, b) => Number(a.id) - Number(b.id));
+      return formatted.length >= 1 ? formatted : null;
+    }
+  });
+
+  if (canaryResult) {
+    return res.json(canaryResult);
+  }
+
   let connection;
   try {
     connection = await pool.getConnection();

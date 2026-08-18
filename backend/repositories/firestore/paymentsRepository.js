@@ -75,6 +75,25 @@ export async function getPaymentsByBookingFirestore(bookingId, options = {}) {
   return Array.from(map.values()).sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
 }
 
+export async function getPaymentsByGuestFirestore(userId, options = {}) {
+  if (!userId || isNaN(Number(userId))) return [];
+  const targetId = Number(userId);
+
+  // Defense in depth: Query root collection and filter strictly by guest ownership
+  const allDocs = await listDocs(COLLECTION, {
+    transaction: options.transaction
+  });
+
+  return allDocs.filter(p => {
+    if (!p) return false;
+    if (p.guest_user_id === targetId || p.user_id === targetId) return true;
+    if (p.guest_id === null || p.guest_id === undefined || p.guest_id === '') return false;
+    const gNum = Number(p.guest_id);
+    return !isNaN(gNum) && gNum === targetId;
+  }).sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+}
+
+
 export async function getAllPaymentsFirestore(options = {}) {
   const { filters = [], orderBy = [{ field: 'created_at', direction: 'desc' }], limit = 50, cursor = null, transaction = null } = options;
   return await listDocs(COLLECTION, {

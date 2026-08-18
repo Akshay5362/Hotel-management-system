@@ -51,16 +51,105 @@ export function normalizeTimestamp(val) {
 }
 
 /**
+ * Exact decimal precision serializer for financial/monetary fields.
+ * Preserves exact MySQL DECIMAL representation as fixed 2-decimal strings without floating-point loss.
+ */
+export function formatDecimal(val) {
+  if (val === null || val === undefined || val === '') {
+    return null;
+  }
+
+  const str = String(val).trim();
+  if (str === '' || str.toLowerCase() === 'null' || str.toLowerCase() === 'undefined') {
+    return null;
+  }
+
+  const isNegative = str.startsWith('-');
+  const cleanStr = isNegative ? str.slice(1) : str;
+
+  const parts = cleanStr.split('.');
+  const intPart = parts[0].replace(/^0+(?=\d)/, '') || '0';
+  let fracPart = parts[1] || '';
+
+  if (fracPart.length === 0) {
+    fracPart = '00';
+  } else if (fracPart.length === 1) {
+    fracPart = fracPart + '0';
+  } else if (fracPart.length > 2) {
+    fracPart = fracPart.slice(0, 2);
+  }
+
+  const result = `${isNegative && (intPart !== '0' || fracPart !== '00') ? '-' : ''}${intPart}.${fracPart}`;
+  return result;
+}
+
+const FORBIDDEN_KEY_PATTERNS = [
+  'password',
+  'password_hash',
+  'passwordhash',
+  'jwt',
+  'token',
+  'access_token',
+  'accesstoken',
+  'refresh_token',
+  'refreshtoken',
+  'private_key',
+  'privatekey',
+  'service_account',
+  'service_account_key',
+  'serviceaccount',
+  'api_key',
+  'apikey',
+  'secret',
+  'card_number',
+  'cardnumber',
+  'cvv',
+  'pin'
+];
+
+/**
+ * Recursively strips forbidden credential keys from an object or array.
+ * OWASP excessive data exposure protection at repository & API boundaries.
+ */
+export function sanitizeSensitiveFields(target) {
+  if (!target || typeof target !== 'object') {
+    return target;
+  }
+
+  if (Array.isArray(target)) {
+    return target.map(item => sanitizeSensitiveFields(item));
+  }
+
+  if (target instanceof Date || target.constructor?.name === 'Timestamp' || target.constructor?.name === 'FieldValue') {
+    return target;
+  }
+
+  const cleanObj = {};
+  for (const key of Object.keys(target)) {
+    const lowerKey = key.toLowerCase();
+    const isForbidden = FORBIDDEN_KEY_PATTERNS.some(p => lowerKey === p || lowerKey === p.replace(/_/g, ''));
+
+    if (isForbidden) {
+      continue;
+    }
+
+    cleanObj[key] = sanitizeSensitiveFields(target[key]);
+  }
+
+  return cleanObj;
+}
+
+/**
  * Formats a Firestore Document Snapshot into a clean plain JavaScript object
  */
 export function formatDocSnapshot(docSnap) {
   if (!docSnap.exists) return null;
   const d = docSnap.data();
-  return {
+  return sanitizeSensitiveFields({
     id: docSnap.id,
     doc_id: docSnap.id,
     ...d
-  };
+  });
 }
 
 /**

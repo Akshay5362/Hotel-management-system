@@ -37,7 +37,9 @@ export const processCheckIn = async (connection, {
   guestId = null,
   departureDate = null,
   billingInstruction = 'Direct to Guest',
-  mealPlan = 'EP'
+  mealPlan = 'EP',
+  dateOfBirth = null,
+  dob = null
 }) => {
   // Validate optional fields (ignore invalid values gracefully — use default)
   const resolvedBilling = ALLOWED_BILLING_INSTRUCTIONS.includes(billingInstruction)
@@ -46,6 +48,8 @@ export const processCheckIn = async (connection, {
   const resolvedMealPlan = ALLOWED_MEAL_PLANS.includes(mealPlan)
     ? mealPlan
     : 'EP';
+  const resolvedDob = dateOfBirth || dob || null;
+
   // 1. Get Business Date
   const businessDate = await BusinessDateService.getBusinessDate(connection);
   if (!businessDate) throw new Error('System configuration error: Business Date is missing.');
@@ -65,6 +69,11 @@ export const processCheckIn = async (connection, {
     throw { status: 404, message: `Room ${roomNumber} not found` };
   }
   const room = roomRows[0];
+
+  // Inactive Room Check
+  if (room.is_active === 0 || room.is_active === false || room.is_active === '0') {
+    throw { status: 400, message: `Room ${roomNumber} is inactive and unavailable for check-in.`, code: 'ROOM_INACTIVE' };
+  }
 
   if (room.status === 'occupied') {
     // Verify a real active 'Checked In' booking backs this status.
@@ -88,7 +97,11 @@ export const processCheckIn = async (connection, {
     console.warn(`[checkInService] Auto-corrected ghost occupied status for Room ${roomNumber} (no active Checked In booking found).`);
   }
   if (room.status !== 'vacant' && room.status !== 'booked') {
-    throw { status: 400, message: `Room ${roomNumber} is not vacant or booked. Current status: ${room.status}` };
+    if (room.status === 'dirty' && manualOverride) {
+      // Allowed via manual override
+    } else {
+      throw { status: 400, message: `Room ${roomNumber} is not vacant or booked. Current status: ${room.status}` };
+    }
   }
 
   // Dirty check
@@ -143,13 +156,16 @@ export const processCheckIn = async (connection, {
   const guestNameUpper = guestName ? guestName.trim().toUpperCase() : 'UNKNOWN';
   
   if (!finalGuestId) {
-    const [existingGuests] = await connection.query('SELECT id FROM guests WHERE phone = ? LIMIT 1 FOR UPDATE', [phone || '']);
+    const [existingGuests] = await connection.query('SELECT id, date_of_birth FROM guests WHERE phone = ? LIMIT 1 FOR UPDATE', [phone || '']);
     if (existingGuests.length > 0) {
       finalGuestId = existingGuests[0].id;
+      if (resolvedDob && !existingGuests[0].date_of_birth) {
+        await connection.query('UPDATE guests SET date_of_birth = ? WHERE id = ?', [resolvedDob, finalGuestId]);
+      }
     } else {
       const [newGuestRes] = await connection.query(
-        'INSERT INTO guests (full_name, phone, email, address, country) VALUES (?, ?, ?, ?, ?)',
-        [guestNameUpper, phone || '', email || '', address || '', country || '']
+        'INSERT INTO guests (full_name, phone, email, address, country, date_of_birth) VALUES (?, ?, ?, ?, ?, ?)',
+        [guestNameUpper, phone || '', email || '', address || '', country || '', resolvedDob]
       );
       finalGuestId = newGuestRes.insertId;
     }

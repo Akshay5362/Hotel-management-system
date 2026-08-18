@@ -46,15 +46,27 @@ export async function getStaffByUsernameFirestore(username, options = {}) {
 }
 
 export async function getAllStaffFirestore(options = {}) {
-  const { filters = [], orderBy = [{ field: 'full_name', direction: 'asc' }], limit = 100, cursor = null, transaction = null } = options;
-  return await listDocs(COLLECTION, {
+  const { filters = [], orderBy = [{ field: 'full_name', direction: 'asc' }], limit = 100, cursor = null, transaction = null, includeInactive = false } = options;
+  const docs = await listDocs(COLLECTION, {
     filters,
     orderBy,
     limit,
     startAfterDoc: cursor,
     transaction
   });
+
+  if (includeInactive) return docs;
+
+  // Active staff filter: Exclude soft-deleted or inactive staff records
+  return docs.filter(s => {
+    if (!s) return false;
+    if (s.deleted === true || s.deleted === 1 || s.is_deleted === true || s.is_deleted === 1 || s.deleted_at) return false;
+    if (s.is_active === false || s.is_active === 0 || s.active === false || s.active === 0) return false;
+    if (s.status === 'Inactive' || s.status === 'Disabled' || s.status === 'Deleted') return false;
+    return true;
+  });
 }
+
 
 /**
  * Checks whether an incoming payload is stale compared to the existing Firestore document.

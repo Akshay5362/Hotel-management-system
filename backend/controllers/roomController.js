@@ -5,10 +5,12 @@ import { BusinessDateService } from '../services/businessDateService.js';
 import { CheckoutRecoveryService } from '../services/CheckoutRecoveryService.js';
 import { AvailabilityService } from '../services/AvailabilityService.js';
 import pool from '../db.js';
+import { db } from '../config/firebaseAdmin.js';
 import fs from 'fs';
 import path from 'path';
 import { enqueue } from '../services/outboxService.js';
-import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
+import { isFirestoreDualWriteEnabled, isRoomsReadCanaryEnabled } from '../config/featureFlags.js';
+import { executeReadCanary } from '../services/dualReadVerificationService.js';
 import { extractOCRData, verifyDocumentData } from '../services/ocrService.js';
 import {
   CompoundEventBuilder,
@@ -31,7 +33,7 @@ export const checkIn = async (req, res) => {
   const { number } = req.params;
   const {
     guestName, phone, pax, deposit, checkInDate, manual_override, paymentMethod, transactionId,
-    billing_instruction, meal_plan
+    billing_instruction, meal_plan, dateOfBirth, dob
   } = req.body;
   // Input Validation
   if (!number || typeof number !== "string" || number.trim() === "") return res.status(400).json({ error: "Room number is required" });
@@ -58,7 +60,8 @@ export const checkIn = async (req, res) => {
       resolvedUserId,
       isGuestSelfCheckIn: false,
       billingInstruction: billing_instruction,
-      mealPlan: meal_plan
+      mealPlan: meal_plan,
+      dateOfBirth: dateOfBirth || dob || null
     });
     await connection.commit();
     res.json({ message: `Successfully checked in to Room ${number}`, bookingId });
@@ -2026,6 +2029,61 @@ export const adminNoShow = async (req, res) => {
 };
 
 export const getPublicRooms = async (req, res) => {
+  const canaryResult = await executeReadCanary({
+    flagCheckFn: isRoomsReadCanaryEnabled,
+    endpointName: '/api/public/rooms',
+    timeoutMs: 1000,
+    fetchFirestoreFn: async () => {
+      const roomsSnap = await db.collection('rooms').get();
+      const typesSnap = await db.collection('room_types').get();
+      return { roomsSnap, typesSnap };
+    },
+    validateAndFormatFn: ({ roomsSnap, typesSnap }) => {
+      if (!roomsSnap || roomsSnap.empty || !typesSnap || typesSnap.empty) return null;
+      const typeMap = new Map();
+      typesSnap.forEach(doc => {
+        const data = doc.data();
+        typeMap.set(data.id || doc.id, {
+          id: data.id || doc.id,
+          type: data.code || data.category || 'DELUXE',
+          price: parseFloat(data.base_rate || data.price || 0),
+          capacity: data.capacity || 2,
+          image: data.image || 'https://images.unsplash.com/photo-1611892440504-42a792e24d32?auto=format&fit=crop&q=80&w=800',
+          available_rooms: 0,
+          total_rooms: 0
+        });
+      });
+
+      roomsSnap.forEach(doc => {
+        const data = doc.data();
+        const typeId = data.room_type_id;
+        if (typeMap.has(typeId)) {
+          const entry = typeMap.get(typeId);
+          entry.total_rooms++;
+          if (data.status === 'VACANT' || data.status === 'Vacant' || data.status === 'Available') {
+            entry.available_rooms++;
+          }
+        }
+      });
+
+      const formatted = Array.from(typeMap.values()).map(r => ({
+        id: r.id,
+        type: r.type,
+        price: r.price,
+        capacity: r.capacity,
+        image: r.image,
+        available: r.available_rooms > 0
+      }));
+
+      return formatted.length >= 1 ? formatted : null;
+    }
+  });
+
+  if (canaryResult) {
+    return res.json(canaryResult);
+  }
+
+  // Primary / Fallback MySQL read path
   let connection;
   try {
     connection = await pool.getConnection();
@@ -2043,7 +2101,7 @@ export const getPublicRooms = async (req, res) => {
       JOIN rooms r ON r.room_type_id = rt.id
       GROUP BY rt.id
     `);
-    
+
     // Map data to match what the frontend expects
     const formattedRooms = rooms.map(r => ({
       id: r.category_id,
@@ -2102,6 +2160,7 @@ export const updateRoomStatus = async (req, res) => {
     let newStatus   = room.status;   // occupancy status — only changed when appropriate
     let oldHkStatus = room.housekeeping_status;
     let newHkStatus = room.housekeeping_status;
+    let newIsActive = room.is_active !== undefined ? room.is_active : 1;
     let logDetail   = '';
 
     if (action === 'mark_dirty') {
@@ -2121,18 +2180,20 @@ export const updateRoomStatus = async (req, res) => {
       // Occupied rooms: HK cleaned while occupied — occupancy stays occupied
       logDetail = `Room ${number}: Housekeeping marked Clean (occupancy: ${oldStatus} → ${newStatus}).`;
     } else if (action === 'mark_inactive') {
-      if (room.status !== 'vacant' && room.status !== 'dirty') {
+      if (room.status === 'occupied') {
         await connection.rollback();
-        return res.status(400).json({ error: 'Only vacant or dirty rooms can be marked inactive' });
+        return res.status(400).json({ error: 'Occupied rooms cannot be marked inactive' });
       }
-      newStatus = 'inactive';
+      newIsActive = 0;
+      if (room.status === 'vacant' || room.status === 'dirty') {
+        newStatus = 'inactive';
+      }
       logDetail = `Room ${number}: Marked Inactive.`;
     } else if (action === 'mark_active') {
-      if (room.status !== 'inactive') {
-        await connection.rollback();
-        return res.status(400).json({ error: 'Room is not inactive' });
+      newIsActive = 1;
+      if (room.status === 'inactive') {
+        newStatus = room.housekeeping_status === 'Dirty' ? 'dirty' : 'vacant';
       }
-      newStatus = room.housekeeping_status === 'Dirty' ? 'dirty' : 'vacant';
       logDetail = `Room ${number}: Marked Active.`;
     } else {
       await connection.rollback();
@@ -2140,8 +2201,8 @@ export const updateRoomStatus = async (req, res) => {
     }
 
     await connection.query(
-      'UPDATE rooms SET status = ?, housekeeping_status = ? WHERE id = ?',
-      [newStatus, newHkStatus, room.id]
+      'UPDATE rooms SET is_active = ?, status = ?, housekeeping_status = ? WHERE id = ?',
+      [newIsActive, newStatus, newHkStatus, room.id]
     );
 
     if (newStatus !== oldStatus || newHkStatus !== oldHkStatus) {

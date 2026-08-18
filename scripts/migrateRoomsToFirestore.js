@@ -8,7 +8,7 @@
  *  - Defaults to DRY-RUN mode (`--dry-run`).
  *  - ZERO writes to Firestore unless `--commit` is explicitly passed.
  *  - ZERO writes/updates to MySQL (MySQL is strictly Read-Only).
- *  - No existing application source files or routes modified.
+ *  - Uses SafeFirestoreBatchWriter for safe chunked batching (max 250 ops/batch).
  *
  * Usage:
  *  node scripts/migrateRoomsToFirestore.js           (Runs Dry-Run mode)
@@ -18,18 +18,18 @@
 
 import pool from '../backend/db.js';
 import { db, isFirebaseConfigured } from '../backend/config/firebaseAdmin.js';
+import { SafeFirestoreBatchWriter } from './utils/firestoreBatch.js';
 
 const isCommitMode = process.argv.includes('--commit');
 const isDryRunMode = !isCommitMode;
 
 async function runRoomsMigration() {
   console.log('\n=================================================');
-  console.log(`  ROOMS PILOT MIGRATION SCRIPT (${isCommitMode ? 'COMMIT MODE' : 'DRY-RUN MODE'})`);
+  console.log(`  ROOMS MIGRATION SCRIPT (${isCommitMode ? 'COMMIT MODE' : 'DRY-RUN MODE'})`);
   console.log('=================================================\n');
 
   let connection;
   try {
-    // 1. Read rooms from MySQL
     connection = await pool.getConnection();
     const [rows] = await connection.query(`
       SELECT 
@@ -60,7 +60,6 @@ async function runRoomsMigration() {
     let missingFieldCount = 0;
     const issues = [];
 
-    // 2. Perform deterministic field mapping and validation
     for (const r of rows) {
       if (!r.mysql_room_id) {
         missingMysqlIdCount++;
@@ -104,7 +103,7 @@ async function runRoomsMigration() {
       });
     }
 
-    // 3. Dry-Run Report
+    // Dry-Run Report
     console.log('\n--- DRY-RUN VALIDATION REPORT ---');
     console.log(`Target Collection          : /rooms`);
     console.log(`MySQL Rooms Count          : ${rows.length}`);
@@ -129,21 +128,25 @@ async function runRoomsMigration() {
       return;
     }
 
-    // 4. Actual Commit (Only if --commit explicitly passed)
+    // Commit Mode
     if (!isFirebaseConfigured || !db) {
       throw new Error('Firebase Admin SDK is not configured. Cannot perform Firestore write.');
     }
 
-    console.log(`\n[Firestore Write] Committing ${mappedDocuments.length} room documents to Firestore...`);
-    const batch = db.batch();
+    const batchWriter = new SafeFirestoreBatchWriter(db, {
+      collectionName: 'rooms',
+      maxBatchSize: 250,
+      isDryRun: false
+    });
 
+    console.log(`\n[Firestore Write] Committing ${mappedDocuments.length} room documents using SafeBatchWriter...`);
     for (const item of mappedDocuments) {
       const docRef = db.collection('rooms').doc(item.docId);
-      batch.set(docRef, item.data, { merge: true });
+      await batchWriter.set(docRef, item.data, { merge: true });
     }
 
-    await batch.commit();
-    console.log(`✔ [Firestore Write SUCCESS] Successfully wrote ${mappedDocuments.length} room documents to /rooms collection.\n`);
+    await batchWriter.finalize();
+    console.log(`✔ [Firestore Write SUCCESS] Successfully wrote ${mappedDocuments.length} room documents.\n`);
 
   } catch (error) {
     console.error('\n❌ [Migration Error]:', error.message);

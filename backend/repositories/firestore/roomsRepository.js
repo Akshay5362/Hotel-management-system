@@ -65,6 +65,7 @@ export async function createRoomFirestore(roomData, options = {}) {
     number: String(roomData.number),
     type: String(roomData.type),
     status: roomData.status || 'vacant',
+    is_active: roomData.is_active !== undefined ? Boolean(roomData.is_active) : (roomData.is_active_val !== undefined ? Boolean(roomData.is_active_val) : true),
     cleaning_status: roomData.cleaning_status || roomData.housekeeping_status || 'Clean',
     housekeeping_status: roomData.housekeeping_status || roomData.cleaning_status || 'Clean',
     price: Number(roomData.price || roomData.base_rate || 0),

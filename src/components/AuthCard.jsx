@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { API_BASE_URL, getApiHeaders } from '../config/apiConfig';
 import { auth, signInWithEmailAndPassword, isClientConfigured } from '../config/firebaseClient';
+import { resolveFirebaseEmail, resolveFallbackFirebaseEmail } from '../config/authMapping';
 
 
 export default function AuthCard({ isAdmin = false, initialIsSignUp = false, onAuthSuccess, showAlert, onNavigate }) {
@@ -39,27 +40,21 @@ export default function AuthCard({ isAdmin = false, initialIsSignUp = false, onA
     setIsLoading(true);
 
     if (isAdmin && isClientConfigured && auth) {
-      let emailToUse = username.trim().toLowerCase();
-      if (!emailToUse.includes('@')) {
-        const USERNAME_EMAIL_MAP = {
-          'admin': 'admin@hotelsky5.com',
-          'superadmin': 'admin@hpms-sky5.internal',
-          'reception_morning': 'reception.morning@hotelsky5.com',
-          'reception_evening': 'reception.evening@hotelsky5.com',
-          'reception_night': 'reception.night@hotelsky5.com',
-          'chef': 'chef@hotelsky5.com',
-          'helper': 'helper@hotelsky5.com',
-          'pantry1': 'pantry1@hotelsky5.com',
-          'pantry2': 'pantry2@hotelsky5.com',
-          'cleaner1': 'cleaner1@hotelsky5.com',
-          'cleaner2': 'cleaner2@hotelsky5.com',
-          'reception2': 'reception2@hotelsky5.com'
-        };
-        emailToUse = USERNAME_EMAIL_MAP[emailToUse] || `${emailToUse}@hotelsky5.com`;
-      }
+      const emailToUse = resolveFirebaseEmail(username);
 
       try {
-        const userCredential = await signInWithEmailAndPassword(auth, emailToUse, password);
+        let userCredential;
+        try {
+          userCredential = await signInWithEmailAndPassword(auth, emailToUse, password);
+        } catch (primaryErr) {
+          const fallbackEmail = resolveFallbackFirebaseEmail(username);
+          if (fallbackEmail) {
+            userCredential = await signInWithEmailAndPassword(auth, fallbackEmail, password);
+          } else {
+            throw primaryErr;
+          }
+        }
+
         const idToken = await userCredential.user.getIdToken(true);
 
         const verifyRes = await fetch(`${API_BASE_URL}/api/status`, {
@@ -73,18 +68,22 @@ export default function AuthCard({ isAdmin = false, initialIsSignUp = false, onA
         }
 
         const verifiedUser = verifyData.user || {
-          username: userCredential.user.displayName || emailToUse,
-          role: emailToUse === 'admin@hpms-sky5.internal' ? 'super_admin' : 'admin',
+          username: username.trim(),
+          role: (emailToUse.includes('hpms-sky5.internal') && username.trim().toLowerCase() === 'admin') ? 'super_admin' : (verifyData.user?.role || 'admin'),
           loginType: 'staff'
         };
 
         showAlert('Logged in successfully via Firebase Auth!', 'Authentication Success');
         onAuthSuccess(verifiedUser, idToken);
+        setIsLoading(false);
         return;
       } catch (fbErr) {
         console.warn('[AuthCard] Firebase Client Auth login attempt failed/fallback:', fbErr.message);
-      } finally {
-        setIsLoading(false);
+        if (fbErr.message && (fbErr.message.includes('inactive') || fbErr.message.includes('Forbidden') || fbErr.message.includes('disabled'))) {
+          showAlert(fbErr.message, 'Authentication Error');
+          setIsLoading(false);
+          return;
+        }
       }
     }
 

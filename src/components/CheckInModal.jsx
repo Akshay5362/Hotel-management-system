@@ -8,12 +8,14 @@ export default function CheckInModal({ isOpen, onClose, room, onCheckIn, showAle
   const [checkInDate, setCheckInDate] = useState('');
   const [billingInstruction, setBillingInstruction] = useState('Direct to Guest');
   const [mealPlan, setMealPlan] = useState('EP');
+  const [dob, setDob] = useState('');
 
   // Reset or initialize state when room changes or modal opens
   useEffect(() => {
     if (room) {
       setGuestName('');
       setPhone('');
+      setDob('');
       setPax('1');
       setDeposit('0');
       setBillingInstruction('Direct to Guest');
@@ -39,7 +41,8 @@ export default function CheckInModal({ isOpen, onClose, room, onCheckIn, showAle
       deposit: parseFloat(deposit) || 0,
       checkInDate,
       billing_instruction: billingInstruction,
-      meal_plan: mealPlan
+      meal_plan: mealPlan,
+      dateOfBirth: dob || null
     });
   };
 
@@ -82,17 +85,27 @@ export default function CheckInModal({ isOpen, onClose, room, onCheckIn, showAle
               </div>
             </div>
 
-            <div className="form-group">
-              <label>Mobile Number</label>
-              <div className="input-icon-wrapper">
-                <svg viewBox="0 0 24 24">
-                  <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
-                </svg>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Mobile Number</label>
+                <div className="input-icon-wrapper">
+                  <svg viewBox="0 0 24 24">
+                    <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
+                  </svg>
+                  <input 
+                    type="tel" 
+                    placeholder="e.g. +91 9999999999"
+                    value={phone}
+                    onChange={(e) => setPhone(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="form-group">
+                <label>Date of Birth (Optional)</label>
                 <input 
-                  type="tel" 
-                  placeholder="e.g. +91 9999999999"
-                  value={phone}
-                  onChange={(e) => setPhone(e.target.value)}
+                  type="date" 
+                  value={dob}
+                  onChange={(e) => setDob(e.target.value)}
                 />
               </div>
             </div>

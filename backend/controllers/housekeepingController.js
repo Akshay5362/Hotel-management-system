@@ -1,19 +1,53 @@
 import db from '../db.js';
+import { db as firestoreDb } from '../config/firebaseAdmin.js';
 import { BusinessDateService } from '../services/businessDateService.js';
 import { enqueue } from '../services/outboxService.js';
-import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
+import { isFirestoreDualWriteEnabled, isHousekeepingReadCanaryEnabled } from '../config/featureFlags.js';
+import { executeReadCanary } from '../services/dualReadVerificationService.js';
 
 export const getHousekeepingRooms = async (req, res) => {
+  const canaryResult = await executeReadCanary({
+    flagCheckFn: isHousekeepingReadCanaryEnabled,
+    endpointName: '/api/housekeeping/rooms',
+    timeoutMs: 1000,
+    fetchFirestoreFn: async () => {
+      const snap = await firestoreDb.collection('rooms').get();
+      return snap.docs.map(doc => ({ ...doc.data(), firestore_id: doc.id }));
+    },
+    validateAndFormatFn: (docs) => {
+      if (!Array.isArray(docs) || docs.length === 0) return null;
+      const formatted = docs.map(r => ({
+        id: r.id || r.mysql_room_id || r.firestore_id,
+        number: String(r.number || ''),
+        type: r.type || 'DELUXE',
+        occupancy_status: r.status || r.occupancy_status || 'VACANT',
+        housekeeping_status: r.housekeeping_status || 'Clean',
+        housekeeping_priority: r.housekeeping_priority || 'Normal',
+        last_cleaned_at: r.last_cleaned_at || null,
+        housekeeping_assigned_to: r.housekeeping_assigned_to || null,
+        assigned_to_name: r.assigned_to_name || null,
+        guest_name: r.guest_name || null
+      }));
+      formatted.sort((a, b) => parseInt(a.number, 10) - parseInt(b.number, 10));
+      return formatted.length >= 1 ? formatted : null;
+    }
+  });
+
+  if (canaryResult) {
+    return res.json(canaryResult);
+  }
+
   try {
     const query = `
       SELECT 
-        r.id, r.number, r.type, r.status as occupancy_status,
+        r.id, r.number, COALESCE(rt.code, 'DELUXE') as type, r.status as occupancy_status,
         r.housekeeping_status, r.housekeeping_priority, r.last_cleaned_at,
-        r.housekeeping_assigned_to, u.name as assigned_to_name,
-        (SELECT name FROM guests g JOIN bookings b ON b.guest_id = g.id WHERE b.room_id = r.id AND b.booking_status = 'Checked In' LIMIT 1) as guest_name
+        r.housekeeping_assigned_to, s.full_name as assigned_to_name,
+        (SELECT full_name FROM guests g JOIN bookings b ON b.guest_id = g.id WHERE b.room_id = r.id AND b.booking_status = 'Checked In' LIMIT 1) as guest_name
       FROM rooms r
-      LEFT JOIN users u ON r.housekeeping_assigned_to = u.id
-      ORDER BY r.number ASC
+      LEFT JOIN room_types rt ON r.room_type_id = rt.id
+      LEFT JOIN staff s ON r.housekeeping_assigned_to = s.id
+      ORDER BY CAST(r.number AS UNSIGNED) ASC
     `;
     const [rows] = await db.query(query);
     res.json(rows);

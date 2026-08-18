@@ -80,8 +80,9 @@ app.get('/', (req, res) => {
   res.send('Webline PMS Plus Backend API is running!');
 });
 
-import { isFirestoreOutboxWorkerEnabled } from './config/featureFlags.js';
+import { isFirestoreOutboxWorkerEnabled, isFirestoreServicesEnabled, isFirestoreReadsEnabled, isFirestoreDualWriteEnabled } from './config/featureFlags.js';
 import { isWorkerRunning, stopOutboxWorker } from './services/outboxWorker.js';
+import { getServiceReadMetrics } from './services/serviceStrategy.js';
 
 // Health check endpoint — used by wait-on in electron:dev workflow & Docker healthcheck
 app.get('/api/health', (req, res) => {
@@ -89,12 +90,20 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     service: 'hotel-pms-backend',
     port: PORT,
+    feature_flags: {
+      outbox_worker: isFirestoreOutboxWorkerEnabled(),
+      dual_write: isFirestoreDualWriteEnabled(),
+      firestore_reads: isFirestoreReadsEnabled(),
+      use_firestore_services: isFirestoreServicesEnabled()
+    },
     outbox_worker: {
       enabled: isFirestoreOutboxWorkerEnabled(),
       running: isWorkerRunning()
-    }
+    },
+    telemetry: getServiceReadMetrics()
   });
 });
+
 
 
 // Error handling middleware

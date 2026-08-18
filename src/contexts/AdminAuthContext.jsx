@@ -18,7 +18,7 @@ export function AdminAuthProvider({ children }) {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       if (firebaseUser) {
         try {
-          const freshToken = await firebaseUser.getIdToken(true);
+          const freshToken = await firebaseUser.getIdToken(false);
           setAdminToken(freshToken);
           localStorage.setItem('adminToken', freshToken);
         } catch (e) {
@@ -37,7 +37,7 @@ export function AdminAuthProvider({ children }) {
   };
 
   const logout = async () => {
-    if (auth) {
+    if (auth && auth.currentUser) {
       try {
         await signOut(auth);
       } catch (e) {

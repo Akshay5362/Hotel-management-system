@@ -489,33 +489,6 @@ function AppContent() {
     }
 
     setSelectedRoom(freshRoom);
-    if (freshRoom.status === 'vacant') {
-      setActiveModal('checkin');
-    } else if (freshRoom.status === 'occupied') {
-      setActiveModal('checkout');
-    } else if (freshRoom.status === 'booked') {
-      // Build a context-aware message about payment method
-      const paymentNote = freshRoom.payment_method === 'Cash' || !freshRoom.payment_method
-        ? `\n\n💵 This guest selected CASH payment. Confirm you have received \u20b9${freshRoom.deposit} cash at the reception before proceeding.`
-        : `\n\nPayment method: ${freshRoom.payment_method}`;
-
-      const confirmed = await showConfirm(
-        `Guest ${freshRoom.guestName} has booked Room ${freshRoom.number} with a \u20b9${freshRoom.deposit} deposit.${paymentNote}\n\nCheck in this guest now?`,
-        'Guest Arrival — Confirm Check-In',
-        'Yes, Check In',
-        'Cancel'
-      );
-      if (confirmed) {
-        checkInBookedGuest(freshRoom.number);
-      }
-    } else if (freshRoom.status === 'dirty') {
-      const confirmed = await showConfirm(`Mark Room ${freshRoom.number} as CLEAN and make it vacant?`, 'Clean Room Service');
-      if (confirmed) {
-        cleanRoom(freshRoom.number);
-      }
-    } else {
-      showAlert(`Room ${freshRoom.number} is inactive and cannot be operated.`, 'Room Status');
-    }
   };
 
   // Action Bar clicks
@@ -898,6 +871,37 @@ function AppContent() {
     }
   };
 
+  // Handle Room Status change (Mark Active / Inactive, Mark Clean / Dirty)
+  const handleRoomStatusChange = async (roomNumber, action) => {
+    try {
+      const res = await fetch(`${API_URL}/rooms/${roomNumber}/status`, {
+        method: 'PUT',
+        headers: getApiHeaders(adminToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ action })
+      });
+
+      if (!res.ok) {
+        const errData = await res.json();
+        showAlert(errData.error || 'Failed to update room status', 'Room Update Error');
+        return;
+      }
+
+      await fetchStatus();
+      setSelectedRoom(prev => {
+        if (prev && prev.number === roomNumber) {
+          const isAct = action === 'mark_active' ? true : (action === 'mark_inactive' ? false : prev.is_active);
+          const isHk = action === 'mark_clean' ? 'Clean' : (action === 'mark_dirty' ? 'Dirty' : prev.housekeeping_status);
+          return { ...prev, is_active: isAct, housekeeping_status: isHk };
+        }
+        return prev;
+      });
+      showAlert(`Room ${roomNumber} updated successfully.`, 'Status Updated');
+    } catch (err) {
+      console.error('Error in handleRoomStatusChange:', err);
+      showAlert('Network error, please try again.', 'Connection Error');
+    }
+  };
+
   // Helper date formatter
   const formatDateString = (dateStr) => {
     if (!dateStr) return '';
@@ -1152,17 +1156,51 @@ function AppContent() {
               />
             </div>
           )}
-          {(adminTab === 'frontdesk' || adminTab === 'rooms') && (
-          <div className="dashboard-body">
-            <div className="room-grid-wrapper">
-              <RoomGrid 
-                rooms={rooms}
-                activeFilter={filter}
-                searchQuery={searchQuery}
-                onRoomClick={handleRoomClick}
-              />
+          {adminTab === 'frontdesk' && (
+            <div className="dashboard-body">
+              <div className="room-grid-wrapper">
+                <RoomGrid 
+                  rooms={rooms}
+                  activeFilter={filter}
+                  searchQuery={searchQuery}
+                  onRoomClick={handleRoomClick}
+                  showOperationalBadges={false}
+                />
+              </div>
             </div>
-          </div>
+          )}
+
+          {adminTab === 'rooms' && (
+            <div className="dashboard-body">
+              <div style={{
+                background: 'rgba(255, 255, 255, 0.03)',
+                border: '1px solid var(--border-color)',
+                borderRadius: '8px',
+                padding: '12px 16px',
+                marginBottom: '16px',
+                display: 'flex',
+                justify: 'space-between',
+                alignItems: 'center'
+              }}>
+                <div>
+                  <h2 style={{ fontSize: '1.1rem', fontWeight: '700', color: 'var(--text-main)', margin: 0 }}>
+                    🛏️ Rooms Management & Operational Controls
+                  </h2>
+                  <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                    Manage room availability (Active/Inactive) and housekeeping (Clean/Dirty)
+                  </span>
+                </div>
+              </div>
+              <div className="room-grid-wrapper">
+                <RoomGrid 
+                  rooms={rooms}
+                  activeFilter={filter}
+                  searchQuery={searchQuery}
+                  onRoomClick={handleRoomClick}
+                  showOperationalBadges={true}
+                />
+              </div>
+            </div>
           )}
 
           {/* Bottom Metrics Information Bar */}
@@ -1272,7 +1310,9 @@ function AppContent() {
         <RoomInspectorDrawer 
           selectedRoom={selectedRoom} 
           onClose={() => setSelectedRoom(null)}
-          onActionClick={handleActionClick} 
+          onCheckInClick={(room) => { setSelectedRoom(room); setActiveModal('checkin'); }}
+          onCheckOutClick={(room) => { setSelectedRoom(room); setActiveModal('checkout'); }}
+          onRoomStatusChange={handleRoomStatusChange}
         />
         </div>
       </RoleProtectedRoute>

@@ -120,10 +120,12 @@ export const getStatus = async (req, res) => {
       number: r.number,
       type: r.type,
       status: r.status,
+      is_active: r.is_active,
       housekeeping_status: r.housekeeping_status,
       rate: r.rate,
       guestName: r.guestName,
       phone: r.phone,
+      date_of_birth: r.date_of_birth,
       pax: r.pax,
       deposit: r.deposit,
       checkInDate: r.checkInDate,
@@ -141,7 +143,14 @@ export const getStatus = async (req, res) => {
       billing_instruction: r.billing_instruction || 'Direct to Guest',
       meal_plan: r.meal_plan || 'EP',
       ledger: (r.booking_id && ledgerByBookingId[r.booking_id]) ? ledgerByBookingId[r.booking_id] : []
-    }));
+    })).sort((a, b) => {
+      const numA = parseInt(a.number, 10);
+      const numB = parseInt(b.number, 10);
+      if (!isNaN(numA) && !isNaN(numB) && numA !== numB) {
+        return numA - numB;
+      }
+      return String(a.number || '').localeCompare(String(b.number || ''), undefined, { numeric: true, sensitivity: 'base' });
+    });
 
     const [cashLog] = await pool.query('SELECT * FROM cash_logs WHERE business_date = ?', [systemDate]);
 
@@ -1080,7 +1089,7 @@ export const listGuests = async (req, res) => {
     // Page of results
     const [guests] = await pool.query(
       `SELECT
-         g.id, g.full_name, g.phone, g.email, g.address, g.gst_no, g.pincode, g.country,
+         g.id, g.full_name, g.phone, g.email, g.address, g.gst_no, g.pincode, g.country, g.date_of_birth,
          g.arrival_from, g.departure_to,
          g.government_id, g.id_type, g.gender, g.age,
          g.id_verification_status,

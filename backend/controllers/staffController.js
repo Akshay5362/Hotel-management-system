@@ -9,10 +9,12 @@
  */
 
 import pool from '../db.js';
+import { db } from '../config/firebaseAdmin.js';
 import bcrypt from 'bcryptjs';
 import { generateToken } from './authController.js';
 import { enqueue } from '../services/outboxService.js';
-import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
+import { isFirestoreDualWriteEnabled, isStaffReadCanaryEnabled } from '../config/featureFlags.js';
+import { executeReadCanary } from '../services/dualReadVerificationService.js';
 
 const BCRYPT_ROUNDS = 12;
 
@@ -127,6 +129,53 @@ export const staffLogin = async (req, res) => {
 
 // ── GET /api/staff ─────────────────────────────────────────────────────────────
 export const getAllStaff = async (req, res) => {
+  const canaryResult = await executeReadCanary({
+    flagCheckFn: isStaffReadCanaryEnabled,
+    endpointName: '/api/staff',
+    timeoutMs: 1000,
+    fetchFirestoreFn: async () => {
+      const snap = await db.collection('staff').get();
+      return snap.docs.map(doc => ({ ...doc.data(), firestore_id: doc.id }));
+    },
+    validateAndFormatFn: (docs) => {
+      if (!Array.isArray(docs) || docs.length === 0) return null;
+      const sanitizedStaff = docs
+        .filter(s => {
+          if (!s) return false;
+          if (s.deleted === true || s.deleted === 1 || s.is_deleted === true || s.is_deleted === 1 || s.deleted_at) return false;
+          if (s.is_active === false || s.is_active === 0 || s.active === false || s.active === 0) return false;
+          if (s.status === 'Inactive' || s.status === 'Disabled' || s.status === 'Deleted') return false;
+          return true;
+        })
+        .map(s => {
+          const safe = {
+            id: s.id || s.mysql_staff_id || s.firestore_id,
+            full_name: s.full_name || s.name || '',
+            username: s.username || '',
+            email: s.email || '',
+            role: s.role || 'staff',
+            department: s.department || 'Administration',
+            shift: s.shift || 'Morning',
+            phone: s.phone || '',
+            status: s.status || 'Active',
+            last_login: s.last_login || null,
+            created_at: s.created_at || null,
+            updated_at: s.updated_at || null
+          };
+          delete safe.password_hash;
+          delete safe.password;
+          delete safe.deleted;
+          return safe;
+        });
+      sanitizedStaff.sort((a, b) => String(a.full_name).localeCompare(String(b.full_name)));
+      return sanitizedStaff.length >= 1 ? { staff: sanitizedStaff, total: sanitizedStaff.length } : null;
+    }
+  });
+
+  if (canaryResult) {
+    return res.json(canaryResult);
+  }
+
   try {
     const { role, department, shift, status, search } = req.query;
     let where = ['deleted = 0'];

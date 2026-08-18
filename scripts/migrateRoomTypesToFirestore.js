@@ -8,7 +8,7 @@
  *  - Defaults to DRY-RUN mode (`--dry-run`).
  *  - ZERO writes to Firestore unless `--commit` is explicitly passed.
  *  - ZERO writes/updates to MySQL (MySQL is strictly Read-Only).
- *  - No existing application source files or routes modified.
+ *  - Uses SafeFirestoreBatchWriter for safe chunked batching (max 250 ops/batch).
  *
  * Usage:
  *  node scripts/migrateRoomTypesToFirestore.js           (Runs Dry-Run mode)
@@ -18,6 +18,7 @@
 
 import pool from '../backend/db.js';
 import { db, isFirebaseConfigured } from '../backend/config/firebaseAdmin.js';
+import { SafeFirestoreBatchWriter } from './utils/firestoreBatch.js';
 
 const isCommitMode = process.argv.includes('--commit');
 const isDryRunMode = !isCommitMode;
@@ -29,7 +30,6 @@ async function runRoomTypesMigration() {
 
   let connection;
   try {
-    // 1. Read room_types from MySQL
     connection = await pool.getConnection();
     const [rows] = await connection.query(`
       SELECT id, code, title, description, base_rate, image
@@ -52,7 +52,6 @@ async function runRoomTypesMigration() {
     let invalidTypeCount = 0;
     const issues = [];
 
-    // 2. Perform deterministic field mapping and validation
     for (const rt of rows) {
       if (!rt.id) {
         missingMysqlIdCount++;
@@ -101,7 +100,7 @@ async function runRoomTypesMigration() {
       });
     }
 
-    // 3. Dry-Run Report
+    // Dry-Run Report
     console.log('\n--- DRY-RUN VALIDATION REPORT ---');
     console.log(`Target Collection          : /room_types`);
     console.log(`MySQL Room Types Count     : ${rows.length}`);
@@ -128,21 +127,25 @@ async function runRoomTypesMigration() {
       return;
     }
 
-    // 4. Actual Commit (Only if --commit explicitly passed)
+    // Commit Mode
     if (!isFirebaseConfigured || !db) {
       throw new Error('Firebase Admin SDK is not configured. Cannot perform Firestore write.');
     }
 
-    console.log(`\n[Firestore Write] Committing ${mappedDocuments.length} room_type documents to Firestore...`);
-    const batch = db.batch();
+    const batchWriter = new SafeFirestoreBatchWriter(db, {
+      collectionName: 'room_types',
+      maxBatchSize: 250,
+      isDryRun: false
+    });
 
+    console.log(`\n[Firestore Write] Committing ${mappedDocuments.length} room_type documents using SafeBatchWriter...`);
     for (const item of mappedDocuments) {
       const docRef = db.collection('room_types').doc(item.docId);
-      batch.set(docRef, item.data, { merge: true });
+      await batchWriter.set(docRef, item.data, { merge: true });
     }
 
-    await batch.commit();
-    console.log(`✔ [Firestore Write SUCCESS] Successfully wrote ${mappedDocuments.length} room_type documents to /room_types collection.\n`);
+    await batchWriter.finalize();
+    console.log(`✔ [Firestore Write SUCCESS] Successfully wrote ${mappedDocuments.length} room_type documents.\n`);
 
   } catch (error) {
     console.error('\n❌ [Migration Error]:', error.message);

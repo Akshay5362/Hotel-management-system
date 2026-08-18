@@ -52,6 +52,7 @@ export async function createReservationFirestore(resData, options = {}) {
     guest_name: String(resData.guest_name),
     email: resData.email || null,
     phone: resData.phone || null,
+    date_of_birth: resData.date_of_birth || resData.dob || null,
     room_id: String(resData.room_id),
     mysql_room_id: resData.mysql_room_id || null,
     booking_id: resData.booking_id || null,

@@ -15,12 +15,14 @@
  *   - No FieldValue.increment(), no random IDs, all operations are set_merge.
  */
 import pool from '../db.js';
+import { db } from '../config/firebaseAdmin.js';
 import { BusinessDateService } from '../services/businessDateService.js';
 import { processCheckIn } from '../services/checkInService.js';
 import { RoomStatusService, isDateOverlap, parseToComparableDate } from '../services/roomStatusService.js';
 import { AvailabilityService } from '../services/AvailabilityService.js';
 import { enqueue } from '../services/outboxService.js';
-import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
+import { isFirestoreDualWriteEnabled, isReservationsReadCanaryEnabled } from '../config/featureFlags.js';
+import { executeReadCanary } from '../services/dualReadVerificationService.js';
 import {
   CompoundEventBuilder,
   formatReservationId,
@@ -117,8 +119,12 @@ export const createReservation = async (req, res) => {
       paymentMode = 'Cash',
       billingInstructions = '',
       transportMode = 'Self',
-      remarks = ''
+      remarks = '',
+      dateOfBirth = null,
+      dob = null
     } = req.body;
+
+    const resolvedDob = dateOfBirth || dob || null;
 
     // Field Validations
     if (!guestName || typeof guestName !== 'string' || guestName.trim() === '') {
@@ -154,17 +160,25 @@ export const createReservation = async (req, res) => {
 
     // ALWAYS enforce consistency between room_number and room_id
     if (selectedRoomNumber) {
-      const [rRows] = await connection.query('SELECT id FROM rooms WHERE number = ?', [selectedRoomNumber]);
+      const [rRows] = await connection.query('SELECT id, is_active FROM rooms WHERE number = ?', [selectedRoomNumber]);
       if (rRows.length > 0) {
         selectedRoomId = rRows[0].id;
+        if (rRows[0].is_active === 0 || rRows[0].is_active === false || rRows[0].is_active === '0') {
+          await connection.rollback();
+          return res.status(400).json({ error: `Room ${selectedRoomNumber} is inactive and unavailable for reservation.` });
+        }
       } else {
         selectedRoomId = null;
         selectedRoomNumber = ''; // Invalid room number provided
       }
     } else if (selectedRoomId) {
-      const [rRows] = await connection.query('SELECT number FROM rooms WHERE id = ?', [selectedRoomId]);
+      const [rRows] = await connection.query('SELECT number, is_active FROM rooms WHERE id = ?', [selectedRoomId]);
       if (rRows.length > 0) {
         selectedRoomNumber = rRows[0].number;
+        if (rRows[0].is_active === 0 || rRows[0].is_active === false || rRows[0].is_active === '0') {
+          await connection.rollback();
+          return res.status(400).json({ error: `Room ${selectedRoomNumber} is inactive and unavailable for reservation.` });
+        }
       } else {
         selectedRoomId = null;
       }
@@ -176,12 +190,6 @@ export const createReservation = async (req, res) => {
     }
 
     // ── Availability Validation with row lock (concurrency-safe) ─────────────
-    // validateAndLockRoom acquires SELECT ... FOR UPDATE, then checks:
-    //   1. Room physical status (not dirty/OOO/maintenance/occupied/blocked)
-    //   2. Housekeeping status
-    //   3. No overlapping Checked In booking
-    //   4. No overlapping active reservation
-    // Throws { status: 409, message, code: 'ROOM_ALREADY_BOOKED' } if blocked.
     try {
       await AvailabilityService.validateAndLockRoom(connection, {
         roomId:         selectedRoomId,
@@ -209,8 +217,8 @@ export const createReservation = async (req, res) => {
         room_type, room_id, room_number,
         booking_source, booking_mode, booked_by, booked_by_contact,
         advance_payment, payment_mode, billing_instructions, transport_mode,
-        remarks, status, created_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        remarks, status, created_by, date_of_birth
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
       reservationNumber, guestName.trim(), address || '', phone.trim(), email || '',
       nationality, state, company, purpose,
@@ -218,7 +226,7 @@ export const createReservation = async (req, res) => {
       roomType || 'STANDARD', selectedRoomId, selectedRoomNumber,
       bookingSource, bookingMode, bookedBy, bookedByContact,
       parsedAdvance, paymentMode, billingInstructions, transportMode,
-      remarks, 'Reserved', req.user?.id || null
+      remarks, 'Reserved', req.user?.id || null, resolvedDob
     ]);
 
     const reservationId = result.insertId;
@@ -328,6 +336,56 @@ export const createReservation = async (req, res) => {
  * GET /api/reservations
  */
 export const getReservations = async (req, res) => {
+  const canaryResult = await executeReadCanary({
+    flagCheckFn: isReservationsReadCanaryEnabled,
+    endpointName: '/api/reservations',
+    timeoutMs: 1000,
+    fetchFirestoreFn: async () => {
+      const snap = await db.collection('reservations').get();
+      return snap.docs.map(doc => ({ ...doc.data(), firestore_id: doc.id }));
+    },
+    validateAndFormatFn: (docs) => {
+      if (!Array.isArray(docs)) return null;
+      const formatted = docs.map(r => ({
+        id: r.id || r.mysql_reservation_id || r.firestore_id,
+        reservation_number: r.reservation_number || '',
+        guest_name: r.guest_name || '',
+        phone: r.phone || '',
+        email: r.email || null,
+        address: r.address || null,
+        nationality: r.nationality || 'Indian',
+        company: r.company || null,
+        purpose: r.purpose || null,
+        room_id: r.mysql_room_id || null,
+        room_number: r.room_number || '',
+        room_type: r.room_type || 'STANDARD',
+        arrival_date: r.arrival_date || r.check_in_date || null,
+        departure_date: r.departure_date || r.check_out_date || null,
+        arrival_time: r.arrival_time || null,
+        adults: Number(r.adults || 1),
+        children: Number(r.children || 0),
+        booking_source: r.booking_source || 'Direct',
+        booking_mode: r.booking_mode || 'Offline',
+        booked_by: r.booked_by || null,
+        booked_by_contact: r.booked_by_contact || null,
+        advance_payment: parseFloat(r.advance_payment || 0),
+        payment_mode: r.payment_mode || 'Cash',
+        billing_instructions: r.billing_instructions || null,
+        transport_mode: r.transport_mode || 'Self',
+        remarks: r.remarks || null,
+        status: r.status || 'Reserved',
+        created_at: r.created_at || null,
+        updated_at: r.updated_at || null
+      }));
+      formatted.sort((a, b) => Number(b.id) - Number(a.id));
+      return { success: true, count: formatted.length, reservations: formatted };
+    }
+  });
+
+  if (canaryResult) {
+    return res.json(canaryResult);
+  }
+
   try {
     const { status, search, fromDate, toDate } = req.query;
 

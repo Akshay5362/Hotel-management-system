@@ -18,3 +18,5 @@ export * from './housekeepingRepository.js';
 export * from './cashSubmissionsRepository.js';
 export * from './checkoutSnapshotsRepository.js';
 export * from './razorpayTransactionsRepository.js';
+export * from './usersRepository.js';
+export * from './rbacRepository.js';

@@ -5,17 +5,43 @@
  */
 
 import pool from '../db.js';
+import { db } from '../config/firebaseAdmin.js';
 import { BusinessDateService } from '../services/businessDateService.js';
 import { VALID_UNITS, VALID_STATUSES } from '../utils/inventoryConstants.js';
 import { removeOldProductPhoto } from '../middleware/inventoryUploadMiddleware.js';
 import { enqueue } from '../services/outboxService.js';
-import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
+import { isFirestoreDualWriteEnabled, isInventoryCategoriesReadCanaryEnabled, isInventoryProductsReadCanaryEnabled } from '../config/featureFlags.js';
+import { executeReadCanary } from '../services/dualReadVerificationService.js';
 
 /**
  * GET /api/inventory/categories
  * Retrieves all inventory categories.
  */
 export const getCategories = async (req, res) => {
+  const canaryResult = await executeReadCanary({
+    flagCheckFn: isInventoryCategoriesReadCanaryEnabled,
+    endpointName: '/api/inventory/categories',
+    fetchFirestoreFn: async () => {
+      const snap = await db.collection('inventory_categories').get();
+      return snap.docs.map(doc => ({ ...doc.data(), firestore_id: doc.id }));
+    },
+    validateAndFormatFn: (docs) => {
+      if (!Array.isArray(docs) || docs.length === 0) return null;
+      const categories = docs.map(d => ({
+        id: d.id || d.mysql_category_id || d.firestore_id,
+        name: d.name || '',
+        department: d.department || 'General',
+        created_at: d.created_at || null
+      }));
+      categories.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+      return categories.length >= 1 ? { categories } : null;
+    }
+  });
+
+  if (canaryResult) {
+    return res.json(canaryResult);
+  }
+
   try {
     const [rows] = await pool.query(
       'SELECT id, name, department, created_at FROM inventory_categories ORDER BY name ASC'
@@ -196,6 +222,56 @@ export const deleteCategory = async (req, res) => {
  * Retrieves product list with filters and calculates stock statuses & dashboard summary metrics.
  */
 export const getProducts = async (req, res) => {
+  const canaryResult = await executeReadCanary({
+    flagCheckFn: isInventoryProductsReadCanaryEnabled,
+    endpointName: '/api/inventory/products',
+    fetchFirestoreFn: async () => {
+      const snap = await db.collection('inventory_products').get();
+      return snap.docs.map(doc => ({ ...doc.data(), firestore_id: doc.id }));
+    },
+    validateAndFormatFn: (docs) => {
+      if (!Array.isArray(docs) || docs.length === 0) return null;
+      const products = docs.map(p => {
+        const cur = parseFloat(p.current_stock || 0);
+        const min = parseFloat(p.minimum_stock_level || 0);
+        let stock_status = 'In Stock';
+        if (cur <= 0) stock_status = 'Out of Stock';
+        else if (cur <= min) stock_status = 'Low Stock';
+
+        return {
+          id: p.id || p.mysql_product_id || p.firestore_id,
+          sku: p.sku || '',
+          name: p.name || '',
+          category_id: p.category_id || 1,
+          category_name: p.category_name || 'General',
+          category_department: p.category_department || 'General',
+          unit_of_measure: p.unit_of_measure || 'pcs',
+          minimum_stock_level: min,
+          current_stock: cur,
+          unit_price: parseFloat(p.unit_price || 0),
+          photo_url: p.photo_url || null,
+          status: p.status || 'Active',
+          created_at: p.created_at || null,
+          updated_at: p.updated_at || null,
+          stock_status
+        };
+      });
+
+      const metrics = {
+        totalProducts: products.length,
+        activeProducts: products.filter(p => p.status === 'Active').length,
+        lowStockProducts: products.filter(p => p.status === 'Active' && p.current_stock > 0 && p.current_stock <= p.minimum_stock_level).length,
+        outOfStockProducts: products.filter(p => p.status === 'Active' && p.current_stock <= 0).length
+      };
+
+      return products.length >= 1 ? { products, metrics } : null;
+    }
+  });
+
+  if (canaryResult) {
+    return res.json(canaryResult);
+  }
+
   try {
     const { search, category_id, status, low_stock } = req.query;
 

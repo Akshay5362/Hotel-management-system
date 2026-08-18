@@ -1,5 +1,6 @@
 import pool from '../backend/db.js';
-import { db } from '../backend/config/firebaseAdmin.js';
+import { db, isFirebaseConfigured } from '../backend/config/firebaseAdmin.js';
+import { SafeFirestoreBatchWriter } from './utils/firestoreBatch.js';
 
 const isCommit = process.argv.includes('--commit');
 
@@ -10,22 +11,22 @@ async function migrateLedger() {
     const [rows] = await pool.query('SELECT * FROM ledger_items ORDER BY id ASC');
     console.log(`MySQL source record count: ${rows.length}`);
 
-    let amountSum = 0;
+    let totalAmountSum = 0;
     const documentsToInsert = [];
 
     for (const row of rows) {
-      amountSum += Number(row.amount || 0);
+      totalAmountSum += Number(row.amount || 0);
 
       const docId = `ledger_${row.id}`;
       const docData = {
         mysql_ledger_id: row.id,
-        mysql_booking_id: row.booking_id || null,
-        room_number: row.room_number,
-        description: row.desc || '',
-        qty: Number(row.qty || 1),
+        mysql_booking_id: row.booking_id,
+        description: row.desc || row.description || 'Room Charge',
         amount: Number(row.amount || 0),
-        status: row.status || 'Pending',
+        type: row.type || 'CHARGE',
+        room_number: row.room_number || null,
         business_date: row.business_date || null,
+        status: row.status || 'Posted',
         created_at: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString()
       };
 
@@ -33,7 +34,7 @@ async function migrateLedger() {
     }
 
     console.log(`Financial Totals Assertion:`);
-    console.log(` - SUM(amount) : ₹${amountSum}`);
+    console.log(` - SUM(amount) : ₹${totalAmountSum}`);
     console.log(`Expected Firestore Collection: /ledger_items (${documentsToInsert.length} documents)\n`);
 
     if (!isCommit) {
@@ -41,19 +42,28 @@ async function migrateLedger() {
       process.exit(0);
     }
 
-    console.log('Executing batched Firestore write operation...');
-    const batch = db.batch();
+    if (!isFirebaseConfigured || !db) {
+      throw new Error('Firebase Admin SDK is not initialized.');
+    }
+
+    console.log('Executing batched Firestore write operation via SafeFirestoreBatchWriter...');
+    const batchWriter = new SafeFirestoreBatchWriter(db, {
+      collectionName: 'ledger_items',
+      maxBatchSize: 250,
+      isDryRun: false
+    });
+
     for (const { docId, docData } of documentsToInsert) {
       const ref = db.collection('ledger_items').doc(docId);
-      batch.set(ref, docData, { merge: true });
+      await batchWriter.set(ref, docData, { merge: true });
     }
-    await batch.commit();
 
+    await batchWriter.finalize();
     console.log(`Successfully committed ${documentsToInsert.length} /ledger_items documents to Cloud Firestore.`);
     process.exit(0);
 
   } catch (err) {
-    console.error('Ledger migration error:', err.message);
+    console.error('Ledger items migration error:', err.message);
     process.exit(1);
   }
 }

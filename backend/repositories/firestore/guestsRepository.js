@@ -81,6 +81,7 @@ export async function createGuestFirestore(guestData, options = {}) {
     email: guestData.email ? String(guestData.email).toLowerCase().trim() : null,
     phone: guestData.phone ? String(guestData.phone).trim() : null,
     address: guestData.address || '',
+    date_of_birth: guestData.date_of_birth || guestData.dob || null,
     government_id: guestData.government_id || null,
     id_type: guestData.id_type || null,
     id_document_url: guestData.id_document_url || null,

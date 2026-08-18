@@ -1,5 +1,6 @@
 import pool from '../backend/db.js';
-import { db } from '../backend/config/firebaseAdmin.js';
+import { db, isFirebaseConfigured } from '../backend/config/firebaseAdmin.js';
+import { SafeFirestoreBatchWriter } from './utils/firestoreBatch.js';
 
 const isCommit = process.argv.includes('--commit');
 
@@ -41,14 +42,23 @@ async function migrateReservations() {
       process.exit(0);
     }
 
-    console.log('Executing batched Firestore write operation...');
-    const batch = db.batch();
+    if (!isFirebaseConfigured || !db) {
+      throw new Error('Firebase Admin SDK is not initialized.');
+    }
+
+    console.log('Executing batched Firestore write operation via SafeFirestoreBatchWriter...');
+    const batchWriter = new SafeFirestoreBatchWriter(db, {
+      collectionName: 'reservations',
+      maxBatchSize: 250,
+      isDryRun: false
+    });
+
     for (const { docId, docData } of documentsToInsert) {
       const ref = db.collection('reservations').doc(docId);
-      batch.set(ref, docData, { merge: true });
+      await batchWriter.set(ref, docData, { merge: true });
     }
-    await batch.commit();
 
+    await batchWriter.finalize();
     console.log(`Successfully committed ${documentsToInsert.length} /reservations documents to Cloud Firestore.`);
     process.exit(0);
 

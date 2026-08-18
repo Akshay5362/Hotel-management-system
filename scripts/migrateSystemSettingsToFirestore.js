@@ -1,5 +1,6 @@
 import pool from '../backend/db.js';
-import { db } from '../backend/config/firebaseAdmin.js';
+import { db, isFirebaseConfigured } from '../backend/config/firebaseAdmin.js';
+import { SafeFirestoreBatchWriter } from './utils/firestoreBatch.js';
 
 const isCommit = process.argv.includes('--commit');
 
@@ -15,9 +16,9 @@ async function migrateSystemSettings() {
     for (const row of rows) {
       const docId = `setting_${row.key_name}`;
       const docData = {
-        key_name: row.key_name,
-        value_val: row.value_val,
-        migrated_at: new Date().toISOString(),
+        key_name: String(row.key_name),
+        value_val: String(row.value_val || ''),
+        updated_at: new Date().toISOString(),
         source_table: 'system_settings'
       };
 
@@ -31,14 +32,23 @@ async function migrateSystemSettings() {
       process.exit(0);
     }
 
-    console.log('Executing batched Firestore write operation...');
-    const batch = db.batch();
+    if (!isFirebaseConfigured || !db) {
+      throw new Error('Firebase Admin SDK is not initialized.');
+    }
+
+    console.log('Executing batched Firestore write operation via SafeFirestoreBatchWriter...');
+    const batchWriter = new SafeFirestoreBatchWriter(db, {
+      collectionName: 'system_settings',
+      maxBatchSize: 250,
+      isDryRun: false
+    });
+
     for (const { docId, docData } of documentsToInsert) {
       const ref = db.collection('system_settings').doc(docId);
-      batch.set(ref, docData, { merge: true });
+      await batchWriter.set(ref, docData, { merge: true });
     }
-    await batch.commit();
 
+    await batchWriter.finalize();
     console.log(`Successfully committed ${documentsToInsert.length} /system_settings documents to Cloud Firestore.`);
     process.exit(0);
 

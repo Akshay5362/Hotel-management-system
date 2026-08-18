@@ -1,5 +1,6 @@
 import pool from '../backend/db.js';
-import { db } from '../backend/config/firebaseAdmin.js';
+import { db, isFirebaseConfigured } from '../backend/config/firebaseAdmin.js';
+import { SafeFirestoreBatchWriter } from './utils/firestoreBatch.js';
 
 const isCommit = process.argv.includes('--commit');
 
@@ -16,17 +17,10 @@ async function migrateAuditLogs() {
       const docId = `audit_${row.id}`;
       const docData = {
         mysql_audit_id: row.id,
-        mysql_user_id: row.user_id || null,
+        mysql_user_id: row.user_id,
         action: row.action,
         details: row.details || null,
         business_date: row.business_date,
-        previous_business_date: row.previous_business_date || null,
-        new_business_date: row.new_business_date || null,
-        reason: row.reason || null,
-        username: row.username || null,
-        role: row.role || null,
-        client_ip: row.client_ip || null,
-        application_version: row.application_version || '1.0.0',
         created_at: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString()
       };
 
@@ -40,19 +34,23 @@ async function migrateAuditLogs() {
       process.exit(0);
     }
 
-    console.log('Executing batched Firestore write operation...');
-    // Batched writing in chunks of 400 docs
-    const chunkSize = 400;
-    for (let i = 0; i < documentsToInsert.length; i += chunkSize) {
-      const chunk = documentsToInsert.slice(i, i + chunkSize);
-      const batch = db.batch();
-      for (const { docId, docData } of chunk) {
-        const ref = db.collection('audit_logs').doc(docId);
-        batch.set(ref, docData, { merge: true });
-      }
-      await batch.commit();
+    if (!isFirebaseConfigured || !db) {
+      throw new Error('Firebase Admin SDK is not initialized.');
     }
 
+    console.log('Executing batched Firestore write operation via SafeFirestoreBatchWriter...');
+    const batchWriter = new SafeFirestoreBatchWriter(db, {
+      collectionName: 'audit_logs',
+      maxBatchSize: 250,
+      isDryRun: false
+    });
+
+    for (const { docId, docData } of documentsToInsert) {
+      const ref = db.collection('audit_logs').doc(docId);
+      await batchWriter.set(ref, docData, { merge: true });
+    }
+
+    await batchWriter.finalize();
     console.log(`Successfully committed ${documentsToInsert.length} /audit_logs documents to Cloud Firestore.`);
     process.exit(0);
 

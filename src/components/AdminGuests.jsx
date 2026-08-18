@@ -257,6 +257,7 @@ function GuestDrawer({ guest, token, onClose }) {
                   <Section title="Personal Information">
                     <Grid2>
                       <Field label="Full Name"     val={guest.full_name} />
+                      <Field label="Date of Birth" val={guest.date_of_birth || '—'} />
                       <Field label="Gender"        val={guest.gender || '—'} />
                       <Field label="Age"           val={guest.age || '—'} />
                       <Field label="Phone"         val={guest.phone || '—'} />
@@ -586,6 +587,7 @@ export default function AdminGuests({ token }) {
                   <td style={{ padding: '10px 14px', color: 'var(--text-muted)' }}>
                     <div>{g.phone || '—'}</div>
                     <div style={{ fontSize: '0.72rem', marginTop: '1px' }}>{g.email || ''}</div>
+                    {g.date_of_birth && <div style={{ fontSize: '0.68rem', color: '#a78bfa', marginTop: '1px' }}>🎂 DOB: {g.date_of_birth}</div>}
                   </td>
                   <td style={{ padding: '10px 14px' }}>
                     <TierBadge tier={g.loyalty_tier} />

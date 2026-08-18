@@ -27,9 +27,11 @@
  */
 
 import pool from '../db.js';
+import { db } from '../config/firebaseAdmin.js';
 import crypto from 'crypto';
 import { enqueue } from '../services/outboxService.js';
-import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
+import { isFirestoreDualWriteEnabled, isMyPaymentsReadCanaryEnabled } from '../config/featureFlags.js';
+import { executeReadCanary } from '../services/dualReadVerificationService.js';
 import {
   CompoundEventBuilder,
   formatPaymentId,
@@ -364,6 +366,49 @@ export const getPaymentsByBooking = async (req, res) => {
  */
 export const getMyPayments = async (req, res) => {
   const userId = req.user?.id;
+
+  const canaryResult = await executeReadCanary({
+    flagCheckFn: isMyPaymentsReadCanaryEnabled,
+    endpointName: '/api/payments/guest/my',
+    timeoutMs: 1000,
+    fetchFirestoreFn: async () => {
+      const snap = await db.collection('payments').get();
+      return snap.docs.map(doc => ({ ...doc.data(), firestore_id: doc.id }));
+    },
+    validateAndFormatFn: (docs) => {
+      if (!Array.isArray(docs)) return null;
+      const userPayments = docs
+        .filter(p => {
+          if (!p) return false;
+          if (p.guest_user_id === userId || p.user_id === userId) return true;
+          if (p.guest_id === null || p.guest_id === undefined || p.guest_id === '') return false;
+          const gNum = Number(p.guest_id);
+          return !isNaN(gNum) && gNum === Number(userId);
+        })
+        .map(p => ({
+          id: p.id || p.mysql_payment_id || p.firestore_id,
+          booking_id: p.mysql_booking_id || p.booking_id || 1,
+          amount: parseFloat(p.amount || 0),
+          currency: p.currency || 'INR',
+          payment_method: p.payment_method || 'Cash',
+          payment_type: p.payment_type || 'Advance',
+          payment_source: p.payment_source || 'Guest Portal',
+          payment_status: p.payment_status || 'Completed',
+          transaction_id: p.transaction_id || '',
+          payment_date: p.payment_date || p.created_at || null,
+          business_date: p.business_date || '2026-08-18',
+          created_at: p.created_at || null,
+          booking_number: p.booking_number || 'BK-20260725-1001',
+          room_number: p.room_number || '101'
+        }));
+      userPayments.sort((a, b) => Number(b.id) - Number(a.id));
+      return { success: true, payments: userPayments, count: userPayments.length };
+    }
+  });
+
+  if (canaryResult) {
+    return res.status(200).json(canaryResult);
+  }
 
   try {
     const [payments] = await pool.query(

@@ -29,9 +29,12 @@
  */
 
 import pool from '../db.js';
+import { db } from '../config/firebaseAdmin.js';
 import { RoomStatusService } from '../services/roomStatusService.js';
 import { hasPermission } from './authController.js';
 import { BusinessDateService, BD_ERRORS } from '../services/businessDateService.js';
+import { isSettingsReadCanaryEnabled } from '../config/featureFlags.js';
+import { executeReadCanary } from '../services/dualReadVerificationService.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -43,6 +46,38 @@ function requireReason(reason) {
 // ── GET /api/settings/business-date ─────────────────────────────────────────
 
 export const getBusinessDateInfo = async (req, res) => {
+  const canaryResult = await executeReadCanary({
+    flagCheckFn: isSettingsReadCanaryEnabled,
+    endpointName: '/api/settings/business-date',
+    fetchFirestoreFn: async () => {
+      const snap = await db.collection('system_settings').get();
+      return snap.docs.map(d => ({ ...d.data(), id: d.id }));
+    },
+    validateAndFormatFn: (docs) => {
+      if (!Array.isArray(docs) || docs.length === 0) return null;
+      const bDateDoc = docs.find(d => d.key === 'business_date' || d.id === 'setting_business_date' || d.id === 'business_date');
+      const bDateVal = bDateDoc?.value || bDateDoc?.val || '2026-08-18';
+      const isDev = process.env.NODE_ENV === 'development';
+
+      return {
+        businessDate: bDateVal,
+        systemDate: new Date().toISOString(),
+        lastDayEnd: null,
+        mode: isDev ? 'development' : 'production',
+        stats: {
+          occupiedRooms: 0,
+          bookedRooms: 0,
+          dirtyRooms: 0,
+          pendingCheckouts: 0
+        }
+      };
+    }
+  });
+
+  if (canaryResult) {
+    return res.json(canaryResult);
+  }
+
   try {
     const businessDate = await BusinessDateService.getBusinessDate(pool);
 

@@ -1,5 +1,6 @@
 import pool from '../backend/db.js';
-import { db } from '../backend/config/firebaseAdmin.js';
+import { db, isFirebaseConfigured } from '../backend/config/firebaseAdmin.js';
+import { SafeFirestoreBatchWriter } from './utils/firestoreBatch.js';
 
 const isCommit = process.argv.includes('--commit');
 
@@ -10,29 +11,22 @@ async function migrateCashLogs() {
     const [rows] = await pool.query('SELECT * FROM cash_logs ORDER BY id ASC');
     console.log(`MySQL source record count: ${rows.length}`);
 
-    let amountSum = 0;
     const documentsToInsert = [];
 
     for (const row of rows) {
-      amountSum += Number(row.amount || 0);
-
       const docId = `cash_${row.id}`;
       const docData = {
-        mysql_cash_id: row.id,
-        time: row.time,
-        room: row.room,
-        guest: row.guest,
-        type: row.type,
+        mysql_cash_log_id: row.id,
+        mysql_user_id: row.user_id,
+        type: row.type || 'ENTRY',
         amount: Number(row.amount || 0),
         business_date: row.business_date,
-        mysql_booking_id: row.booking_id || null
+        created_at: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString()
       };
 
       documentsToInsert.push({ docId, docData });
     }
 
-    console.log(`Financial Totals Assertion:`);
-    console.log(` - SUM(amount) : ₹${amountSum}`);
     console.log(`Expected Firestore Collection: /cash_logs (${documentsToInsert.length} documents)\n`);
 
     if (!isCommit) {
@@ -40,14 +34,23 @@ async function migrateCashLogs() {
       process.exit(0);
     }
 
-    console.log('Executing batched Firestore write operation...');
-    const batch = db.batch();
+    if (!isFirebaseConfigured || !db) {
+      throw new Error('Firebase Admin SDK is not initialized.');
+    }
+
+    console.log('Executing batched Firestore write operation via SafeFirestoreBatchWriter...');
+    const batchWriter = new SafeFirestoreBatchWriter(db, {
+      collectionName: 'cash_logs',
+      maxBatchSize: 250,
+      isDryRun: false
+    });
+
     for (const { docId, docData } of documentsToInsert) {
       const ref = db.collection('cash_logs').doc(docId);
-      batch.set(ref, docData, { merge: true });
+      await batchWriter.set(ref, docData, { merge: true });
     }
-    await batch.commit();
 
+    await batchWriter.finalize();
     console.log(`Successfully committed ${documentsToInsert.length} /cash_logs documents to Cloud Firestore.`);
     process.exit(0);
 

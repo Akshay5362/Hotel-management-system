@@ -366,16 +366,40 @@ export const authenticate = async (req, res, next) => {
     try {
       const decodedFirebase = await auth.verifyIdToken(token);
       if (decodedFirebase) {
+        const mysqlId = decodedFirebase.mysql_id || decodedFirebase.mysql_staff_id || (decodedFirebase.uid?.startsWith('user_') ? parseInt(decodedFirebase.uid.replace('user_', ''), 10) : null);
+        const userType = decodedFirebase.user_type || (decodedFirebase.role === 'guest' ? 'guest' : 'staff');
+
         req.firebaseUser = decodedFirebase;
         req.user = {
           uid: decodedFirebase.uid,
           email: decodedFirebase.email || null,
+          username: decodedFirebase.displayName || decodedFirebase.email?.split('@')[0] || decodedFirebase.uid,
           role: decodedFirebase.role || 'guest',
-          type: decodedFirebase.user_type || (decodedFirebase.role === 'guest' ? 'guest' : 'staff'),
-          id: decodedFirebase.mysql_id || null,
-          mysql_id: decodedFirebase.mysql_id || null,
+          user_type: userType,
+          type: userType,
+          id: mysqlId,
+          mysql_id: mysqlId,
+          staff_id: decodedFirebase.staff_id || (decodedFirebase.uid?.startsWith('staff_') ? decodedFirebase.uid.replace('staff_', '') : null),
+          guest_id: decodedFirebase.guest_id || (decodedFirebase.uid?.startsWith('guest_') ? decodedFirebase.uid.replace('guest_', '') : null),
           authProvider: 'firebase'
         };
+
+        // Staff Account Status Check (Inactive / Deleted safety guard)
+        if (req.user.user_type === 'staff' || req.user.type === 'staff' || req.user.uid?.startsWith('staff_') || (req.user.role !== 'admin' && req.user.role !== 'super_admin' && req.user.role !== 'guest')) {
+          const staffDbId = req.user.mysql_id || req.user.staff_id || req.user.id;
+          if (staffDbId) {
+            try {
+              const [staffRows] = await pool.query(
+                'SELECT status, deleted FROM staff WHERE id = ? OR username = ? LIMIT 1',
+                [staffDbId, staffDbId]
+              );
+              if (staffRows.length > 0 && (staffRows[0].status === 'Inactive' || staffRows[0].deleted === 1)) {
+                return res.status(403).json({ error: 'Your account is inactive. Please contact an administrator.', code: 'ACCOUNT_INACTIVE' });
+              }
+            } catch (err) {}
+          }
+        }
+
         return next();
       }
     } catch (fbError) {
@@ -387,7 +411,31 @@ export const authenticate = async (req, res, next) => {
   const decoded = verifyToken(token);
   if (!decoded) return res.status(401).json({ error: 'Invalid or expired token' });
 
-  req.user = decoded;
+  const userType = decoded.type || decoded.user_type || (decoded.role === 'guest' ? 'guest' : 'staff');
+  req.user = {
+    ...decoded,
+    mysql_id: decoded.id || decoded.mysql_id || null,
+    user_type: userType,
+    type: userType,
+    authProvider: 'legacy'
+  };
+
+  // Staff Account Status Check for Legacy Token
+  if (req.user.type === 'staff' || req.user.user_type === 'staff' || (req.user.role !== 'admin' && req.user.role !== 'super_admin' && req.user.role !== 'guest')) {
+    const staffDbId = req.user.id || req.user.mysql_id || req.user.staff_id;
+    if (staffDbId) {
+      try {
+        const [staffRows] = await pool.query(
+          'SELECT status, deleted FROM staff WHERE id = ? OR username = ? LIMIT 1',
+          [staffDbId, staffDbId]
+        );
+        if (staffRows.length > 0 && (staffRows[0].status === 'Inactive' || staffRows[0].deleted === 1)) {
+          return res.status(403).json({ error: 'Your account is inactive. Please contact an administrator.', code: 'ACCOUNT_INACTIVE' });
+        }
+      } catch (err) {}
+    }
+  }
+
   next();
 };
 
@@ -422,6 +470,8 @@ export const requireGuest = (req, res, next) => {
   next();
 };
 
+import { executeShadowRbacVerification } from '../services/dualRbacShadowService.js';
+
 export const hasPermission = async (req, permissionName) => {
   if (!req.user) return false;
   const roleName = req.user.role?.toLowerCase() || '';
@@ -432,7 +482,11 @@ export const hasPermission = async (req, permissionName) => {
     JOIN roles r ON rp.role_id = r.id
     WHERE LOWER(r.name) = ? AND p.name = ?
   `, [roleName, permissionName]);
-  return rows.length > 0;
+
+  const mysqlAllowed = rows.length > 0;
+  executeShadowRbacVerification(req, permissionName, mysqlAllowed);
+
+  return mysqlAllowed;
 };
 
 /**

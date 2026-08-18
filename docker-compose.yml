@@ -32,6 +32,7 @@ services:
     ports:
       - "5000:5000"
     volumes:
+      - ./backend:/app
       - guest_documents:/app/guest-documents
     depends_on:
       db:

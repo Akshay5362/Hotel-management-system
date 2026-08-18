@@ -9,6 +9,7 @@
  *  - ZERO writes to Firestore unless `--commit` is explicitly passed.
  *  - ZERO writes/updates to MySQL (MySQL is strictly Read-Only).
  *  - ZERO password hashes or credential secrets exported.
+ *  - Uses SafeFirestoreBatchWriter for safe chunked batching (max 250 ops/batch).
  *  - Sensitive personal data (phone, email, government_id) REDACTED in dry-run output logs.
  *
  * Usage:
@@ -19,13 +20,14 @@
 
 import pool from '../backend/db.js';
 import { db, isFirebaseConfigured } from '../backend/config/firebaseAdmin.js';
+import { SafeFirestoreBatchWriter } from './utils/firestoreBatch.js';
 
 const isCommitMode = process.argv.includes('--commit');
 const isDryRunMode = !isCommitMode;
 
 async function runGuestMigration() {
   console.log('\n=================================================');
-  console.log(`  GUEST PILOT MIGRATION SCRIPT (${isCommitMode ? 'COMMIT MODE' : 'DRY-RUN MODE'})`);
+  console.log(`  GUEST MIGRATION SCRIPT (${isCommitMode ? 'COMMIT MODE' : 'DRY-RUN MODE'})`);
   console.log('=================================================\n');
 
   let connection;
@@ -236,14 +238,19 @@ async function runGuestMigration() {
       throw new Error('Firebase Admin SDK is not configured.');
     }
 
-    console.log(`\n[Firestore Write] Committing ${mappedDocuments.length} guest documents to Firestore...`);
-    const batch = db.batch();
+    console.log(`\n[Firestore Write] Committing ${mappedDocuments.length} guest documents to Firestore via SafeBatchWriter...`);
+    const batchWriter = new SafeFirestoreBatchWriter(db, {
+      collectionName: 'guests',
+      maxBatchSize: 250,
+      isDryRun: false
+    });
+
     for (const item of mappedDocuments) {
-      const ref = db.collection('guests').doc(item.docId);
-      batch.set(ref, item.data, { merge: true });
+      const docRef = db.collection('guests').doc(item.docId);
+      await batchWriter.set(docRef, item.data, { merge: true });
     }
 
-    await batch.commit();
+    await batchWriter.finalize();
     console.log(`✔ [Firestore Write SUCCESS] Wrote ${mappedDocuments.length} documents to /guests.\n`);
 
   } catch (error) {
