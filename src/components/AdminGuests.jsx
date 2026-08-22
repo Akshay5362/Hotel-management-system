@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { exportToExcel } from '../utils/exportUtils';
 import { formatDateOnly } from '../utils/dateFormatter';
+import MasterBillModal from './MasterBillModal';
 
 import { API_URL as API_BASE, getApiHeaders } from '../config/apiConfig';
 
@@ -143,11 +144,74 @@ function EmptyState({ icon, msg, sub }) {
   );
 }
 
+// ── Booking Selector Modal for Multiple Stays ─────────────────────────────────
+function BookingPickerModal({ isOpen, onClose, bookings, guestName, onSelectBooking }) {
+  if (!isOpen) return null;
+  return (
+    <div className="modal-overlay" style={{ zIndex: 10005 }}>
+      <div className="modal-content" style={{ maxWidth: '540px', width: '92%', background: '#0f172a', border: '1px solid rgba(56,189,248,0.25)', borderRadius: '12px', padding: '0', boxShadow: '0 10px 40px rgba(0,0,0,0.8)' }}>
+        <div style={{ padding: '16px 20px', borderBottom: '1px solid rgba(255,255,255,0.08)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(30,41,59,0.7)' }}>
+          <div>
+            <h3 style={{ margin: 0, fontSize: '1rem', color: '#fff', fontWeight: 700 }}>🖨 Select Stay to Reprint Bill</h3>
+            <p style={{ margin: '2px 0 0', fontSize: '0.74rem', color: 'var(--text-muted)' }}>Guest: <strong style={{ color: '#38bdf8' }}>{guestName}</strong> · {bookings.length} stays on record</p>
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#94a3b8', fontSize: '1.4rem', cursor: 'pointer' }}>&times;</button>
+        </div>
+        <div style={{ padding: '16px 20px', maxHeight: '60vh', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+          {bookings.map(b => (
+            <div key={b.id} style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '12px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{ fontWeight: 700, color: '#818cf8', fontSize: '0.88rem' }}>{b.booking_number || `#${b.id}`}</span>
+                  <StatusBadge status={b.booking_status} />
+                </div>
+                <div style={{ fontSize: '0.74rem', color: '#cbd5e1', marginTop: '4px' }}>
+                  🏨 Room <strong>{b.room_number}</strong> ({b.room_type || 'Standard'})
+                </div>
+                <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '2px' }}>
+                  📅 {b.check_in_date} → {b.check_out_date || b.expected_check_out_date || '—'}
+                </div>
+              </div>
+              <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                <div style={{ fontWeight: 800, fontSize: '0.9rem', color: '#4ade80', marginBottom: '6px' }}>₹{Number(b.total_amount || 0).toLocaleString('en-IN')}</div>
+                <button
+                  onClick={() => { onSelectBooking(b.booking_number || b.id); onClose(); }}
+                  style={{
+                    background: 'linear-gradient(135deg, #0284c7, #0369a1)',
+                    border: '1px solid rgba(56,189,248,0.4)',
+                    color: '#fff',
+                    borderRadius: '6px',
+                    padding: '5px 12px',
+                    fontSize: '0.75rem',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '4px'
+                  }}
+                >
+                  🖨 Reprint Bill
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div style={{ padding: '12px 20px', borderTop: '1px solid rgba(255,255,255,0.06)', textAlign: 'right', background: 'rgba(0,0,0,0.2)' }}>
+          <button onClick={onClose} style={{ background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.15)', color: '#cbd5e1', borderRadius: '6px', padding: '6px 14px', fontSize: '0.78rem', fontWeight: 600, cursor: 'pointer' }}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Drawer overlay ────────────────────────────────────────────────────────────
 function GuestDrawer({ guest, token, onClose }) {
-  const [tab, setTab]         = useState('profile');
-  const [detail, setDetail]   = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [tab, setTab]                         = useState('profile');
+  const [detail, setDetail]                   = useState(null);
+  const [loading, setLoading]                 = useState(true);
+  const [selectedBookingForBill, setSelectedBookingForBill] = useState(null);
+  const [showBookingPicker, setShowBookingPicker]           = useState(false);
+  const [noBillAlert, setNoBillAlert]         = useState(false);
 
   useEffect(() => {
     if (!guest) return;
@@ -182,6 +246,23 @@ function GuestDrawer({ guest, token, onClose }) {
       } catch { return s; }
     }, 0);
 
+  const handleReprintClick = (specificBooking = null) => {
+    if (specificBooking) {
+      setSelectedBookingForBill(specificBooking.booking_number || specificBooking.id);
+      return;
+    }
+    if (bookings.length === 0) {
+      setNoBillAlert(true);
+      setTimeout(() => setNoBillAlert(false), 4000);
+      return;
+    }
+    if (bookings.length === 1) {
+      setSelectedBookingForBill(bookings[0].booking_number || bookings[0].id);
+      return;
+    }
+    setShowBookingPicker(true);
+  };
+
   return (
     <>
       {/* Backdrop */}
@@ -197,8 +278,8 @@ function GuestDrawer({ guest, token, onClose }) {
         boxShadow: '-8px 0 40px rgba(0,0,0,0.6)',
       }}>
         {/* Drawer header */}
-        <div style={{ padding: '20px 24px 16px', borderBottom: '1px solid rgba(255,255,255,0.07)', display: 'flex', alignItems: 'center', gap: '14px' }}>
-          <div style={{ width: '46px', height: '46px', borderRadius: '50%', background: 'linear-gradient(135deg,#38bdf8,#818cf8)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.3rem', fontWeight: 800, color: '#fff', flexShrink: 0 }}>
+        <div style={{ padding: '18px 24px 14px', borderBottom: '1px solid rgba(255,255,255,0.07)', display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: 'linear-gradient(135deg,#38bdf8,#818cf8)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.25rem', fontWeight: 800, color: '#fff', flexShrink: 0 }}>
             {guest.full_name?.[0]?.toUpperCase() || '?'}
           </div>
           <div style={{ flex: 1, minWidth: 0 }}>
@@ -208,12 +289,43 @@ function GuestDrawer({ guest, token, onClose }) {
               {guest.email && <span>✉ {guest.email}</span>}
             </div>
           </div>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '4px', flexShrink: 0 }}>
-            <TierBadge tier={guest.loyalty_tier} />
-            {guest.current_room && <span style={{ fontSize: '0.68rem', color: '#f87171', fontWeight: 600 }}>Room {guest.current_room}</span>}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+            <button
+              onClick={() => handleReprintClick()}
+              style={{
+                background: 'rgba(56,189,248,0.12)',
+                border: '1px solid rgba(56,189,248,0.35)',
+                color: '#38bdf8',
+                borderRadius: '6px',
+                padding: '6px 11px',
+                fontSize: '0.74rem',
+                fontWeight: 700,
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '5px',
+                fontFamily: 'inherit',
+                transition: 'all 0.15s'
+              }}
+              title="Reprint Bill / Invoice for this guest"
+            >
+              🖨 Reprint Bill
+            </button>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '2px' }}>
+              <TierBadge tier={guest.loyalty_tier} />
+              {guest.current_room && <span style={{ fontSize: '0.68rem', color: '#f87171', fontWeight: 600 }}>Room {guest.current_room}</span>}
+            </div>
+            <button onClick={onClose} style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', color: '#94a3b8', borderRadius: '6px', width: '28px', height: '28px', cursor: 'pointer', fontSize: '1.1rem', display: 'flex', alignItems: 'center', justifyContent: 'center', marginLeft: '4px' }}>×</button>
           </div>
-          <button onClick={onClose} style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', color: '#94a3b8', borderRadius: '6px', width: '30px', height: '30px', cursor: 'pointer', fontSize: '1.1rem', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>×</button>
         </div>
+
+        {/* No bill warning banner if triggered */}
+        {noBillAlert && (
+          <div style={{ background: 'rgba(239,68,68,0.15)', borderBottom: '1px solid rgba(239,68,68,0.3)', color: '#fca5a5', padding: '8px 24px', fontSize: '0.76rem', display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span>⚠️</span>
+            <span>No bill is available for this booking/guest.</span>
+          </div>
+        )}
 
         {/* KPI strip */}
         <div style={{ display: 'flex', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
@@ -307,7 +419,29 @@ function GuestDrawer({ guest, token, onClose }) {
               {/* BOOKINGS TAB */}
               {tab === 'bookings' && (
                 <div>
-                  <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '12px' }}>{bookings.length} booking{bookings.length !== 1 ? 's' : ''} on record</div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{bookings.length} booking{bookings.length !== 1 ? 's' : ''} on record</div>
+                    {bookings.length > 0 && (
+                      <button
+                        onClick={() => handleReprintClick()}
+                        style={{
+                          background: 'rgba(56,189,248,0.08)',
+                          border: '1px solid rgba(56,189,248,0.25)',
+                          color: '#38bdf8',
+                          borderRadius: '5px',
+                          padding: '4px 10px',
+                          fontSize: '0.72rem',
+                          fontWeight: 700,
+                          cursor: 'pointer',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '5px'
+                        }}
+                      >
+                        🖨 Reprint Bill
+                      </button>
+                    )}
+                  </div>
                   {bookings.length === 0 ? <EmptyState icon="📭" msg="No booking history found" /> : (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                       {bookings.map(b => (
@@ -327,6 +461,25 @@ function GuestDrawer({ guest, token, onClose }) {
                             <div style={{ textAlign: 'right', flexShrink: 0 }}>
                               <StatusBadge status={b.booking_status} />
                               <div style={{ fontSize: '0.82rem', fontWeight: 700, color: '#fff', marginTop: '5px' }}>₹{Number(b.total_amount || 0).toLocaleString('en-IN')}</div>
+                              <button
+                                onClick={() => handleReprintClick(b)}
+                                style={{
+                                  background: 'rgba(56,189,248,0.1)',
+                                  border: '1px solid rgba(56,189,248,0.3)',
+                                  color: '#38bdf8',
+                                  borderRadius: '4px',
+                                  padding: '3px 8px',
+                                  fontSize: '0.68rem',
+                                  fontWeight: 700,
+                                  cursor: 'pointer',
+                                  marginTop: '6px',
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '4px'
+                                }}
+                              >
+                                🖨 Reprint
+                              </button>
                             </div>
                           </div>
                         </div>
@@ -339,7 +492,7 @@ function GuestDrawer({ guest, token, onClose }) {
               {/* PAYMENTS TAB (BILLING) */}
               {tab === 'payments' && (
                 <div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '10px', marginBottom: '20px' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '10px', marginBottom: '16px' }}>
                     <div style={{ background: 'rgba(255,255,255,0.03)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.06)' }}>
                       <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Total Charges</div>
                       <div style={{ fontSize: '1.1rem', fontWeight: 800, color: '#e2e8f0' }}>₹{Number(lifetimeSpend).toLocaleString('en-IN')}</div>
@@ -353,7 +506,31 @@ function GuestDrawer({ guest, token, onClose }) {
                       <div style={{ fontSize: '1.1rem', fontWeight: 800, color: '#f87171' }}>₹{Number(lifetimeSpend - payments.reduce((s, p) => s + Number(p.amount || 0), 0)).toLocaleString('en-IN')}</div>
                     </div>
                   </div>
-                  <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '12px' }}>{payments.length} payment record{payments.length !== 1 ? 's' : ''}</div>
+
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{payments.length} payment record{payments.length !== 1 ? 's' : ''}</div>
+                    {bookings.length > 0 && (
+                      <button
+                        onClick={() => handleReprintClick()}
+                        style={{
+                          background: 'rgba(56,189,248,0.12)',
+                          border: '1px solid rgba(56,189,248,0.35)',
+                          color: '#38bdf8',
+                          borderRadius: '6px',
+                          padding: '5px 12px',
+                          fontSize: '0.74rem',
+                          fontWeight: 700,
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '5px'
+                        }}
+                      >
+                        🖨 Reprint Master Bill
+                      </button>
+                    )}
+                  </div>
+
                   {payments.length === 0 ? <EmptyState icon="💳" msg="No payment records found" /> : (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                       {payments.map(p => {
@@ -384,6 +561,24 @@ function GuestDrawer({ guest, token, onClose }) {
           )}
         </div>
       </div>
+
+      {/* Booking Selector Modal for Multiple Stays */}
+      <BookingPickerModal
+        isOpen={showBookingPicker}
+        onClose={() => setShowBookingPicker(false)}
+        bookings={bookings}
+        guestName={guest.full_name}
+        onSelectBooking={bId => setSelectedBookingForBill(bId)}
+      />
+
+      {/* Authoritative Master Bill & Invoice Modal */}
+      {selectedBookingForBill && (
+        <MasterBillModal
+          isOpen={Boolean(selectedBookingForBill)}
+          onClose={() => setSelectedBookingForBill(null)}
+          bookingId={selectedBookingForBill}
+        />
+      )}
     </>
   );
 }

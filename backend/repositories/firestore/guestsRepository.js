@@ -26,8 +26,29 @@ function isStaleUpdate(existingDoc, incomingData) {
 
 export async function getGuestByIdFirestore(guestId, options = {}) {
   if (!guestId) return null;
-  const docId = String(guestId).startsWith('guest_') ? String(guestId) : formatGuestId(guestId);
-  return await getDoc(COLLECTION, docId, options);
+  const strId = String(guestId).trim();
+  const docId = strId.startsWith('guest_') ? strId : formatGuestId(strId);
+  const byDoc = await getDoc(COLLECTION, docId, options);
+  if (byDoc) return byDoc;
+
+  if (docId !== strId) {
+    const byDirect = await getDoc(COLLECTION, strId, options);
+    if (byDirect) return byDirect;
+  }
+
+  const byPhone = await getGuestByPhoneFirestore(strId, options);
+  if (byPhone) return byPhone;
+
+  if (!isNaN(Number(strId))) {
+    const byMysql = await listDocs(COLLECTION, {
+      filters: [{ field: 'mysql_guest_id', op: '==', value: Number(strId) }],
+      limit: 1,
+      transaction: options.transaction
+    });
+    if (byMysql && byMysql.length > 0) return byMysql[0];
+  }
+
+  return null;
 }
 
 export async function getGuestByUidFirestore(uid, options = {}) {

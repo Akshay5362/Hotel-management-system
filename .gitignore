@@ -75,3 +75,13 @@ node_modules/
 .env
 /backups/
 scratch/
+
+# ========================
+# Local Backup & Scratch Tests
+# ========================
+backend/test-data-cleanup-backup/
+backend/tests/scratch*.mjs
+backend/tests/*.txt
+backend/tests/output/
+*_backup.json
+
