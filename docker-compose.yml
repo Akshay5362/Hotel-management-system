@@ -1,23 +1,4 @@
-
 services:
-  db:
-    image: mysql:8.0
-    container_name: hotel_pms_db
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-Akshu@5362}
-      MYSQL_DATABASE: ${DB_NAME:-hotel_pms}
-    ports:
-      - "3307:3306"
-    volumes:
-      - mysql_data:/var/lib/mysql
-    healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$${MYSQL_ROOT_PASSWORD} || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
-
   backend:
     build:
       context: .
@@ -26,17 +7,11 @@ services:
     restart: unless-stopped
     env_file:
       - ./backend/.env
-    environment:
-      - DB_HOST=db
-      - DB_PORT=3306
     ports:
       - "5000:5000"
     volumes:
       - ./backend:/app
       - guest_documents:/app/guest-documents
-    depends_on:
-      db:
-        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:5000/api/health || exit 1"]
       interval: 10s
@@ -44,21 +19,6 @@ services:
       retries: 3
       start_period: 15s
 
-  phpmyadmin:
-    image: phpmyadmin:latest
-    container_name: hotel_pms_phpmyadmin
-    restart: unless-stopped
-    environment:
-      PMA_HOST: db
-      PMA_PORT: 3306
-    ports:
-      - "8080:80"
-    depends_on:
-      - db
-
 volumes:
-  mysql_data:
-    driver: local
   guest_documents:
     driver: local
-    

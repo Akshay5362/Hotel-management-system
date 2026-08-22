@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+import { API_URL } from '../config/apiConfig.js';
 
 /**
  * LedgerPanel — displays the live ledger for an occupied room.
