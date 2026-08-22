@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { getDefaultExpectedCheckoutInput } from '../utils/dateFormatter';
+import StateSelect from './StateSelect';
 
 export default function CheckInModal({ isOpen, onClose, room, onCheckIn, showAlert }) {
   // Guest Information (Mandatory)
@@ -323,10 +324,21 @@ export default function CheckInModal({ isOpen, onClose, room, onCheckIn, showAle
               </div>
               <div>
                 <label style={labelStyle}>State <span style={reqStar}>*</span></label>
-                <input
-                  style={errors.state ? errInpStyle : inpStyle}
-                  type="text" placeholder="e.g. Maharashtra"
-                  value={state} onChange={e => setState(e.target.value)}
+                <StateSelect
+                  value={state}
+                  onChange={(val) => {
+                    setState(val);
+                    if (errors.state) {
+                      setErrors(prev => {
+                        const copy = { ...prev };
+                        delete copy.state;
+                        return copy;
+                      });
+                    }
+                  }}
+                  hasError={Boolean(errors.state)}
+                  placeholder="Select State / UT"
+                  required
                 />
                 {errors.state && <span style={errText}>{errors.state}</span>}
               </div>

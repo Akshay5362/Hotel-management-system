@@ -953,19 +953,85 @@ export const modifyCheckIn = async (req, res) => {
     checkInDate, 
     expectedCheckOutDate,
     address,
+    state,
     gst_no,
     pincode,
     country,
     arrival_from,
     departure_to,
     billing_instruction,
-    meal_plan
+    meal_plan,
+    gender,
+    dob,
+    dateOfBirth
   } = req.body;
 
   if (!number) {
     return res.status(400).json({ error: 'Room number is required' });
   }
 
+  const guestNameUpper = guestName ? guestName.trim().toUpperCase() : '';
+  const ALLOWED_BILLING = ['Direct to Guest', 'Bill to Company', 'Room Tariff Only'];
+  const ALLOWED_MEAL    = ['EP', 'CP', 'MAP', 'AP'];
+  const resolvedBilling  = billing_instruction && ALLOWED_BILLING.includes(billing_instruction)
+    ? billing_instruction
+    : 'Direct to Guest';
+  const resolvedMealPlan = meal_plan && ALLOWED_MEAL.includes(meal_plan)
+    ? meal_plan
+    : 'EP';
+
+  // 1. Update Firestore
+  if (db) {
+    try {
+      const roomDocSnap = await db.collection('rooms').doc(`room_${number}`).get();
+      if (roomDocSnap.exists && roomDocSnap.data().current_booking_id) {
+        const fsBkgRef = db.collection('bookings').doc(roomDocSnap.data().current_booking_id);
+        const fsBkgSnap = await fsBkgRef.get();
+        if (fsBkgSnap.exists) {
+          const fsBkgData = fsBkgSnap.data();
+          const updateBkg = {
+            updated_at: new Date().toISOString()
+          };
+          if (guestNameUpper) updateBkg.guest_name = guestNameUpper;
+          if (phone) updateBkg.phone = phone;
+          if (address !== undefined) updateBkg.address = address;
+          if (state !== undefined) updateBkg.state = state;
+          if (pincode !== undefined) updateBkg.pincode = pincode;
+          if (country !== undefined) updateBkg.country = country;
+          if (gst_no !== undefined) updateBkg.gst_no = gst_no;
+          if (checkInDate) updateBkg.check_in_date = checkInDate;
+          if (expectedCheckOutDate) updateBkg.expected_check_out_date = expectedCheckOutDate;
+          if (pax) { updateBkg.adults = Number(pax); updateBkg.pax = Number(pax); }
+          if (deposit !== undefined) updateBkg.advance_amount = Number(deposit);
+          if (billing_instruction) updateBkg.billing_instruction = resolvedBilling;
+          if (meal_plan) updateBkg.meal_plan = resolvedMealPlan;
+          if (gender !== undefined) updateBkg.gender = gender;
+          if (dob || dateOfBirth) updateBkg.date_of_birth = dob || dateOfBirth;
+
+          await fsBkgRef.update(updateBkg);
+
+          if (fsBkgData.guest_id) {
+            const fsGuestRef = db.collection('guests').doc(fsBkgData.guest_id);
+            const updateGuest = { updated_at: new Date().toISOString() };
+            if (guestNameUpper) updateGuest.full_name = guestNameUpper;
+            if (phone) updateGuest.phone = phone;
+            if (address !== undefined) updateGuest.address = address;
+            if (state !== undefined) updateGuest.state = state;
+            if (pincode !== undefined) updateGuest.pincode = pincode;
+            if (country !== undefined) updateGuest.country = country;
+            if (gst_no !== undefined) updateGuest.gst_no = gst_no;
+            if (gender !== undefined) updateGuest.gender = gender;
+            if (dob || dateOfBirth) updateGuest.date_of_birth = dob || dateOfBirth;
+            await fsGuestRef.update(updateGuest).catch(() => {});
+          }
+        }
+      }
+    } catch (fsErr) {
+      console.warn('[modifyCheckIn] Firestore update warning:', fsErr.message);
+    }
+  }
+
+  // 2. MySQL dual-write
   let connection;
   try {
     connection = await pool.getConnection();
@@ -974,99 +1040,76 @@ export const modifyCheckIn = async (req, res) => {
     const [roomRows] = await connection.query(`
       SELECT id, status FROM rooms WHERE number = ? FOR UPDATE
     `, [number]);
-    if (roomRows.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ error: `Room ${number} not found` });
-    }
-    const room = roomRows[0];
+    if (roomRows.length > 0) {
+      const room = roomRows[0];
+      const [bookingRows] = await connection.query(`
+        SELECT * FROM bookings 
+        WHERE room_id = ? AND booking_status IN ('Checked In', 'Reserved')
+        ORDER BY id DESC LIMIT 1 FOR UPDATE
+      `, [room.id]);
 
-    const [bookingRows] = await connection.query(`
-      SELECT * FROM bookings 
-      WHERE room_id = ? AND booking_status IN ('Checked In', 'Reserved')
-      ORDER BY id DESC LIMIT 1 FOR UPDATE
-    `, [room.id]);
+      if (bookingRows.length > 0) {
+        const booking = bookingRows[0];
+        if (guestNameUpper) {
+          await connection.query(`
+            UPDATE guests 
+            SET full_name = ?, phone = ?, address = ?, gst_no = ?, pincode = ?, country = ?, arrival_from = ?, departure_to = ?
+            WHERE id = ?
+          `, [
+            guestNameUpper, 
+            phone || '', 
+            address || '', 
+            gst_no || '', 
+            pincode || '', 
+            country || '', 
+            arrival_from || '', 
+            departure_to || '', 
+            booking.guest_id
+          ]);
+        }
 
-    if (bookingRows.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ error: `No active booking found for Room ${number}` });
-    }
-    const booking = bookingRows[0];
+        const parsedPax = pax ? parseInt(pax, 10) : booking.adults;
+        const parsedDeposit = deposit !== undefined ? parseInt(deposit, 10) : booking.advance_amount;
 
-    const guestNameUpper = guestName ? guestName.trim().toUpperCase() : '';
-    if (guestNameUpper) {
-      await connection.query(`
-        UPDATE guests 
-        SET full_name = ?, phone = ?, address = ?, gst_no = ?, pincode = ?, country = ?, arrival_from = ?, departure_to = ?
-        WHERE id = ?
-      `, [
-        guestNameUpper, 
-        phone || '', 
-        address || '', 
-        gst_no || '', 
-        pincode || '', 
-        country || '', 
-        arrival_from || '', 
-        departure_to || '', 
-        booking.guest_id
-      ]);
-    }
+        await connection.query(`
+          UPDATE bookings 
+          SET check_in_date = ?, expected_check_out_date = ?, adults = ?, advance_amount = ?,
+              billing_instruction = ?, meal_plan = ?
+          WHERE id = ?
+        `, [
+          checkInDate || booking.check_in_date, 
+          expectedCheckOutDate || booking.expected_check_out_date || '',
+          parsedPax, 
+          parsedDeposit,
+          resolvedBilling,
+          resolvedMealPlan,
+          booking.id
+        ]);
 
+        const resolvedUserId = req.user?.id || null;
+        const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
+        const systemDate = settings[0]?.value_val || '11-Jul-2026';
 
-    const parsedPax = pax ? parseInt(pax, 10) : booking.adults;
-    const parsedDeposit = deposit !== undefined ? parseInt(deposit, 10) : booking.advance_amount;
-
-    // Allowed values for optional fields
-    const ALLOWED_BILLING = ['Direct to Guest', 'Bill to Company', 'Room Tariff Only'];
-    const ALLOWED_MEAL    = ['EP', 'CP', 'MAP', 'AP'];
-    const resolvedBilling  = billing_instruction && ALLOWED_BILLING.includes(billing_instruction)
-      ? billing_instruction
-      : booking.billing_instruction || 'Direct to Guest';
-    const resolvedMealPlan = meal_plan && ALLOWED_MEAL.includes(meal_plan)
-      ? meal_plan
-      : booking.meal_plan || 'EP';
-
-    await connection.query(`
-      UPDATE bookings 
-      SET check_in_date = ?, expected_check_out_date = ?, adults = ?, advance_amount = ?,
-          billing_instruction = ?, meal_plan = ?
-      WHERE id = ?
-    `, [
-      checkInDate || booking.check_in_date, 
-      expectedCheckOutDate || booking.expected_check_out_date || '',
-      parsedPax, 
-      parsedDeposit,
-      resolvedBilling,
-      resolvedMealPlan,
-      booking.id
-    ]);
-
-    const resolvedUserId = req.user?.id || null;
-    const [settings] = await connection.query('SELECT value_val FROM system_settings WHERE key_name = ?', ['system_date']);
-    const systemDate = settings[0]?.value_val || '11-Jul-2026';
-
-    await connection.query(
-      `INSERT INTO audit_logs (user_id, action, details, business_date)
-       VALUES (?, 'MODIFY_CHECKIN', ?, ?)`,
-      [resolvedUserId, `Modified check-in details for Room ${number}. Booking ID: ${booking.id}`, systemDate]
-    );
-
-    await connection.commit();
-    res.json({ message: `Successfully modified check-in details for Room ${number}` });
-  } catch (error) {
-    if (connection) {
-      try {
-        await connection.rollback();
-      } catch (rollbackError) {
-        console.error('Rollback failed:', rollbackError);
+        await connection.query(
+          `INSERT INTO audit_logs (user_id, action, details, business_date)
+           VALUES (?, 'MODIFY_CHECKIN', ?, ?)`,
+          [resolvedUserId, `Modified check-in details for Room ${number}. Booking ID: ${booking.id}`, systemDate]
+        );
       }
     }
-    console.error('Error in modifyCheckIn controller:', error);
-    res.status(500).json({ error: 'Internal Server Error' });
+    await connection.commit();
+  } catch (sqlErr) {
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
+    console.warn('[modifyCheckIn] MySQL update warning:', sqlErr.message);
   } finally {
     if (connection) {
       connection.release();
     }
   }
+
+  return res.json({ message: `Successfully modified check-in details for Room ${number}` });
 };
 
 // ─────────────────────────────────────────────────────────────

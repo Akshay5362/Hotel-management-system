@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import StateSelect from './StateSelect';
 
 function parseDisplayDate(dateStr) {
   if (!dateStr) return '';
@@ -29,6 +30,7 @@ export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, sh
   const [checkInDate, setCheckInDate] = useState('');
   const [expectedCheckOutDate, setExpectedCheckOutDate] = useState('');
   const [address, setAddress] = useState('');
+  const [state, setState] = useState('');
   const [gstNo, setGstNo] = useState('');
   const [pincode, setPincode] = useState('');
   const [country, setCountry] = useState('');
@@ -49,6 +51,7 @@ export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, sh
       setCheckInDate(parseDisplayDate(room.checkInDate || ''));
       setExpectedCheckOutDate(parseDisplayDate(room.expectedCheckOutDate || ''));
       setAddress(room.address || '');
+      setState(room.state || room.guestState || room.guest_state || '');
       setGstNo(room.gst_no || room.gstNo || '');
       setPincode(room.pincode || '');
       setCountry(room.country || '');
@@ -90,6 +93,7 @@ export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, sh
       checkInDate,
       expectedCheckOutDate,
       address,
+      state: state || '',
       gst_no: gstNo,
       gstNo: gstNo,
       pincode,
@@ -243,21 +247,32 @@ export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, sh
 
             <div className="form-row">
               <div className="form-group">
-                <label>Pincode</label>
-                <input 
-                  type="text" 
-                  placeholder="e.g. 110001"
-                  value={pincode}
-                  onChange={(e) => setPincode(e.target.value)}
-                />
-              </div>
-              <div className="form-group">
                 <label>Country</label>
                 <input 
                   type="text" 
                   placeholder="e.g. India"
                   value={country}
                   onChange={(e) => setCountry(e.target.value)}
+                />
+              </div>
+              <div className="form-group">
+                <label>State</label>
+                <StateSelect
+                  value={state}
+                  onChange={(val) => setState(val)}
+                  placeholder="Select State / UT"
+                />
+              </div>
+            </div>
+
+            <div className="form-row">
+              <div className="form-group">
+                <label>Pincode</label>
+                <input 
+                  type="text" 
+                  placeholder="e.g. 110001"
+                  value={pincode}
+                  onChange={(e) => setPincode(e.target.value)}
                 />
               </div>
             </div>

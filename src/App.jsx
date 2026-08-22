@@ -818,6 +818,7 @@ function AppContent() {
       checkInDate: res.checkInDate,
       expectedCheckOutDate: res.expectedCheckOutDate,
       address: res.address || '',
+      state: res.state || '',
       gst_no: res.gst_no || '',
       pincode: res.pincode || '',
       country: res.country || '',
