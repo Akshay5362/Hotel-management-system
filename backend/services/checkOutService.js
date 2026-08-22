@@ -1,17 +1,5 @@
 import { BusinessDateService } from './businessDateService.js';
-import { CheckoutRecoveryService } from './CheckoutRecoveryService.js';
 import { formatTime } from '../utils/dateUtils.js';
-import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
-import { enqueue } from './outboxService.js';
-import {
-  createCompoundEventBuilder,
-  formatBookingId,
-  formatRoomId,
-  formatPaymentId,
-  formatCashLogId,
-  formatHistoryId,
-  formatInvoiceId
-} from './compoundEventBuilder.js';
 
 export const processCheckOut = async (connection, {
   number,
@@ -105,18 +93,22 @@ export const processCheckOut = async (connection, {
     [invoiceNumber, activeBooking.id, totalCollected, totalCollected, businessDate]
   );
 
+  const resolvedUserIdNum = (resolvedUserId && Number.isInteger(Number(resolvedUserId)) && Number(resolvedUserId) > 0)
+    ? Number(resolvedUserId)
+    : null;
+
   // Update Room Status History
   await connection.query(
     `INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date)
      VALUES (?, 'occupied', 'dirty', ?, ?)`,
-    [room.id, resolvedUserId, businessDate]
+    [room.id, resolvedUserIdNum, businessDate]
   );
 
   // Insert Audit Log entry
   await connection.query(
     `INSERT INTO audit_logs (user_id, action, details, business_date)
      VALUES (?, 'CHECK_OUT', ?, ?)`,
-    [resolvedUserId, `Checked out Room ${number}. Booking ID: ${activeBooking.id}. Balance paid: ₹${parsedBalancePaid}`, businessDate]
+    [resolvedUserIdNum, `Checked out Room ${number}. Booking ID: ${activeBooking.id}. Balance paid: ₹${parsedBalancePaid}`, businessDate]
   );
 
   // Update room status to dirty and housekeeping to Dirty (High Priority)
@@ -129,7 +121,7 @@ export const processCheckOut = async (connection, {
   const [historyResult] = await connection.query(
     `INSERT INTO booking_history (booking_id, action, old_room_id, new_room_id, changed_by, business_date, notes)
      VALUES (?, 'CHECKED_OUT', ?, ?, ?, ?, ?)`,
-    [activeBooking.id, room.id, room.id, resolvedUserId, businessDate,
+    [activeBooking.id, room.id, room.id, resolvedUserIdNum, businessDate,
      `Checkout settled. Total collected: ₹${totalCollected}. Payment status: Paid.`]
   );
   historyMysqlId = historyResult.insertId;
@@ -160,243 +152,6 @@ export const processCheckOut = async (connection, {
     "SELECT value_val FROM system_settings WHERE key_name = 'today_checkouts'"
   );
   const todayCheckoutsAbsolute = Number(checkoutCounterRow.value_val);
-
-  // ── Phase 1: Snapshot capture (immediately before commit) ─────────────────
-  // Stores an immutable copy of all checkout state for future Undo support.
-  // A snapshot failure is caught inside createSnapshot() — checkout proceeds.
-  const [ledgerItemsForSnapshot] = await connection.query(
-    'SELECT * FROM ledger_items WHERE booking_id = ? ORDER BY id ASC',
-    [activeBooking.id]
-  );
-
-  // ── Phase 4E-B4: Compound Outbox Event ──────────────────────────────────────
-  if (isFirestoreDualWriteEnabled()) {
-    const eventOccurredAt = new Date().toISOString();
-    const bkgDocId = formatBookingId(activeBooking.booking_number);
-    const roomDocId = formatRoomId(room.number);
-    const invoiceDocId = formatInvoiceId(invoiceNumber);
-    const historyDocId = formatHistoryId(historyMysqlId);
-
-    const builder = createCompoundEventBuilder({
-      event_type:     'COMPOUND_CHECK_OUT',
-      aggregate_type: 'BOOKING',
-      aggregate_id:   activeBooking.booking_number,
-      operation_id:   `op_checkout_${activeBooking.booking_number}_${activeBooking.id}`,
-      occurred_at:    eventOccurredAt,
-      business_date:  businessDate
-    });
-
-    // 1. Booking document (root)
-    builder.addRootWrite({
-      collection:  'bookings',
-      document_id: bkgDocId,
-      operation:   'set_merge',
-      data: {
-        booking_status: 'Checked Out',
-        payment_status: 'Paid',
-        total_amount:   totalCollected,
-        check_out_date: businessDate,
-        updated_at:     eventOccurredAt
-      }
-    });
-
-    // 2. Room document (root)
-    builder.addRootWrite({
-      collection:  'rooms',
-      document_id: roomDocId,
-      operation:   'set_merge',
-      data: {
-        status:              'dirty',
-        housekeeping_status: 'Dirty',
-        housekeeping_priority: 'High Priority',
-        updated_at:          eventOccurredAt
-      }
-    });
-
-    // 3. Invoice document (root)
-    builder.addRootWrite({
-      collection:  'invoices',
-      document_id: invoiceDocId,
-      operation:   'set_merge',
-      data: {
-        invoice_number: invoiceNumber,
-        booking_id:     bkgDocId,
-        mysql_booking_id: activeBooking.id,
-        total_amount:   totalCollected,
-        paid_amount:    totalCollected,
-        balance_due:    0,
-        status:         'Paid',
-        invoice_status: 'Paid',
-        business_date:  businessDate,
-        updated_at:     eventOccurredAt
-      }
-    });
-
-    // 4+5. Booking History (dual write)
-    const historyData = {
-      history_id:       historyDocId,
-      booking_id:       bkgDocId,
-      mysql_booking_id: activeBooking.id,
-      action:           'CHECKED_OUT',
-      details:          `Checkout settled. Total collected: ₹${totalCollected}. Payment status: Paid.`,
-      changed_by:       resolvedUserId ? String(resolvedUserId) : null,
-      mysql_changed_by: resolvedUserId || null,
-      business_date:    businessDate,
-      mysql_history_id: historyMysqlId,
-      created_at:       eventOccurredAt
-    };
-    builder.addDualWrite({
-      rootCollection:   'booking_history',
-      document_id:       historyDocId,
-      parentCollection:  'bookings',
-      parent_id:         bkgDocId,
-      subcollection:     'history',
-      operation:         'set_merge',
-      data:              historyData
-    });
-
-    // 6. Payment (dual write, conditional)
-    if (parsedBalancePaid !== 0) {
-      const paymentDocId = formatPaymentId(paymentMysqlId);
-      const paymentData = {
-        payment_id:       paymentDocId,
-        booking_id:       bkgDocId,
-        mysql_booking_id: activeBooking.id,
-        amount:           Math.abs(parsedBalancePaid),
-        payment_method:   'Cash',
-        payment_status:   'Completed',
-        payment_type:     parsedBalancePaid > 0 ? 'Checkout Settlement' : 'Checkout Refund',
-        business_date:    businessDate,
-        mysql_payment_id: paymentMysqlId,
-        created_at:       eventOccurredAt
-      };
-      builder.addDualWrite({
-        rootCollection:   'payments',
-        document_id:       paymentDocId,
-        parentCollection:  'bookings',
-        parent_id:         bkgDocId,
-        subcollection:     'payments',
-        operation:         'set_merge',
-        data:              paymentData
-      });
-
-      // 7. Cash Log (root only, conditional)
-      const cashLogDocId = formatCashLogId(cashLogMysqlId);
-      builder.addRootWrite({
-        collection:  'cash_logs',
-        document_id: cashLogDocId,
-        operation:   'set_merge',
-        data: {
-          log_id:           cashLogDocId,
-          amount:           Math.abs(parsedBalancePaid),
-          type:             parsedBalancePaid > 0 ? 'Checkout Settlement' : 'Checkout Refund',
-          category:         'Room Payment',
-          description:      `Checkout for ${number} — ${activeBooking.guestName}`,
-          booking_id:       bkgDocId,
-          mysql_booking_id: activeBooking.id,
-          business_date:    businessDate,
-          mysql_cash_log_id: cashLogMysqlId,
-          created_at:       eventOccurredAt
-        }
-      });
-    }
-
-    // 8. Settings Counter
-    builder.addRootWrite({
-      collection:  'settings',
-      document_id: 'system_date',
-      operation:   'set_merge',
-      data: {
-        today_checkouts: todayCheckoutsAbsolute
-      }
-    });
-
-    // 9. Checkout Snapshot (root only)
-    const snapshotDocId = `snap_${bkgDocId}`;
-    const bookingSnapshot = {
-      ...activeBooking,
-      _snapshotVersion: 1,
-      _capturedAt: eventOccurredAt,
-      _totalCollected: totalCollected,
-      _businessDate: businessDate,
-    };
-    const roomSnapshot = {
-      ...room,
-      _snapshotVersion: 1,
-      _capturedAt: eventOccurredAt,
-    };
-    const invoiceSnapshot = {
-      invoice_number: invoiceNumber,
-      booking_id: activeBooking.id,
-      total_amount: totalCollected,
-      paid_amount: totalCollected,
-      balance_due: 0,
-      status: 'Paid',
-      business_date: businessDate,
-      _snapshotVersion: 1,
-      _capturedAt: eventOccurredAt,
-    };
-    const ledgerSnapshot = {
-      items: ledgerItemsForSnapshot,
-      _snapshotVersion: 1,
-      _capturedAt: eventOccurredAt,
-      _count: ledgerItemsForSnapshot.length,
-    };
-    const paymentSnapshot = paymentMysqlId ? {
-      id: paymentMysqlId,
-      booking_id: activeBooking.id,
-      amount: Math.abs(parsedBalancePaid),
-      payment_method: 'Cash',
-      payment_type: parsedBalancePaid > 0 ? 'Checkout Settlement' : 'Checkout Refund',
-      business_date: businessDate,
-      _snapshotVersion: 1,
-      _capturedAt: eventOccurredAt,
-    } : { _snapshotVersion: 1, _capturedAt: eventOccurredAt };
-
-    const snapshotData = JSON.stringify({
-      bookingSnapshot: JSON.stringify(bookingSnapshot),
-      roomSnapshot: JSON.stringify(roomSnapshot),
-      invoiceSnapshot: JSON.stringify(invoiceSnapshot),
-      ledgerSnapshot: JSON.stringify(ledgerSnapshot),
-      paymentSnapshot: JSON.stringify(paymentSnapshot)
-    });
-
-    builder.addRootWrite({
-      collection:  'checkout_snapshots',
-      document_id: snapshotDocId,
-      operation:   'set_merge',
-      data: {
-        snapshot_id:      snapshotDocId,
-        booking_id:       bkgDocId,
-        mysql_booking_id: activeBooking.id,
-        snapshot_data:    snapshotData,
-        created_at:       eventOccurredAt
-      }
-    });
-
-    const compoundPayload = builder.build();
-
-    await enqueue(connection, {
-      event_type:     compoundPayload.event_type,
-      aggregate_type: compoundPayload.aggregate_type,
-      aggregate_id:   compoundPayload.aggregate_id,
-      payload:        compoundPayload
-    });
-
-    console.log(`[checkOutService] Compound outbox event enqueued: ${compoundPayload.operation_id} (${compoundPayload.writes.length} writes)`);
-  }
-
-  await CheckoutRecoveryService.createSnapshot(connection, {
-    bookingId:      activeBooking.id,
-    roomId:         room.id,
-    guestId:        activeBooking.guest_id,
-    userId:         resolvedUserId,
-    room,
-    booking:        activeBooking,
-    ledgerItems:    ledgerItemsForSnapshot,
-    totalCollected,
-    businessDate,
-  });
 
   return { 
     bookingId: activeBooking.id, 

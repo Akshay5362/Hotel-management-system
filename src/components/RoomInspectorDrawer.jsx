@@ -1,6 +1,8 @@
 import React from 'react';
+import LedgerPanel from './LedgerPanel';
+import { formatDateOnly, formatExpectedCheckout } from '../utils/dateFormatter';
 
-export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInClick, onCheckOutClick, onRoomStatusChange }) {
+export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInClick, onCheckOutClick, onRoomStatusChange, token }) {
   if (!selectedRoom) return null;
 
   const isActive = selectedRoom.is_active !== false && selectedRoom.is_active !== 0 && selectedRoom.is_active !== '0';
@@ -43,7 +45,7 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
                 textTransform: 'uppercase',
                 fontWeight: '700'
               }}>
-                {isActive ? '🟢 ACTIVE' : '🔴 INACTIVE'}
+                {isActive ? 'ACTIVE' : 'INACTIVE'}
               </span>
               <span style={{ 
                 display: 'inline-block',
@@ -56,7 +58,7 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
                 textTransform: 'uppercase',
                 fontWeight: '700'
               }}>
-                {isDirty ? '⚠️ DIRTY' : '🧹 CLEAN'}
+                {isDirty ? 'DIRTY' : 'CLEAN'}
               </span>
             </div>
           </div>
@@ -79,12 +81,12 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
           {/* Occupancy & Guest Details */}
           <div style={{ background: 'rgba(0,0,0,0.2)', padding: '16px', borderRadius: '8px' }}>
             <h3 style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', textTransform: 'uppercase', marginBottom: '12px', borderBottom: '1px solid var(--border-color)', paddingBottom: '6px' }}>
-              Occupancy & Guest Details
+              Occupancy &amp; Guest Details
             </h3>
             {selectedRoom.guestName ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '0.9rem' }}>
                 <div style={{ fontSize: '1.1rem', fontWeight: 'bold', color: 'var(--text-main)' }}>
-                  👤 {selectedRoom.guestName}
+                  {selectedRoom.guestName}
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                   <span style={{ color: 'var(--text-muted)' }}>Phone:</span>
@@ -93,7 +95,31 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
                 {selectedRoom.date_of_birth && (
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                     <span style={{ color: 'var(--text-muted)' }}>Date of Birth:</span>
-                    <span style={{ color: '#a78bfa' }}>🎂 {selectedRoom.date_of_birth}</span>
+                    <span style={{ color: '#a78bfa', fontWeight: 500 }}>{formatDateOnly(selectedRoom.date_of_birth)}</span>
+                  </div>
+                )}
+                {selectedRoom.company_name && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>Company:</span>
+                    <span style={{ fontWeight: 500 }}>{selectedRoom.company_name}</span>
+                  </div>
+                )}
+                {(selectedRoom.gst_no || selectedRoom.gstNo) && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>GST Number:</span>
+                    <span style={{ fontWeight: 500, color: '#38bdf8' }}>{selectedRoom.gst_no || selectedRoom.gstNo}</span>
+                  </div>
+                )}
+                {(selectedRoom.city || selectedRoom.state) && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>Location:</span>
+                    <span>{[selectedRoom.city, selectedRoom.state].filter(Boolean).join(', ')}</span>
+                  </div>
+                )}
+                {selectedRoom.purpose_of_visit && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>Purpose:</span>
+                    <span style={{ color: '#818cf8', fontWeight: 600 }}>{selectedRoom.purpose_of_visit}</span>
                   </div>
                 )}
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -102,11 +128,11 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                   <span style={{ color: 'var(--text-muted)' }}>Check-in Date:</span>
-                  <span style={{ fontWeight: '500' }}>{selectedRoom.checkInDate || 'N/A'}</span>
+                  <span style={{ fontWeight: '500' }}>{formatDateOnly(selectedRoom.checkInDate) || 'N/A'}</span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                   <span style={{ color: 'var(--text-muted)' }}>Expected Check-out:</span>
-                  <span style={{ fontWeight: '500' }}>{selectedRoom.expectedCheckOutDate || 'N/A'}</span>
+                  <span style={{ fontWeight: '500', color: '#38bdf8' }}>{formatExpectedCheckout(selectedRoom.expectedCheckOutDate)}</span>
                 </div>
               </div>
             ) : (
@@ -119,7 +145,7 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
           {/* Tariff & Operational Status */}
           <div style={{ background: 'rgba(0,0,0,0.2)', padding: '16px', borderRadius: '8px' }}>
             <h3 style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', textTransform: 'uppercase', marginBottom: '12px', borderBottom: '1px solid var(--border-color)', paddingBottom: '6px' }}>
-              Tariff & Operational Mode
+              Tariff &amp; Operational Mode
             </h3>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '0.9rem' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -128,27 +154,43 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span style={{ color: 'var(--text-muted)' }}>Base Tariff:</span>
-                <span style={{ fontWeight: '500' }}>₹{selectedRoom.rate || selectedRoom.price || 0}/night</span>
+                <span style={{ fontWeight: '500' }}>&#8377;{selectedRoom.rate || selectedRoom.price || 0}/night</span>
               </div>
+              {selectedRoom.room_tariff && selectedRoom.room_tariff !== selectedRoom.rate && (
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>Booking Tariff:</span>
+                  <span style={{ fontWeight: '700', color: '#f59e0b' }}>&#8377;{selectedRoom.room_tariff}/night</span>
+                </div>
+              )}
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span style={{ color: 'var(--text-muted)' }}>Operational Mode:</span>
                 <span style={{ fontWeight: '700', color: isActive ? '#4ade80' : '#f87171' }}>
-                  {isActive ? '🟢 Active' : '🔴 Inactive'}
+                  {isActive ? 'Active' : 'Inactive'}
                 </span>
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span style={{ color: 'var(--text-muted)' }}>Housekeeping Status:</span>
                 <span style={{ fontWeight: '700', color: isDirty ? '#fbbf24' : '#38bdf8' }}>
-                  {isDirty ? '⚠️ Dirty' : '🧹 Clean'}
+                  {isDirty ? 'Dirty' : 'Clean'}
                 </span>
               </div>
             </div>
           </div>
 
+          {/* Ledger / Folio -- only for occupied rooms */}
+          {isOccupied && token && (
+            <div style={{ background: 'rgba(0,0,0,0.2)', padding: '16px', borderRadius: '8px' }}>
+              <h3 style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', textTransform: 'uppercase', marginBottom: '12px', borderBottom: '1px solid var(--border-color)', paddingBottom: '6px' }}>
+                Folio / Ledger
+              </h3>
+              <LedgerPanel roomNumber={selectedRoom.number} token={token} compact={true} />
+            </div>
+          )}
+
           {/* Operational Controls & Actions */}
           <div style={{ background: 'rgba(0,0,0,0.2)', padding: '16px', borderRadius: '8px', marginTop: 'auto' }}>
             <h3 style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', textTransform: 'uppercase', marginBottom: '12px', borderBottom: '1px solid var(--border-color)', paddingBottom: '6px' }}>
-              Room Controls & Actions
+              Room Controls &amp; Actions
             </h3>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
               {/* Active / Inactive & Clean / Dirty Controls */}
@@ -166,7 +208,7 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
                     fontSize: '0.75rem'
                   }}
                 >
-                  {isActive ? '🚫 Mark Inactive' : '✅ Mark Active'}
+                  {isActive ? 'Mark Inactive' : 'Mark Active'}
                 </button>
 
                 <button 
@@ -182,7 +224,7 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
                     fontSize: '0.75rem'
                   }}
                 >
-                  {isDirty ? '🧹 Mark Clean' : '⚠️ Mark Dirty'}
+                  {isDirty ? 'Mark Clean' : 'Mark Dirty'}
                 </button>
               </div>
 
@@ -216,7 +258,7 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
                   fontWeight: '600',
                   textAlign: 'center'
                 }}>
-                  🔒 Room is inactive and cannot be checked in.
+                  Room is inactive and cannot be checked in.
                 </div>
               )}
             </div>

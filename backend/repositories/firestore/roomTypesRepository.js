@@ -8,12 +8,35 @@ import {
   RepositoryError
 } from './firestoreUtils.js';
 
+import { globalTtlCache } from '../../utils/ttlCache.js';
+
 const COLLECTION = 'room_types';
+
+/**
+ * Invalidate all cached room types immediately upon mutation.
+ */
+export function invalidateRoomTypesCache() {
+  globalTtlCache.deleteByPrefix('room_types_');
+}
 
 export async function getRoomTypeByIdFirestore(typeId, options = {}) {
   if (!typeId) return null;
-  const docId = String(typeId).startsWith('type_') ? String(typeId) : `type_${typeId}`;
-  return await getDoc(COLLECTION, docId, options);
+  const docId = String(typeId).startsWith('type_') ? String(typeId) : `type_${String(typeId).toUpperCase()}`;
+  const direct = await getDoc(COLLECTION, docId, options);
+  if (direct) return direct;
+
+  const codeLookup = await getRoomTypeByCodeFirestore(typeId, options);
+  if (codeLookup) return codeLookup;
+
+  if (!isNaN(Number(typeId))) {
+    const byMySqlId = await listDocs(COLLECTION, {
+      filters: [{ field: 'mysql_room_type_id', op: '==', value: Number(typeId) }],
+      limit: 1,
+      transaction: options.transaction
+    });
+    if (byMySqlId[0]) return byMySqlId[0];
+  }
+  return null;
 }
 
 export async function getRoomTypeByCodeFirestore(code, options = {}) {
@@ -27,14 +50,23 @@ export async function getRoomTypeByCodeFirestore(code, options = {}) {
 }
 
 export async function getAllRoomTypesFirestore(options = {}) {
-  const { filters = [], orderBy = [{ field: 'name', direction: 'asc' }], limit = 50, cursor = null, transaction = null } = options;
-  return await listDocs(COLLECTION, {
-    filters,
-    orderBy,
-    limit,
-    startAfterDoc: cursor,
-    transaction
-  });
+  const { filters = [], orderBy = [{ field: 'name', direction: 'asc' }], limit = 50, cursor = null, transaction = null, skipCache = false } = options;
+
+  if (transaction || cursor || filters.length > 0 || limit !== 50 || skipCache) {
+    return await listDocs(COLLECTION, {
+      filters,
+      orderBy,
+      limit,
+      startAfterDoc: cursor,
+      transaction
+    });
+  }
+
+  return await globalTtlCache.getOrSet(
+    'room_types_all',
+    () => listDocs(COLLECTION, { filters, orderBy, limit, startAfterDoc: cursor, transaction }),
+    600000 // 10 minutes TTL
+  );
 }
 
 export async function createRoomTypeFirestore(typeData, options = {}) {
@@ -59,17 +91,23 @@ export async function createRoomTypeFirestore(typeData, options = {}) {
     created_at: new Date().toISOString()
   };
 
-  return await setDoc(COLLECTION, docId, payload, { ...options, merge: true });
+  const result = await setDoc(COLLECTION, docId, payload, { ...options, merge: true });
+  invalidateRoomTypesCache();
+  return result;
 }
 
 export async function updateRoomTypeFirestore(typeId, typeData, options = {}) {
   if (!typeId) throw new RepositoryError('Room type ID is required for update', 'VALIDATION_ERROR', 400);
   const docId = String(typeId).startsWith('type_') ? String(typeId) : `type_${typeId}`;
-  return await updateDoc(COLLECTION, docId, typeData, options);
+  const result = await updateDoc(COLLECTION, docId, typeData, options);
+  invalidateRoomTypesCache();
+  return result;
 }
 
 export async function deleteRoomTypeFirestore(typeId, options = {}) {
   if (!typeId) throw new RepositoryError('Room type ID is required for deletion', 'VALIDATION_ERROR', 400);
   const docId = String(typeId).startsWith('type_') ? String(typeId) : `type_${typeId}`;
-  return await deleteDoc(COLLECTION, docId, options);
+  const result = await deleteDoc(COLLECTION, docId, options);
+  invalidateRoomTypesCache();
+  return result;
 }

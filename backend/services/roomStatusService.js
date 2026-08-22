@@ -57,6 +57,9 @@ export class RoomStatusService {
         b.booking_status,
         b.billing_instruction,
         b.meal_plan,
+        b.room_tariff,
+        b.payment_mode as bookingPaymentMode,
+        b.purpose_of_visit,
         g.full_name as guestName,
         g.phone,
         g.address,
@@ -66,6 +69,9 @@ export class RoomStatusService {
         g.arrival_from,
         g.departure_to,
         g.date_of_birth,
+        g.company_name,
+        g.city,
+        g.state,
         g.user_id
       FROM bookings b
       JOIN guests g ON b.guest_id = g.id
@@ -187,6 +193,13 @@ export class RoomStatusService {
         country: currentBooking ? (currentBooking.country || '') : '',
         arrival_from: currentBooking ? (currentBooking.arrival_from || '') : '',
         departure_to: currentBooking ? (currentBooking.departure_to || '') : '',
+        // ── New fields (Phase C) ─────────────────────────────────────────────────
+        room_tariff:     currentBooking ? (currentBooking.room_tariff || r.rate) : r.rate,
+        payment_mode:    currentBooking ? (currentBooking.bookingPaymentMode || null) : null,
+        purpose_of_visit: currentBooking ? (currentBooking.purpose_of_visit || null) : null,
+        company_name:    currentBooking ? (currentBooking.company_name || '') : '',
+        city:            currentBooking ? (currentBooking.city || '') : '',
+        state:           currentBooking ? (currentBooking.state || '') : '',
         user_id: currentBooking ? currentBooking.user_id : null,
         booking_id: currentBooking ? currentBooking.booking_id : null,
         reservation_id: currentReservation ? currentReservation.reservation_id : null,
@@ -216,8 +229,8 @@ export class RoomStatusService {
   }
 
   static async getAvailableRoomsForDateRange(connection, arrivalDate, departureDate, roomType = 'ALL') {
-    const { AvailabilityService } = await import('./AvailabilityService.js');
-    return AvailabilityService.getAvailableRooms(connection, arrivalDate, departureDate, roomType);
+    const { FirestoreAvailabilityService } = await import('./firestoreAvailabilityService.js');
+    return FirestoreAvailabilityService.getAvailableRooms(connection, arrivalDate, departureDate, roomType);
   }
 }
 

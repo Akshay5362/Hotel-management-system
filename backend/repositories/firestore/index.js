@@ -20,3 +20,9 @@ export * from './checkoutSnapshotsRepository.js';
 export * from './razorpayTransactionsRepository.js';
 export * from './usersRepository.js';
 export * from './rbacRepository.js';
+export * from './maintenanceRepository.js';
+export * from './notificationsRepository.js';
+export * from './feedbackRepository.js';
+export * from './stayExtensionRequestsRepository.js';
+export * from './roomStatusHistoryRepository.js';
+

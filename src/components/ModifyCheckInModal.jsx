@@ -21,6 +21,8 @@ function parseDisplayDate(dateStr) {
 
 export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, showAlert }) {
   const [guestName, setGuestName] = useState('');
+  const [dob, setDob] = useState('');
+  const [gender, setGender] = useState('');
   const [phone, setPhone] = useState('');
   const [pax, setPax] = useState('1');
   const [deposit, setDeposit] = useState('0');
@@ -39,13 +41,15 @@ export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, sh
   useEffect(() => {
     if (room && isOpen) {
       setGuestName(room.guestName || '');
+      setDob(room.dob || room.dateOfBirth || room.date_of_birth || '');
+      setGender(room.gender || '');
       setPhone(room.phone || '');
       setPax(String(room.pax || '1'));
       setDeposit(String(room.deposit || '0'));
       setCheckInDate(parseDisplayDate(room.checkInDate || ''));
       setExpectedCheckOutDate(parseDisplayDate(room.expectedCheckOutDate || ''));
       setAddress(room.address || '');
-      setGstNo(room.gst_no || '');
+      setGstNo(room.gst_no || room.gstNo || '');
       setPincode(room.pincode || '');
       setCountry(room.country || '');
       setArrivalFrom(room.arrival_from || '');
@@ -76,6 +80,10 @@ export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, sh
 
     onModify(room.number, {
       guestName: guestName.toUpperCase(),
+      dob: dob || null,
+      dateOfBirth: dob || null,
+      date_of_birth: dob || null,
+      gender: gender || null,
       phone,
       pax: parseInt(pax, 10),
       deposit: parseFloat(deposit) || 0,
@@ -83,6 +91,7 @@ export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, sh
       expectedCheckOutDate,
       address,
       gst_no: gstNo,
+      gstNo: gstNo,
       pincode,
       country,
       arrival_from: arrivalFrom,
@@ -165,6 +174,27 @@ export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, sh
                 />
               </div>
               <div className="form-group">
+                <label>Date of Birth (DOB)</label>
+                <input 
+                  type="date" 
+                  value={dob}
+                  onChange={(e) => setDob(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="form-row">
+              <div className="form-group">
+                <label>Gender (Optional)</label>
+                <select value={gender} onChange={(e) => setGender(e.target.value)}>
+                  <option value="">Select Gender (optional)</option>
+                  <option value="Male">Male</option>
+                  <option value="Female">Female</option>
+                  <option value="Other">Other</option>
+                  <option value="Prefer not to say">Prefer not to say</option>
+                </select>
+              </div>
+              <div className="form-group">
                 <label>Mobile Number</label>
                 <input 
                   type="tel" 
@@ -185,6 +215,9 @@ export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, sh
                   <option value="4">4 Persons</option>
                 </select>
               </div>
+            </div>
+
+            <div className="form-row">
               <div className="form-group">
                 <label>Advance Deposit (₹)</label>
                 <input 
@@ -230,7 +263,7 @@ export default function ModifyCheckInModal({ isOpen, onClose, room, onModify, sh
             </div>
 
             <div className="form-group">
-              <label>GST NO</label>
+              <label>Company GST Number (Optional)</label>
               <input 
                 type="text" 
                 placeholder="e.g. 07AAAAA1111A1Z1"

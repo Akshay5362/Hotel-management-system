@@ -1,55 +1,8 @@
-import db from '../db.js';
-import { db as firestoreDb } from '../config/firebaseAdmin.js';
-import { BusinessDateService } from '../services/businessDateService.js';
-import { enqueue } from '../services/outboxService.js';
-import { isFirestoreDualWriteEnabled, isHousekeepingReadCanaryEnabled } from '../config/featureFlags.js';
-import { executeReadCanary } from '../services/dualReadVerificationService.js';
+import { HousekeepingCutoverService } from '../services/housekeepingCutoverService.js';
 
 export const getHousekeepingRooms = async (req, res) => {
-  const canaryResult = await executeReadCanary({
-    flagCheckFn: isHousekeepingReadCanaryEnabled,
-    endpointName: '/api/housekeeping/rooms',
-    timeoutMs: 1000,
-    fetchFirestoreFn: async () => {
-      const snap = await firestoreDb.collection('rooms').get();
-      return snap.docs.map(doc => ({ ...doc.data(), firestore_id: doc.id }));
-    },
-    validateAndFormatFn: (docs) => {
-      if (!Array.isArray(docs) || docs.length === 0) return null;
-      const formatted = docs.map(r => ({
-        id: r.id || r.mysql_room_id || r.firestore_id,
-        number: String(r.number || ''),
-        type: r.type || 'DELUXE',
-        occupancy_status: r.status || r.occupancy_status || 'VACANT',
-        housekeeping_status: r.housekeeping_status || 'Clean',
-        housekeeping_priority: r.housekeeping_priority || 'Normal',
-        last_cleaned_at: r.last_cleaned_at || null,
-        housekeeping_assigned_to: r.housekeeping_assigned_to || null,
-        assigned_to_name: r.assigned_to_name || null,
-        guest_name: r.guest_name || null
-      }));
-      formatted.sort((a, b) => parseInt(a.number, 10) - parseInt(b.number, 10));
-      return formatted.length >= 1 ? formatted : null;
-    }
-  });
-
-  if (canaryResult) {
-    return res.json(canaryResult);
-  }
-
   try {
-    const query = `
-      SELECT 
-        r.id, r.number, COALESCE(rt.code, 'DELUXE') as type, r.status as occupancy_status,
-        r.housekeeping_status, r.housekeeping_priority, r.last_cleaned_at,
-        r.housekeeping_assigned_to, s.full_name as assigned_to_name,
-        (SELECT full_name FROM guests g JOIN bookings b ON b.guest_id = g.id WHERE b.room_id = r.id AND b.booking_status = 'Checked In' LIMIT 1) as guest_name
-      FROM rooms r
-      LEFT JOIN room_types rt ON r.room_type_id = rt.id
-      LEFT JOIN staff s ON r.housekeeping_assigned_to = s.id
-      ORDER BY CAST(r.number AS UNSIGNED) ASC
-    `;
-    const [rows] = await db.query(query);
+    const rows = await HousekeepingCutoverService.getHousekeepingRooms();
     res.json(rows);
   } catch (error) {
     console.error('Error fetching housekeeping rooms:', error);
@@ -63,65 +16,19 @@ export const assignHousekeeper = async (req, res) => {
   
   if (!roomId) return res.status(400).json({ error: 'Room ID is required' });
 
-  let connection;
   try {
-    connection = await db.getConnection();
-    await connection.beginTransaction();
-
-    const [roomRows] = await connection.query('SELECT number FROM rooms WHERE id = ?', [roomId]);
-    const roomNumber = roomRows.length > 0 ? roomRows[0].number : String(roomId);
-
-    const updateQuery = `
-      UPDATE rooms 
-      SET housekeeping_assigned_to = ?, housekeeping_priority = COALESCE(?, housekeeping_priority)
-      WHERE id = ?
-    `;
-    await connection.query(updateQuery, [userId || null, priority, roomId]);
-
-    let staffName = 'Unassigned';
-    if (userId) {
-      const [uRows] = await connection.query('SELECT fullName as name FROM users WHERE id = ?', [userId]);
-      if (uRows.length > 0) staffName = uRows[0].name;
-    }
-
-    const action = userId ? `Assigned to ${staffName}` : 'Unassigned';
-    const [logResult] = await connection.query(`
-      INSERT INTO housekeeping_logs (room_id, action, performed_by, notes)
-      VALUES (?, ?, ?, ?)
-    `, [roomId, action, performedBy, priority ? `Priority updated to ${priority}` : null]);
-
-    if (isFirestoreDualWriteEnabled()) {
-      await enqueue(connection, {
-        event_type: 'HOUSEKEEPING_LOG_CREATED',
-        aggregate_type: 'HOUSEKEEPING',
-        aggregate_id: String(roomNumber),
-        payload: {
-          room_id: String(roomId),
-          room_number: String(roomNumber),
-          action: action,
-          assigned_to: userId ? String(userId) : null,
-          priority: priority || 'Normal',
-          mysql_housekeeping_id: logResult.insertId,
-          updated_at: new Date().toISOString()
-        }
-      });
-    }
-
-    await connection.commit();
-
-    if (req.io) {
-      req.io.emit('housekeeping_update', { roomId, action, userId, priority });
-    }
-
-    res.json({ success: true, message: 'Assignment updated successfully' });
+    const result = await HousekeepingCutoverService.assignHousekeeper({
+      roomId,
+      userId,
+      priority,
+      performedBy,
+      io: req.io
+    });
+    res.json(result);
   } catch (error) {
-    if (connection) {
-      try { await connection.rollback(); } catch (e) {}
-    }
+    if (error.status === 404) return res.status(404).json({ error: 'Room not found' });
     console.error('Error assigning housekeeper:', error);
     res.status(500).json({ error: 'Failed to assign housekeeper' });
-  } finally {
-    if (connection) connection.release();
   }
 };
 
@@ -131,128 +38,30 @@ export const updateHousekeepingStatus = async (req, res) => {
   
   if (!roomId || !status) return res.status(400).json({ error: 'Room ID and status are required' });
 
-  let connection;
   try {
-    connection = await db.getConnection();
-    await connection.beginTransaction();
-
-    // Fetch current room data — NEVER touch occupancy status (rooms.status), only housekeeping_status
-    const [roomRows] = await connection.query(
-      'SELECT r.number, r.housekeeping_status FROM rooms r WHERE r.id = ?',
-      [roomId]
-    );
-    if (roomRows.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ error: 'Room not found' });
-    }
-    const oldHkStatus = roomRows[0].housekeeping_status;
-    const roomNumber  = roomRows[0].number;
-
-    // Resolve performer's name for the audit trail
-    let performerName = 'System';
-    if (performedBy) {
-      const [userRows] = await connection.query('SELECT fullName as name FROM users WHERE id = ?', [performedBy]);
-      if (userRows.length > 0) performerName = userRows[0].name;
-    }
-
-    // Get business date
-    const businessDate = await BusinessDateService.getBusinessDate(connection);
-
-    // Build update — only housekeeping_status is changed, occupancy status is never touched
-    let updateFields = 'housekeeping_status = ?';
-    const params = [status];
-    
-    if (status === 'Clean' || status === 'Inspected' || status === 'Vacant Ready') {
-      updateFields += ', last_cleaned_at = CURRENT_TIMESTAMP';
-    }
-
-    await connection.query(`UPDATE rooms SET ${updateFields} WHERE id = ?`, [...params, roomId]);
-
-    // Housekeeping action log
-    const [logResult] = await connection.query(`
-      INSERT INTO housekeeping_logs (room_id, action, performed_by, notes)
-      VALUES (?, ?, ?, ?)
-    `, [roomId, `Status changed from ${oldHkStatus} to ${status}`, performedBy, notes || null]);
-
-    // Structured audit log
-    const structuredDetails = JSON.stringify({
-      Room:             roomNumber,
-      Occupancy_Before: 'unchanged',
-      Occupancy_After:  'unchanged',
-      HK_Before:        oldHkStatus,
-      HK_After:         status,
-      User:             performerName,
-      Business_Date:    businessDate
+    const result = await HousekeepingCutoverService.updateHousekeepingStatus({
+      roomId,
+      status,
+      notes,
+      performedBy,
+      io: req.io
     });
-    await connection.query(
-      `INSERT INTO audit_logs (user_id, action, details, business_date)
-       VALUES (?, 'HK_STATUS_CHANGE', ?, ?)`,
-      [performedBy, structuredDetails, businessDate]
-    );
-
-    // Enqueue Transactional Outbox Event if feature flag enabled
-    if (isFirestoreDualWriteEnabled()) {
-      await enqueue(connection, {
-        event_type: 'ROOM_STATUS_CHANGED',
-        aggregate_type: 'ROOM',
-        aggregate_id: String(roomNumber),
-        payload: {
-          number: String(roomNumber),
-          room_number: String(roomNumber),
-          housekeeping_status: status,
-          cleaning_status: status,
-          updated_at: new Date().toISOString()
-        }
-      });
-
-      await enqueue(connection, {
-        event_type: 'HOUSEKEEPING_STATUS_UPDATED',
-        aggregate_type: 'HOUSEKEEPING',
-        aggregate_id: String(roomNumber),
-        payload: {
-          room_id: String(roomId),
-          room_number: String(roomNumber),
-          status: status,
-          notes: notes || null,
-          performed_by: performerName,
-          mysql_housekeeping_id: logResult.insertId,
-          updated_at: new Date().toISOString()
-        }
-      });
-    }
-
-    await connection.commit();
-
-    if (req.io) {
-      req.io.emit('housekeeping_update', { roomId, status });
-    }
-
-    res.json({ success: true, message: 'Status updated successfully' });
+    res.json(result);
   } catch (error) {
-    if (connection) {
-      try { await connection.rollback(); } catch (e) {}
-    }
+    if (error.status === 404) return res.status(404).json({ error: 'Room not found' });
     console.error('Error updating status:', error);
     res.status(500).json({ error: 'Failed to update status' });
-  } finally {
-    if (connection) connection.release();
   }
 };
 
 export const getHousekeepingLogs = async (req, res) => {
   const { roomId } = req.params;
   try {
-    const query = `
-      SELECT h.*, u.name as performed_by_name
-      FROM housekeeping_logs h
-      LEFT JOIN users u ON h.performed_by = u.id
-      WHERE h.room_id = ?
-      ORDER BY h.created_at DESC
-    `;
-    const [rows] = await db.query(query, [roomId]);
+    const rows = await HousekeepingCutoverService.getHousekeepingLogs(roomId);
     res.json(rows);
   } catch (error) {
     console.error('Error fetching housekeeping logs:', error);
     res.status(500).json({ error: 'Failed to fetch logs' });
   }
 };
+

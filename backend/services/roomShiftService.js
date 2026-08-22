@@ -1,13 +1,5 @@
 import pool from '../db.js';
-import { AvailabilityService } from './AvailabilityService.js';
-import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
-import { enqueue } from './outboxService.js';
-import { 
-  createCompoundEventBuilder, 
-  formatBookingId, 
-  formatRoomId, 
-  formatLedgerItemId 
-} from './compoundEventBuilder.js';
+import { FirestoreAvailabilityService } from './firestoreAvailabilityService.js';
 
 /**
  * processRoomShift
@@ -60,8 +52,8 @@ export async function processRoomShift(connection, {
   }
   const booking = bookings[0];
 
-  // Validate target room availability using AvailabilityService
-  const avail = await AvailabilityService.checkRoomAvailability(connection, {
+  // Validate target room availability using FirestoreAvailabilityService
+  const avail = await FirestoreAvailabilityService.checkRoomAvailability(connection, {
     roomId: targetRoom.id,
     roomNumber: toRoomNumber,
     arrivalDate: businessDate,
@@ -107,124 +99,30 @@ export async function processRoomShift(connection, {
   );
   const tariffMysqlId = tariffResult.insertId;
 
+  const resolvedUserIdNum = (resolvedUserId && Number.isInteger(Number(resolvedUserId)) && Number(resolvedUserId) > 0)
+    ? Number(resolvedUserId)
+    : null;
+
   // Log Room Status History for source room
   await connection.query(
     `INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date)
      VALUES (?, 'occupied', 'vacant', ?, ?)`,
-    [sourceRoom.id, resolvedUserId, businessDate]
+    [sourceRoom.id, resolvedUserIdNum, businessDate]
   );
 
   // Log Room Status History for target room
   await connection.query(
     `INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date)
      VALUES (?, 'vacant', 'occupied', ?, ?)`,
-    [targetRoom.id, resolvedUserId, businessDate]
+    [targetRoom.id, resolvedUserIdNum, businessDate]
   );
 
   // Insert Audit Log entry
   await connection.query(
     `INSERT INTO audit_logs (user_id, action, details, business_date)
      VALUES (?, 'SHIFT_ROOM', ?, ?)`,
-    [resolvedUserId, `Shifted guest reservation (Booking ID: ${booking.id}) from Room ${fromRoomNumber} to ${toRoomNumber}`, businessDate]
+    [resolvedUserIdNum, `Shifted guest reservation (Booking ID: ${booking.id}) from Room ${fromRoomNumber} to ${toRoomNumber}`, businessDate]
   );
-
-  // ============================================================
-  // COMPOUND OUTBOX GENERATION (Dual Write)
-  // ============================================================
-  if (isFirestoreDualWriteEnabled()) {
-    // 1. Re-query all affected ledger items for the booking to capture final state and IDs
-    const [affectedLedgers] = await connection.query(
-      'SELECT id, room_number, `desc`, qty, amount, business_date, booking_id FROM ledger_items WHERE booking_id = ?',
-      [booking.id]
-    );
-
-    const bkgDocId = formatBookingId(booking.id);
-    const oldRoomDocId = formatRoomId(fromRoomNumber);
-    const newRoomDocId = formatRoomId(toRoomNumber);
-
-    const builder = createCompoundEventBuilder({
-      event_type: 'COMPOUND_ROOM_SHIFT',
-      aggregate_type: 'BOOKING',
-      aggregate_id: bkgDocId
-    });
-
-    // Write 1: Booking
-    builder.addRootWrite({
-      collection: 'bookings',
-      document_id: bkgDocId,
-      operation: 'set_merge',
-      data: {
-        room_id: targetRoom.id,
-        room_number: toRoomNumber
-      }
-    });
-
-    // Write 2: Old Room
-    builder.addRootWrite({
-      collection: 'rooms',
-      document_id: oldRoomDocId,
-      operation: 'set_merge',
-      data: {
-        status: 'vacant',
-        current_booking_id: '' // Cleared upon shifting out
-      }
-    });
-
-    // Write 3: New Room
-    builder.addRootWrite({
-      collection: 'rooms',
-      document_id: newRoomDocId,
-      operation: 'set_merge',
-      data: {
-        status: 'occupied',
-        current_booking_id: bkgDocId
-      }
-    });
-
-    // Writes 4...N: Ledger Items (Root + Subcollection dual write)
-    for (const ledger of affectedLedgers) {
-      const ledgerDocId = formatLedgerItemId(ledger.id);
-      builder.addDualWrite({
-        rootCollection: 'ledger_items',
-        document_id: ledgerDocId,
-        parentCollection: 'bookings',
-        parent_id: bkgDocId,
-        subcollection: 'ledger_items',
-        operation: 'set_merge',
-        data: {
-          item_id: ledgerDocId,
-          mysql_ledger_id: ledger.id,
-          booking_id: bkgDocId,
-          mysql_booking_id: booking.id,
-          room_number: ledger.room_number,
-          description: ledger.desc,
-          desc: ledger.desc, // schema compat
-          qty: ledger.qty,
-          quantity: ledger.qty, // schema compat
-          amount: ledger.amount,
-          business_date: ledger.business_date
-        }
-      });
-    }
-
-    const payload = builder.build();
-
-    // Batch Size Guard
-    const FIRESTORE_MAX_BATCH_OPS = process.env.FIRESTORE_MAX_BATCH_OPS || 500;
-    if (payload.writes.length > FIRESTORE_MAX_BATCH_OPS) {
-      const error = new Error(`Compound event exceeds maximum batch limit (writes: ${payload.writes.length})`);
-      error.status = 500;
-      throw error; // Safe failure, rolls back MySQL transaction
-    }
-
-    // Enqueue
-    await enqueue(connection, {
-      event_type: payload.event_type,
-      aggregate_type: payload.aggregate_type,
-      aggregate_id: payload.aggregate_id,
-      payload
-    });
-  }
 
   return { booking, targetRoom };
 }

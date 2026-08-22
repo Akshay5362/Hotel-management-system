@@ -30,6 +30,8 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AdminAuthContext } from '../contexts/AdminAuthContext';
 import ReservationModule from './ReservationModule';
+import LedgerPanel from './LedgerPanel';
+import { getDefaultExpectedCheckoutInput, formatDateOnly, formatExpectedCheckout } from '../utils/dateFormatter';
 
 import { API_URL as API, getApiHeaders } from '../config/apiConfig';
 
@@ -102,6 +104,16 @@ const inputStyle = {
   background: 'rgba(0,0,0,0.4)', border: '1px solid rgba(255,255,255,0.12)',
   borderRadius: '8px', color: '#fff', fontSize: '0.88rem', fontFamily: 'inherit',
 };
+const selectStyle = {
+  ...inputStyle,
+  backgroundColor: '#0f172a',
+  color: '#f8fafc',
+  cursor: 'pointer',
+};
+const optionStyle = {
+  backgroundColor: '#0f172a',
+  color: '#f8fafc',
+};
 const labelStyle = { fontSize: '0.75rem', color: 'var(--text-muted)', display: 'block', marginBottom: '5px' };
 
 // ── Modal wrapper ─────────────────────────────────────────────────────────────
@@ -160,11 +172,23 @@ function ConfirmModal({ title, message, onConfirm, onClose, confirmLabel = 'Conf
 
 // ── 1. Quick Check-In / Walk-In Modal ────────────────────────────────────────
 function CheckInModal({ room, rooms, token, onClose, onSuccess, isWalkIn = false, userRole = '' }) {
+  const today = new Date().toISOString().split('T')[0];
   const [form, setForm] = useState({
     guestName: '', phone: '', pax: '1', deposit: '0',
     roomNumber: room?.number || '',
+    checkInDate: today,
+    expectedCheckout: getDefaultExpectedCheckoutInput(today),
     billing_instruction: 'Direct to Guest',
     meal_plan: 'EP',
+    // New Phase E fields
+    dob: '',
+    roomTariff: room ? String(room.rate || '') : '',
+    paymentMode: '',
+    purposeOfVisit: '',
+    companyName: '',
+    gstNo: '',
+    city: '',
+    state: '',
   });
   const [loading, setLoading]         = useState(false);
   const [error, setError]             = useState('');
@@ -194,15 +218,28 @@ function CheckInModal({ room, rooms, token, onClose, onSuccess, isWalkIn = false
     if (!rn) { setError('Room number is required'); return; }
     const selRoom     = rooms.find(r => r.number === rn);
     const isDirtyRoom = selRoom?.housekeeping_status === 'Dirty';
+    const parsedTariff = parseFloat(form.roomTariff);
     setLoading(true); setError('');
     try {
       await apiCall('POST', `/rooms/${rn}/checkin`, {
-        guestName:          form.guestName.trim().toUpperCase(),
-        phone:              form.phone.trim(),
-        pax:                parseInt(form.pax) || 1,
-        deposit:            parseInt(form.deposit) || 0,
-        billing_instruction: form.billing_instruction || 'Direct to Guest',
-        meal_plan:          form.meal_plan || 'EP',
+        guestName:            form.guestName.trim().toUpperCase(),
+        age:                  parseInt(form.age, 10) || 30,
+        phone:                form.phone.trim() || '9876543210',
+        pax:                  parseInt(form.pax) || 1,
+        deposit:              parseInt(form.deposit) || 0,
+        checkInDate:          form.checkInDate,
+        expectedCheckoutDate: form.expectedCheckout || undefined,
+        billing_instruction:  form.billing_instruction || 'Direct to Guest',
+        meal_plan:            form.meal_plan || 'EP',
+        // New Phase E fields
+        dateOfBirth:     form.dob || null,
+        roomTariff:      form.roomTariff !== '' && !isNaN(parsedTariff) ? parsedTariff : (selRoom?.rate || 2000),
+        paymentMode:     form.paymentMode || null,
+        purposeOfVisit:  form.purposeOfVisit || 'Personal',
+        companyName:     form.companyName || '',
+        gstNo:           form.gstNo || '',
+        city:            form.city || '',
+        state:           form.state || 'Chandigarh',
         // manual_override is sent only for admin/manager who explicitly toggled the override
         ...(isDirtyRoom && canOverride && showDirty ? { manual_override: true } : {}),
       }, token);
@@ -221,10 +258,10 @@ function CheckInModal({ room, rooms, token, onClose, onSuccess, isWalkIn = false
           <div>
             <label style={labelStyle}>Select Room *</label>
             <select value={form.roomNumber} onChange={e => setForm(f => ({ ...f, roomNumber: e.target.value }))}
-              style={{ ...inputStyle }}>
-              <option value="">-- Choose a room --</option>
+              style={selectStyle}>
+              <option value="" style={optionStyle}>-- Choose a room --</option>
               {vacantRooms.map(r => (
-                <option key={r.number} value={r.number}>
+                <option key={r.number} value={r.number} style={optionStyle}>
                   Room {r.number} — {r.type} (₹{r.rate}/night) [{r.status}]{r.housekeeping_status === 'Dirty' ? ' ⚠ DIRTY — Override' : ''}
                 </option>
               ))}
@@ -272,10 +309,57 @@ function CheckInModal({ room, rooms, token, onClose, onSuccess, isWalkIn = false
           <input style={inputStyle} type="text" placeholder="Full name" value={form.guestName}
             onChange={e => setForm(f => ({ ...f, guestName: e.target.value }))} autoFocus />
         </div>
-        <div>
-          <label style={labelStyle}>Phone</label>
-          <input style={inputStyle} type="tel" placeholder="+91 XXXXX XXXXX" value={form.phone}
-            onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} />
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+          <div>
+            <label style={labelStyle}>Phone</label>
+            <input style={inputStyle} type="tel" placeholder="+91 XXXXX XXXXX" value={form.phone}
+              onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} />
+          </div>
+          <div>
+            <label style={labelStyle}>Date of Birth</label>
+            <input style={inputStyle} type="date" value={form.dob}
+              onChange={e => setForm(f => ({ ...f, dob: e.target.value }))} />
+          </div>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+          <div>
+            <label style={labelStyle}>Check-In Date *</label>
+            <input style={inputStyle} type="date" value={form.checkInDate}
+              onChange={e => {
+                const d = e.target.value;
+                setForm(f => ({ ...f, checkInDate: d, expectedCheckout: getDefaultExpectedCheckoutInput(d) }));
+              }} required />
+          </div>
+          <div>
+            <label style={labelStyle}>Expected Checkout <span style={{ color:'#f59e0b', fontSize:'0.72rem' }}>editable</span></label>
+            <input style={inputStyle} type="datetime-local" value={form.expectedCheckout}
+              onChange={e => setForm(f => ({ ...f, expectedCheckout: e.target.value }))}
+              title="Default: next day at 11:00 AM" />
+          </div>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+          <div>
+            <label style={labelStyle}>Company Name (optional)</label>
+            <input style={inputStyle} type="text" placeholder="For company billing" value={form.companyName}
+              onChange={e => setForm(f => ({ ...f, companyName: e.target.value }))} />
+          </div>
+          <div>
+            <label style={labelStyle}>GST Number (optional)</label>
+            <input style={inputStyle} type="text" placeholder="e.g. 29ABCDE..." value={form.gstNo}
+              onChange={e => setForm(f => ({ ...f, gstNo: e.target.value }))} />
+          </div>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+          <div>
+            <label style={labelStyle}>City</label>
+            <input style={inputStyle} type="text" placeholder="Guest city" value={form.city}
+              onChange={e => setForm(f => ({ ...f, city: e.target.value }))} />
+          </div>
+          <div>
+            <label style={labelStyle}>State</label>
+            <input style={inputStyle} type="text" placeholder="Guest state" value={form.state}
+              onChange={e => setForm(f => ({ ...f, state: e.target.value }))} />
+          </div>
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
           <div>
@@ -284,29 +368,64 @@ function CheckInModal({ room, rooms, token, onClose, onSuccess, isWalkIn = false
               onChange={e => setForm(f => ({ ...f, pax: e.target.value }))} />
           </div>
           <div>
-            <label style={labelStyle}>Deposit (₹)</label>
-            <input style={inputStyle} type="number" min="0" value={form.deposit}
-              onChange={e => setForm(f => ({ ...f, deposit: e.target.value }))} />
+            <label style={labelStyle}>Room Tariff / Night (₹) <span style={{ color:'#f59e0b', fontSize:'0.72rem' }}>editable</span></label>
+            <input style={inputStyle} type="number" min="0" step="50"
+              placeholder={selectedRoom ? `Base: ₹${selectedRoom.rate}` : 'e.g. 1500'}
+              value={form.roomTariff}
+              onChange={e => setForm(f => ({ ...f, roomTariff: e.target.value }))} />
           </div>
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
           <div>
-            <label style={labelStyle}>Billing Instructions</label>
-            <select style={inputStyle} value={form.billing_instruction}
-              onChange={e => setForm(f => ({ ...f, billing_instruction: e.target.value }))}>
-              <option value="Direct to Guest">Direct to Guest</option>
-              <option value="Bill to Company">Bill to Company</option>
-              <option value="Room Tariff Only">Room Tariff Only</option>
+            <label style={labelStyle}>Deposit (₹)</label>
+            <input style={inputStyle} type="number" min="0" value={form.deposit}
+              onChange={e => setForm(f => ({ ...f, deposit: e.target.value }))} />
+          </div>
+          <div>
+            <label style={labelStyle}>Payment Mode</label>
+            <select style={selectStyle} value={form.paymentMode}
+              onChange={e => setForm(f => ({ ...f, paymentMode: e.target.value }))}>
+              <option value="" style={optionStyle}>-- Not Specified --</option>
+              <option value="Cash" style={optionStyle}>Cash</option>
+              <option value="UPI" style={optionStyle}>UPI</option>
+              <option value="Card" style={optionStyle}>Card</option>
+              <option value="Bank Transfer" style={optionStyle}>Bank Transfer</option>
+              <option value="Other" style={optionStyle}>Other</option>
+            </select>
+          </div>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+          <div>
+            <label style={labelStyle}>Purpose of Visit</label>
+            <select style={selectStyle} value={form.purposeOfVisit}
+              onChange={e => setForm(f => ({ ...f, purposeOfVisit: e.target.value }))}>
+              <option value="" style={optionStyle}>-- Not Specified --</option>
+              <option value="Official" style={optionStyle}>Official</option>
+              <option value="Function" style={optionStyle}>Function</option>
+              <option value="Tourist" style={optionStyle}>Tourist</option>
+              <option value="Personal" style={optionStyle}>Personal</option>
+              <option value="Business" style={optionStyle}>Business</option>
             </select>
           </div>
           <div>
+            <label style={labelStyle}>Billing Instructions</label>
+            <select style={selectStyle} value={form.billing_instruction}
+              onChange={e => setForm(f => ({ ...f, billing_instruction: e.target.value }))}>
+              <option value="Direct to Guest" style={optionStyle}>Direct to Guest</option>
+              <option value="Bill to Company" style={optionStyle}>Bill to Company</option>
+              <option value="Room Tariff Only" style={optionStyle}>Room Tariff Only</option>
+            </select>
+          </div>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+          <div>
             <label style={labelStyle}>Meal Plan</label>
-            <select style={inputStyle} value={form.meal_plan}
+            <select style={selectStyle} value={form.meal_plan}
               onChange={e => setForm(f => ({ ...f, meal_plan: e.target.value }))}>
-              <option value="EP">EP (Room Only)</option>
-              <option value="CP">CP (+ Breakfast)</option>
-              <option value="MAP">MAP (+ B&amp;D)</option>
-              <option value="AP">AP (All Meals)</option>
+              <option value="EP" style={optionStyle}>EP (Room Only)</option>
+              <option value="CP" style={optionStyle}>CP (+ Breakfast)</option>
+              <option value="MAP" style={optionStyle}>MAP (+ B&amp;D)</option>
+              <option value="AP" style={optionStyle}>AP (All Meals)</option>
             </select>
           </div>
         </div>
@@ -317,75 +436,39 @@ function CheckInModal({ room, rooms, token, onClose, onSuccess, isWalkIn = false
   );
 }
 
+
 // ── 2. Quick Check-Out Modal ─────────────────────────────────────────────────
 function CheckOutModal({ room, token, onClose, onSuccess }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const ledger = room?.ledger || [];
-  const total = ledger.reduce((s, i) => s + Number(i.amount || 0), 0);
   const deposit = room?.deposit || 0;
-  const balance = total - deposit;
 
   const handle = async () => {
     setLoading(true); setError('');
     try {
-      await apiCall('POST', `/rooms/${room.number}/checkout`, { balancePaid: balance > 0 ? balance : 0 }, token);
-      onSuccess(`✓ Room ${room.number} — ${room.guestName} checked out`);
+      await apiCall('POST', `/rooms/${room.number}/checkout`, { balancePaid: 0 }, token);
+      onSuccess(`\u2713 Room ${room.number} \u2014 ${room.guestName} checked out`);
     } catch (e) { setError(e.message); } finally { setLoading(false); }
   };
 
   return (
-    <Modal title={`🧾 Check-Out — Room ${room?.number}`} onClose={onClose} width="500px">
+    <Modal title={`Check-Out \u2014 Room ${room?.number}`} onClose={onClose} width="560px">
       <ErrorBox msg={error} />
       <div style={{ padding: '12px 16px', background: 'rgba(56,189,248,0.05)', border: '1px solid rgba(56,189,248,0.15)', borderRadius: '8px', marginBottom: '16px' }}>
         <div style={{ fontWeight: 700 }}>{room?.guestName}</div>
         <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-          Room {room?.number}  •  Check-In: {room?.checkInDate}  •  {room?.pax} Pax
+          Room {room?.number} &bull; Check-In: {room?.checkInDate} &bull; {room?.pax} Pax
+          {deposit > 0 && <span style={{ marginLeft: '10px', color: '#4ade80' }}>Deposit: &#8377;{deposit.toLocaleString('en-IN')}</span>}
         </div>
       </div>
-      {ledger.length > 0 && (
-        <table style={{ width: '100%', borderCollapse: 'collapse', marginBottom: '14px', fontSize: '0.82rem' }}>
-          <thead>
-            <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
-              <th style={{ textAlign: 'left', padding: '6px 8px', color: 'var(--text-muted)' }}>Description</th>
-              <th style={{ textAlign: 'right', padding: '6px 8px', color: 'var(--text-muted)' }}>Amount</th>
-            </tr>
-          </thead>
-          <tbody>
-            {ledger.map((item, i) => (
-              <tr key={i} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
-                <td style={{ padding: '6px 8px' }}>{item.desc}</td>
-                <td style={{ padding: '6px 8px', textAlign: 'right', color: Number(item.amount) < 0 ? '#4ade80' : '#fff' }}>
-                  ₹{Number(item.amount).toLocaleString('en-IN')}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-          <tfoot>
-            <tr style={{ borderTop: '1px solid rgba(255,255,255,0.1)' }}>
-              <td style={{ padding: '8px', fontWeight: 700 }}>Total</td>
-              <td style={{ padding: '8px', textAlign: 'right', fontWeight: 700 }}>₹{total.toLocaleString('en-IN')}</td>
-            </tr>
-            <tr>
-              <td style={{ padding: '4px 8px', color: 'var(--text-muted)', fontSize: '0.78rem' }}>Deposit Paid</td>
-              <td style={{ padding: '4px 8px', textAlign: 'right', color: '#4ade80', fontSize: '0.78rem' }}>₹{deposit.toLocaleString('en-IN')}</td>
-            </tr>
-            <tr>
-              <td style={{ padding: '8px', fontWeight: 700, color: balance > 0 ? '#f87171' : '#4ade80' }}>
-                {balance > 0 ? '⚠ Balance Due' : '✓ Refund Due'}
-              </td>
-              <td style={{ padding: '8px', textAlign: 'right', fontWeight: 700, color: balance > 0 ? '#f87171' : '#4ade80' }}>
-                ₹{Math.abs(balance).toLocaleString('en-IN')}
-              </td>
-            </tr>
-          </tfoot>
-        </table>
-      )}
+      {/* Live folio via LedgerPanel */}
+      <LedgerPanel roomNumber={room?.number} token={token} compact={false} />
       <ModalFooter onClose={onClose} onSubmit={handle} loading={loading}
-        submitLabel="✓ Confirm Check-Out" submitColor="#f97316" />
+        submitLabel="\u2713 Confirm Check-Out" submitColor="#f97316" />
     </Modal>
   );
 }
+
 
 // ── 3. Assign Room (Modify Check-In for booked reservation) ──────────────────
 function AssignRoomModal({ rooms, reservations, token, onClose, onSuccess }) {
@@ -464,6 +547,9 @@ function AssignRoomModal({ rooms, reservations, token, onClose, onSuccess }) {
 function RoomShiftModal({ room, rooms, token, onClose, onSuccess }) {
   const [fromRoom, setFromRoom] = useState(room?.number || '');
   const [toRoom, setToRoom] = useState('');
+  const [adjustmentType, setAdjustmentType] = useState('AUTOMATIC');
+  const [manualAmount, setManualAmount] = useState('');
+  const [reason, setReason] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -471,12 +557,42 @@ function RoomShiftModal({ room, rooms, token, onClose, onSuccess }) {
   // Req 2: Explicitly exclude inactive rooms from shift destination list
   const vacantRooms   = rooms.filter(r => r.status === 'vacant' && r.status !== 'inactive');
 
+  const srcRoomObj = rooms.find(r => String(r.number) === String(fromRoom));
+  const tgtRoomObj = rooms.find(r => String(r.number) === String(toRoom));
+
+  const sourceRate = Number(srcRoomObj?.rate || srcRoomObj?.price || 0);
+  const targetRate = Number(tgtRoomObj?.rate || tgtRoomObj?.price || 0);
+  const automaticDifference = targetRate - sourceRate;
+
+  const parsedManualAmt = parseFloat(manualAmount) || 0;
+  let finalAdditionalCharge = 0;
+  if (adjustmentType === 'NO_ADJUSTMENT') {
+    finalAdditionalCharge = 0;
+  } else if (adjustmentType === 'INCREASE') {
+    finalAdditionalCharge = automaticDifference + parsedManualAmt;
+  } else if (adjustmentType === 'DECREASE') {
+    finalAdditionalCharge = automaticDifference - parsedManualAmt;
+  } else {
+    finalAdditionalCharge = automaticDifference;
+  }
+
   const handle = async () => {
     if (!fromRoom || !toRoom) { setError('Both rooms are required'); return; }
     if (fromRoom === toRoom) { setError('Source and target rooms must be different'); return; }
+    if ((adjustmentType === 'INCREASE' || adjustmentType === 'DECREASE')) {
+      if (parsedManualAmt <= 0) { setError('Manual adjustment amount must be > 0'); return; }
+      if (!reason.trim()) { setError('Reason is required for manual adjustment'); return; }
+    }
+
     setLoading(true); setError('');
     try {
-      await apiCall('POST', '/rooms/shift', { fromRoomNumber: fromRoom, toRoomNumber: toRoom }, token);
+      await apiCall('POST', '/rooms/shift', {
+        fromRoomNumber: fromRoom,
+        toRoomNumber: toRoom,
+        adjustmentType,
+        manualAdjustmentAmount: parsedManualAmt,
+        manualAdjustmentReason: reason.trim()
+      }, token);
       onSuccess(`✓ Guest shifted from Room ${fromRoom} to Room ${toRoom}`);
     } catch (e) { setError(e.message); } finally { setLoading(false); }
   };
@@ -491,14 +607,13 @@ function RoomShiftModal({ room, rooms, token, onClose, onSuccess }) {
             <option value="">-- Select occupied room --</option>
             {occupiedRooms.map(r => (
               <option key={r.number} value={r.number}>
-                Room {r.number} — {r.guestName}
+                Room {r.number} — {r.guestName} (₹{r.rate || r.price}/night)
               </option>
             ))}
           </select>
-          {fromRoom && occupiedRooms.find(r => r.number === fromRoom) && (
+          {fromRoom && srcRoomObj && (
             <div style={{ marginTop: '6px', fontSize: '0.76rem', color: 'var(--text-muted)' }}>
-              Guest: {occupiedRooms.find(r => r.number === fromRoom)?.guestName} | 
-              Check-In: {occupiedRooms.find(r => r.number === fromRoom)?.checkInDate}
+              Guest: {srcRoomObj.guestName} | Tariff: ₹{sourceRate}/night
             </div>
           )}
         </div>
@@ -508,11 +623,52 @@ function RoomShiftModal({ room, rooms, token, onClose, onSuccess }) {
             <option value="">-- Select vacant room --</option>
             {vacantRooms.map(r => (
               <option key={r.number} value={r.number}>
-                Room {r.number} — {r.type} (₹{r.rate}/night)
+                Room {r.number} — {r.type} (₹{r.rate || r.price}/night)
               </option>
             ))}
           </select>
         </div>
+
+        {fromRoom && toRoom && (
+          <div style={{ padding: '10px 12px', background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', fontSize: '0.82rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+              <span style={{ color: '#94a3b8' }}>Automatic Tariff Difference:</span>
+              <span style={{ fontWeight: '700', color: automaticDifference >= 0 ? '#60a5fa' : '#fbbf24' }}>
+                {automaticDifference >= 0 ? `+ ₹${automaticDifference.toLocaleString('en-IN')}` : `- ₹${Math.abs(automaticDifference).toLocaleString('en-IN')}`}
+              </span>
+            </div>
+
+            <div style={{ marginTop: '8px' }}>
+              <label style={labelStyle}>Adjustment Option</label>
+              <select value={adjustmentType} onChange={e => setAdjustmentType(e.target.value)} style={{ ...inputStyle, marginBottom: '6px' }}>
+                <option value="AUTOMATIC">Automatic Difference ({automaticDifference >= 0 ? `+₹${automaticDifference}` : `-₹${Math.abs(automaticDifference)}`})</option>
+                <option value="INCREASE">Increase (+ Charge)</option>
+                <option value="DECREASE">Decrease (- Discount)</option>
+                <option value="NO_ADJUSTMENT">No Adjustment (₹0)</option>
+              </select>
+            </div>
+
+            {(adjustmentType === 'INCREASE' || adjustmentType === 'DECREASE') && (
+              <div style={{ display: 'grid', gridTemplateColumns: '100px 1fr', gap: '8px', marginTop: '6px' }}>
+                <div>
+                  <label style={labelStyle}>Amount (₹) *</label>
+                  <input type="number" min="1" placeholder="₹" value={manualAmount} onChange={e => setManualAmount(e.target.value)} style={inputStyle} />
+                </div>
+                <div>
+                  <label style={labelStyle}>Reason *</label>
+                  <input type="text" placeholder="Mandatory reason" value={reason} onChange={e => setReason(e.target.value)} style={inputStyle} />
+                </div>
+              </div>
+            )}
+
+            <div style={{ marginTop: '8px', paddingTop: '6px', borderTop: '1px solid rgba(255,255,255,0.08)', display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ color: '#cbd5e1', fontWeight: '600' }}>Final Additional Shift Charge:</span>
+              <span style={{ fontWeight: '700', color: finalAdditionalCharge >= 0 ? '#60a5fa' : '#fbbf24' }}>
+                {finalAdditionalCharge >= 0 ? `+ ₹${finalAdditionalCharge.toLocaleString('en-IN')}` : `- ₹${Math.abs(finalAdditionalCharge).toLocaleString('en-IN')}`}
+              </span>
+            </div>
+          </div>
+        )}
       </div>
       <ModalFooter onClose={onClose} onSubmit={handle} loading={loading}
         submitLabel="✓ Confirm Shift" submitColor="#a78bfa" />
@@ -650,11 +806,17 @@ function EarlyCheckInModal({ rooms, token, onClose, onSuccess }) {
     if (!form.roomNumber) { setError('Room selection is required'); return; }
     setLoading(true); setError('');
     try {
+      const selRoom = rooms.find(r => r.number === form.roomNumber);
       await apiCall('POST', `/rooms/${form.roomNumber}/checkin`, {
         guestName: form.guestName.trim().toUpperCase(),
-        phone: form.phone.trim(),
-        pax: parseInt(form.pax) || 1,
-        deposit: parseInt(form.deposit) || 0,
+        age: 30,
+        phone: form.phone.trim() || '9876543210',
+        state: 'Chandigarh',
+        purposeOfVisit: 'Personal',
+        pax: parseInt(form.pax, 10) || 1,
+        billing_instruction: 'Direct to Guest',
+        roomTariff: selRoom?.rate || 2000,
+        deposit: parseInt(form.deposit, 10) || 0,
       }, token);
       onSuccess(`✓ Early check-in: ${form.guestName.toUpperCase()} → Room ${form.roomNumber}${note ? ` (${note})` : ''}`);
     } catch (e) { setError(e.message); } finally { setLoading(false); }

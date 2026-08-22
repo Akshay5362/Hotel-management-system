@@ -1,21 +1,82 @@
 import { formatTime } from '../utils/dateUtils.js';
 import { BusinessDateService } from './businessDateService.js';
-import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
-import { enqueue } from './outboxService.js';
-import {
-  createCompoundEventBuilder,
-  formatBookingId,
-  formatRoomId,
-  formatGuestId,
-  formatReservationId,
-  formatLedgerItemId,
-  formatPaymentId,
-  formatCashLogId
-} from './compoundEventBuilder.js';
 
-// Allowed values for the two new optional fields
+// Allowed values for optional enumerated fields
 const ALLOWED_BILLING_INSTRUCTIONS = ['Direct to Guest', 'Bill to Company', 'Room Tariff Only'];
 const ALLOWED_MEAL_PLANS           = ['EP', 'CP', 'MAP', 'AP'];
+const ALLOWED_PURPOSES             = ['Official', 'Function', 'Tourist', 'Personal', 'Business'];
+const ALLOWED_PAYMENT_MODES        = ['Cash', 'UPI', 'Card', 'Bank Transfer', 'Other'];
+
+// Build an entry time string "HH:MM AM/PM" from a Date object
+function buildTimeOfEntry(date) {
+  const h   = date.getHours();
+  const m   = date.getMinutes();
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const h12  = h % 12 === 0 ? 12 : h % 12;
+  return `${String(h12).padStart(2, '0')}:${String(m).padStart(2, '0')} ${ampm}`;
+}
+
+// Compute the expected checkout date = next calendar day at 11:00 AM
+// Result format: "YYYY-MM-DD 11:00"  (safe for existing parseToComparableDate consumers)
+function computeExpectedCheckout(checkInDateStr) {
+  if (!checkInDateStr) return '';
+  const str = String(checkInDateStr).trim();
+  let yyyy = null, mm = null, dd = null;
+
+  // Pattern 1: YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}/.test(str)) {
+    const clean = str.split(' ')[0].split('T')[0];
+    const [y, m, d] = clean.split('-').map(Number);
+    yyyy = y; mm = m; dd = d;
+  }
+  // Pattern 2: DD-Mon-YYYY (e.g. 19-Aug-2026)
+  else if (/^\d{1,2}-[A-Za-z]{3}-\d{4}/.test(str)) {
+    const MONTHS = { jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug:8, sep:9, oct:10, nov:11, dec:12 };
+    const parts = str.split(' ')[0].split('T')[0].split('-');
+    dd = parseInt(parts[0], 10);
+    mm = MONTHS[parts[1].toLowerCase()] || null;
+    yyyy = parseInt(parts[2], 10);
+  }
+  // Pattern 3: DD-MM-YYYY
+  else if (/^\d{1,2}-\d{1,2}-\d{4}/.test(str)) {
+    const parts = str.split(' ')[0].split('T')[0].split('-');
+    dd = parseInt(parts[0], 10);
+    mm = parseInt(parts[1], 10);
+    yyyy = parseInt(parts[2], 10);
+  }
+
+  if (yyyy && mm && dd && !isNaN(yyyy) && !isNaN(mm) && !isNaN(dd)) {
+    const dt = new Date(Date.UTC(yyyy, mm - 1, dd + 1));
+    const nextY = dt.getUTCFullYear();
+    const nextM = String(dt.getUTCMonth() + 1).padStart(2, '0');
+    const nextD = String(dt.getUTCDate()).padStart(2, '0');
+    return `${nextY}-${nextM}-${nextD} 11:00`;
+  }
+
+  return '';
+}
+
+// Normalize user-supplied or default expected checkout string
+function normalizeExpectedCheckout(val, checkInDateStr) {
+  if (!val || typeof val !== 'string' || val.trim() === '' || val.includes('NaN')) {
+    return computeExpectedCheckout(checkInDateStr);
+  }
+  const trimmed = val.trim();
+  // "YYYY-MM-DDTHH:mm" -> "YYYY-MM-DD HH:mm"
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(trimmed)) {
+    const [d, t] = trimmed.split('T');
+    return `${d} ${t.substring(0, 5)}`;
+  }
+  // "YYYY-MM-DD" -> "YYYY-MM-DD 11:00"
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return `${trimmed} 11:00`;
+  }
+  // "YYYY-MM-DD HH:mm"
+  if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(trimmed)) {
+    return trimmed.substring(0, 16);
+  }
+  return trimmed;
+}
 
 export const processCheckIn = async (connection, {
   roomNumber,
@@ -35,11 +96,20 @@ export const processCheckIn = async (connection, {
   reservationId = null,
   isGuestSelfCheckIn = false,
   guestId = null,
+  expectedCheckoutDate = null,
   departureDate = null,
   billingInstruction = 'Direct to Guest',
   mealPlan = 'EP',
   dateOfBirth = null,
-  dob = null
+  dob = null,
+  // ── New fields (Phase C) ──────────────────────────────────────────────────
+  roomTariff      = null,   // booking-specific negotiated tariff (overrides room.rate)
+  paymentMode     = null,   // Cash|UPI|Card|Bank Transfer|Other|null
+  purposeOfVisit  = null,   // Official|Function|Tourist|Personal|Business
+  companyName     = '',     // optional company name
+  gstNo           = '',     // optional GST number (stored on guest)
+  city            = '',     // optional guest city
+  state           = ''      // optional guest state
 }) => {
   // Validate optional fields (ignore invalid values gracefully — use default)
   const resolvedBilling = ALLOWED_BILLING_INSTRUCTIONS.includes(billingInstruction)
@@ -48,7 +118,9 @@ export const processCheckIn = async (connection, {
   const resolvedMealPlan = ALLOWED_MEAL_PLANS.includes(mealPlan)
     ? mealPlan
     : 'EP';
-  const resolvedDob = dateOfBirth || dob || null;
+  const resolvedDob     = dateOfBirth || dob || null;
+  const resolvedPurpose = ALLOWED_PURPOSES.includes(purposeOfVisit) ? purposeOfVisit : null;
+  const resolvedPayMode = ALLOWED_PAYMENT_MODES.includes(paymentMode) ? paymentMode : null;
 
   // 1. Get Business Date
   const businessDate = await BusinessDateService.getBusinessDate(connection);
@@ -96,8 +168,9 @@ export const processCheckIn = async (connection, {
     room.status = 'vacant';
     console.warn(`[checkInService] Auto-corrected ghost occupied status for Room ${roomNumber} (no active Checked In booking found).`);
   }
-  if (room.status !== 'vacant' && room.status !== 'booked') {
-    if (room.status === 'dirty' && manualOverride) {
+  const roomStatusNorm = (room.status || '').toLowerCase();
+  if (roomStatusNorm !== 'vacant' && roomStatusNorm !== 'booked') {
+    if (roomStatusNorm === 'dirty' && manualOverride) {
       // Allowed via manual override
     } else {
       throw { status: 400, message: `Room ${roomNumber} is not vacant or booked. Current status: ${room.status}` };
@@ -105,7 +178,7 @@ export const processCheckIn = async (connection, {
   }
 
   // Dirty check
-  if (room.status === 'dirty' || room.housekeeping_status === 'Dirty') {
+  if (roomStatusNorm === 'dirty' || String(room.housekeeping_status).toLowerCase() === 'dirty') {
     if (!manualOverride) {
       throw { status: 400, message: `Room ${roomNumber} has pending housekeeping (Dirty).`, code: 'ROOM_DIRTY' };
     }
@@ -137,12 +210,15 @@ export const processCheckIn = async (connection, {
       throw { status: 400, message: 'Cannot check in a cancelled reservation.' };
     }
     // Pull defaults from reservation if not provided
-    guestName = guestName || reservation.guest_name;
-    phone = phone || reservation.phone;
-    email = email || reservation.email;
-    address = address || reservation.address;
-    country = country || reservation.nationality;
-    pax = Math.max(pax, reservation.adults || 1);
+    guestName  = guestName  || reservation.guest_name;
+    phone      = phone      || reservation.phone;
+    email      = email      || reservation.email;
+    address    = address    || reservation.address;
+    country    = country    || reservation.nationality;
+    state      = state      || reservation.state      || '';
+    companyName = companyName || reservation.company  || '';
+    purposeOfVisit = purposeOfVisit || (ALLOWED_PURPOSES.includes(reservation.purpose) ? reservation.purpose : null);
+    pax      = Math.max(pax, reservation.adults || 1);
     children = Math.max(children, reservation.children || 0);
     departureDate = departureDate || reservation.departure_date;
     if (deposit === 0 && reservation.advance_payment > 0) {
@@ -156,34 +232,58 @@ export const processCheckIn = async (connection, {
   const guestNameUpper = guestName ? guestName.trim().toUpperCase() : 'UNKNOWN';
   
   if (!finalGuestId) {
-    const [existingGuests] = await connection.query('SELECT id, date_of_birth FROM guests WHERE phone = ? LIMIT 1 FOR UPDATE', [phone || '']);
+    const [existingGuests] = await connection.query(
+      'SELECT id, date_of_birth, gst_no, company_name, city, state FROM guests WHERE phone = ? LIMIT 1 FOR UPDATE',
+      [phone || '']
+    );
     if (existingGuests.length > 0) {
       finalGuestId = existingGuests[0].id;
-      if (resolvedDob && !existingGuests[0].date_of_birth) {
-        await connection.query('UPDATE guests SET date_of_birth = ? WHERE id = ?', [resolvedDob, finalGuestId]);
+      // Update any new information on the existing guest record
+      const updateFields = [];
+      const updateVals   = [];
+      if (resolvedDob && !existingGuests[0].date_of_birth) { updateFields.push('date_of_birth = ?'); updateVals.push(resolvedDob); }
+      if (gstNo && !existingGuests[0].gst_no)              { updateFields.push('gst_no = ?');        updateVals.push(gstNo); }
+      if (companyName)                                     { updateFields.push('company_name = ?');  updateVals.push(companyName); }
+      if (city)                                            { updateFields.push('city = ?');          updateVals.push(city); }
+      if (state)                                           { updateFields.push('state = ?');         updateVals.push(state); }
+      if (updateFields.length > 0) {
+        updateVals.push(finalGuestId);
+        await connection.query(`UPDATE guests SET ${updateFields.join(', ')} WHERE id = ?`, updateVals);
       }
     } else {
       const [newGuestRes] = await connection.query(
-        'INSERT INTO guests (full_name, phone, email, address, country, date_of_birth) VALUES (?, ?, ?, ?, ?, ?)',
-        [guestNameUpper, phone || '', email || '', address || '', country || '', resolvedDob]
+        'INSERT INTO guests (full_name, phone, email, address, country, date_of_birth, gst_no, company_name, city, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [guestNameUpper, phone || '', email || '', address || '', country || '', resolvedDob, gstNo || '', companyName || '', city || '', state || '']
       );
       finalGuestId = newGuestRes.insertId;
     }
   }
 
   // 5. Create Booking
+  // resolvedTariff: use negotiated tariff if valid and positive; otherwise room base rate
+  const resolvedTariff = (roomTariff !== null && roomTariff !== undefined && Number.isFinite(Number(roomTariff)) && Number(roomTariff) >= 0)
+    ? Math.round(Number(roomTariff))
+    : (room.rate || 0);
+
+  // Expected checkout date at 11:00 AM (customizable by client, fallback to D+1 at 11:00)
+  const resolvedExpectedCheckout = normalizeExpectedCheckout(expectedCheckoutDate || departureDate, actualCheckInDate);
+
+  const resolvedUserIdNum = (resolvedUserId && Number.isInteger(Number(resolvedUserId)) && Number(resolvedUserId) > 0)
+    ? Number(resolvedUserId)
+    : null;
+
   const bookingNumber = 'BKG-' + Math.floor(100000 + Math.random() * 900000);
   const [bResult] = await connection.query(
     `INSERT INTO bookings (
       booking_number, guest_id, room_id, check_in_date, expected_check_out_date,
       adults, children, booking_status, payment_status, total_amount, advance_amount, created_by,
-      billing_instruction, meal_plan
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Checked In', ?, ?, ?, ?, ?, ?)`,
+      billing_instruction, meal_plan, room_tariff, payment_mode, purpose_of_visit
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Checked In', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
-      bookingNumber, finalGuestId, room.id, actualCheckInDate, departureDate || actualCheckInDate,
+      bookingNumber, finalGuestId, room.id, actualCheckInDate, resolvedExpectedCheckout,
       pax, children, deposit > 0 ? 'Partial' : 'Pending',
-      room.rate, deposit, resolvedUserId,
-      resolvedBilling, resolvedMealPlan
+      resolvedTariff, deposit, resolvedUserIdNum,
+      resolvedBilling, resolvedMealPlan, resolvedTariff, resolvedPayMode, resolvedPurpose
     ]
   );
   const bookingId = bResult.insertId;
@@ -197,13 +297,30 @@ export const processCheckIn = async (connection, {
   }
 
   // 7. Ledger Items — GST is INCLUDED in the room rate (no separate tax line)
-  const tariffAmount = room.rate || 0;
+  const tariffAmount = resolvedTariff;
+  const entryNow     = new Date();
+  const timeOfEntry  = buildTimeOfEntry(entryNow);
 
   const [ledgerResult] = await connection.query(
-    "INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)",
-    [roomNumber, 'Room Tariff (Incl. GST)', tariffAmount, businessDate, bookingId]
+    `INSERT INTO ledger_items (room_number, \`desc\`, qty, amount, business_date, booking_id,
+      transaction_type, credit_amount, time_of_entry, created_by)
+     VALUES (?, ?, 1, ?, ?, ?, 'CHARGE', 0, ?, ?)`,
+    [roomNumber, 'Room Tariff (Incl. GST)', tariffAmount, businessDate, bookingId, timeOfEntry, resolvedUserIdNum]
   );
   const ledgerMysqlId = ledgerResult.insertId;
+
+  // 7b. PAYMENT ledger entry if advance deposit was provided
+  let paymentLedgerMysqlId = null;
+  if (deposit > 0) {
+    const [payLedgerResult] = await connection.query(
+      `INSERT INTO ledger_items (room_number, \`desc\`, qty, amount, credit_amount, business_date, booking_id,
+        transaction_type, payment_mode, time_of_entry, created_by)
+       VALUES (?, ?, 1, 0, ?, ?, ?, 'PAYMENT', ?, ?, ?)`,
+      [roomNumber, `Advance Deposit (${resolvedPayMode || paymentMethod || 'Cash'})`, deposit, businessDate, bookingId,
+       resolvedPayMode || paymentMethod || null, timeOfEntry, resolvedUserIdNum]
+    );
+    paymentLedgerMysqlId = payLedgerResult.insertId;
+  }
 
   // 8. Payments & Cash Logs
   // Declared in outer scope so compound event builder can access them below.
@@ -238,7 +355,7 @@ export const processCheckIn = async (connection, {
   await connection.query(
     `INSERT INTO room_status_history (room_id, old_status, new_status, changed_by, business_date)
     VALUES (?, ?, 'occupied', ?, ?)`,
-    [room.id, room.status, resolvedUserId, businessDate]
+    [room.id, room.status, resolvedUserIdNum, businessDate]
   );
 
   await connection.query(
@@ -255,210 +372,17 @@ export const processCheckIn = async (connection, {
   if (isGuestSelfCheckIn) {
     await connection.query(
       "INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)",
-      [resolvedUserId, '🎉 Welcome to Hotel Sky-5!', `You have successfully checked in to Room ${roomNumber}. Enjoy your stay!`]
+      [resolvedUserIdNum, '🎉 Welcome to Hotel Sky-5!', `You have successfully checked in to Room ${roomNumber}. Enjoy your stay!`]
     );
     await connection.query(
       "INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'GUEST_CHECKIN', ?, ?)",
-      [resolvedUserId, `Guest self check-in for Room ${roomNumber}. Booking ID: ${bookingId}`, businessDate]
+      [resolvedUserIdNum, `Guest self check-in for Room ${roomNumber}. Booking ID: ${bookingId}`, businessDate]
     );
   } else {
     await connection.query(
       "INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'CHECK_IN', ?, ?)",
-      [resolvedUserId, `Checked in guest ${guestNameUpper} into Room ${roomNumber}. Booking ID: ${bookingId}`, businessDate]
+      [resolvedUserIdNum, `Checked in guest ${guestNameUpper} into Room ${roomNumber}. Booking ID: ${bookingId}`, businessDate]
     );
-  }
-
-  // ── Phase 4E-B3: Compound Outbox Event ──────────────────────────────────────
-  // The compound event is enqueued on the SAME connection as the business
-  // mutations. If enqueue throws, the entire transaction rolls back — no partial
-  // Firestore state is possible.
-  //
-  // The event is only processed by the Outbox worker when
-  // ENABLE_FIRESTORE_OUTBOX_WORKER=true (currently false in production).
-  if (isFirestoreDualWriteEnabled()) {
-    const eventOccurredAt = new Date().toISOString();
-    const bkgDocId  = formatBookingId(bookingNumber);
-    // Canonical guest document ID: the guest repository uses phone as the key
-    // for phone-based guests, or the MySQL guest PK as fallback (walk-ins without phone).
-    const guestDocId = formatGuestId(phone || finalGuestId);
-
-    const builder = createCompoundEventBuilder({
-      event_type:     'COMPOUND_CHECKIN',
-      aggregate_type: 'BOOKING',
-      aggregate_id:   bookingNumber,
-      operation_id:   `op_checkin_${bookingNumber}_${bookingId}`,
-      occurred_at:    eventOccurredAt,
-      business_date:  businessDate
-    });
-
-    // 1. Booking document (root)
-    builder.addRootWrite({
-      collection:  'bookings',
-      document_id: bkgDocId,
-      operation:   'set_merge',
-      data: {
-        booking_number:           bookingNumber,
-        guest_id:                 guestDocId,
-        mysql_guest_id:           finalGuestId,
-        guest_name:               guestNameUpper,
-        room_id:                  formatRoomId(roomNumber),
-        mysql_room_id:            room.id,
-        room_number:              roomNumber,
-        check_in_date:            actualCheckInDate,
-        expected_check_out_date:  departureDate || actualCheckInDate,
-        check_out_date:           null,
-        adults:                   pax,
-        children,
-        booking_status:           'Checked In',
-        payment_status:           deposit > 0 ? 'Partial' : 'Pending',
-        total_amount:             tariffAmount,
-        advance_amount:           deposit,
-        billing_instruction:      resolvedBilling,
-        meal_plan:                resolvedMealPlan,
-        mysql_booking_id:         bookingId,
-        created_at:               eventOccurredAt,
-        updated_at:               eventOccurredAt
-      }
-    });
-
-    // 2. Room document (root)
-    builder.addRootWrite({
-      collection:  'rooms',
-      document_id: formatRoomId(roomNumber),
-      operation:   'set_merge',
-      data: {
-        status:             'occupied',
-        current_booking_id: bkgDocId,
-        updated_at:         eventOccurredAt
-      }
-    });
-
-    // 3. Guest document (root)
-    builder.addRootWrite({
-      collection:  'guests',
-      document_id: guestDocId,
-      operation:   'set_merge',
-      data: {
-        full_name:      guestNameUpper,
-        phone:          phone || '',
-        email:          email || '',
-        address:        address || '',
-        country:        country || '',
-        mysql_guest_id: finalGuestId,
-        updated_at:     eventOccurredAt
-      }
-    });
-
-    // 4. Reservation document (root, conditional)
-    if (reservation) {
-      builder.addRootWrite({
-        collection:  'reservations',
-        document_id: formatReservationId(reservation.id),
-        operation:   'set_merge',
-        data: {
-          status:           'Checked-In',
-          booking_id:       bkgDocId,
-          mysql_booking_id: bookingId,
-          updated_at:       eventOccurredAt
-        }
-      });
-    }
-
-    // 5+6. Ledger item (root + booking subcollection — dual write)
-    const ledgerDocId  = formatLedgerItemId(ledgerMysqlId);
-    const ledgerData   = {
-      item_id:          ledgerDocId,
-      booking_id:       bkgDocId,
-      mysql_booking_id: bookingId,
-      room_number:      roomNumber,
-      description:      'Room Tariff (Incl. GST)',
-      desc:             'Room Tariff (Incl. GST)',
-      qty:              1,
-      quantity:         1,
-      amount:           tariffAmount,
-      type:             'CHARGE',
-      status:           'Pending',
-      business_date:    businessDate,
-      mysql_ledger_id:  ledgerMysqlId,
-      created_at:       eventOccurredAt
-    };
-    builder.addDualWrite({
-      rootCollection:   'ledger_items',
-      document_id:       ledgerDocId,
-      parentCollection:  'bookings',
-      parent_id:         bkgDocId,
-      subcollection:     'ledger_items',
-      operation:         'set_merge',
-      data:              ledgerData
-    });
-
-    // 7+8. Payment (root + booking subcollection — dual write, conditional)
-    if (deposit > 0) {
-      const paymentDocId = formatPaymentId(paymentMysqlId);
-      const paymentData  = {
-        payment_id:       paymentDocId,
-        booking_id:       bkgDocId,
-        mysql_booking_id: bookingId,
-        amount:           deposit,
-        payment_method:   paymentMethod,
-        payment_status:   'Completed',
-        payment_type:     'Advance Deposit',
-        business_date:    businessDate,
-        mysql_payment_id: paymentMysqlId,
-        created_at:       eventOccurredAt
-      };
-      builder.addDualWrite({
-        rootCollection:   'payments',
-        document_id:       paymentDocId,
-        parentCollection:  'bookings',
-        parent_id:         bkgDocId,
-        subcollection:     'payments',
-        operation:         'set_merge',
-        data:              paymentData
-      });
-
-      // 9. Cash log (root only, conditional — cash_logs collection has no subcollection)
-      if (paymentMethod === 'Cash' && cashLogMysqlId !== null) {
-        builder.addRootWrite({
-          collection:  'cash_logs',
-          document_id: formatCashLogId(cashLogMysqlId),
-          operation:   'set_merge',
-          data: {
-            log_id:           formatCashLogId(cashLogMysqlId),
-            amount:           deposit,
-            type:             'Advance Deposit',
-            category:         'Room Payment',
-            description:      `Advance Deposit for ${roomNumber} — ${guestNameUpper}`,
-            booking_id:       bkgDocId,
-            mysql_booking_id: bookingId,
-            business_date:    businessDate,
-            mysql_cash_log_id: cashLogMysqlId,
-            created_at:       eventOccurredAt
-          }
-        });
-      }
-    }
-
-    // 10. Settings/counter document — absolute today_checkins
-    builder.addRootWrite({
-      collection:  'settings',
-      document_id: 'system_date',
-      operation:   'set_merge',
-      data: {
-        today_checkins: todayCheckinsAbsolute
-      }
-    });
-
-    const compoundPayload = builder.build();
-
-    await enqueue(connection, {
-      event_type:     compoundPayload.event_type,
-      aggregate_type: compoundPayload.aggregate_type,
-      aggregate_id:   compoundPayload.aggregate_id,
-      payload:        compoundPayload
-    });
-
-    console.log(`[checkInService] Compound outbox event enqueued: ${compoundPayload.operation_id} (${compoundPayload.writes.length} writes)`);
   }
 
   return { bookingId, roomNumber };

@@ -1,6 +1,22 @@
 import React from 'react';
 
-export default function MetricsBar({ stats, systemStatus }) {
+export default function MetricsBar({ stats, systemStatus, dataStatus = 'fresh', staleReason = null }) {
+  const isOnline = Boolean(systemStatus);
+  const isStale = dataStatus === 'stale';
+  const isDegraded = dataStatus === 'degraded';
+
+  const dotColor = !isOnline ? '#f87171' : (isStale || isDegraded ? '#fbbf24' : '#4ade80');
+  let systemStatusText = 'Online (Real API)';
+  if (!isOnline) {
+    systemStatusText = 'Offline Mode (Backend Unreachable)';
+  } else if (isStale) {
+    systemStatusText = `Online (Cached Snapshot${staleReason ? ` — ${staleReason}` : ''})`;
+  } else if (isDegraded) {
+    systemStatusText = 'Online (Database Quota Reached)';
+  }
+
+  const syncPermissionText = isOnline ? 'Enabled' : 'Disabled';
+
   return (
     <div className="metrics-section">
       {/* Primary Metrics Row */}
@@ -48,10 +64,10 @@ export default function MetricsBar({ stats, systemStatus }) {
 
       {/* Sync Status Banner */}
       <div className="sync-status">
-        <span className="sync-dot" style={{ backgroundColor: systemStatus ? '#4ade80' : '#f87171' }}></span>
-        <span>Online Sync Permission: <strong>{systemStatus ? 'Enabled' : 'Disabled'}</strong></span>
+        <span className="sync-dot" style={{ backgroundColor: dotColor }}></span>
+        <span>Online Sync Permission: <strong>{syncPermissionText}</strong></span>
         <span style={{ margin: '0 8px', color: 'var(--border-color)' }}>|</span>
-        <span>System: <strong>{systemStatus ? 'Online (Real API)' : 'Offline Mode (Backend Unreachable)'}</strong></span>
+        <span>System: <strong>{systemStatusText}</strong></span>
       </div>
     </div>
   );

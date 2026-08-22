@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Toolbar from './components/Toolbar';
 import RoomGrid from './components/RoomGrid';
 import MetricsBar from './components/MetricsBar';
@@ -169,7 +169,9 @@ function AppContent() {
   // Transaction Cash Logs
   const [cashLog, setCashLog] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [isBackendOnline, setIsBackendOnline] = useState(false);
+  const [isBackendOnline, setIsBackendOnline] = useState(true);
+  const [dataStatus, setDataStatus] = useState('fresh'); // 'fresh' | 'stale' | 'degraded'
+  const [staleReason, setStaleReason] = useState(null);
   const [upcomingReservations, setUpcomingReservations] = useState([]);
   const [refundPolicy, setRefundPolicy] = useState({ noStayPct: 100, partialStayPct: 50, fullStayPct: 0, partialHours: 12 });
 
@@ -199,7 +201,29 @@ function AppContent() {
     if ((path === '/login' || path === '/signup') && guestUser) {
       navigate('/dashboard');
     } else if (path === '/admin/login' && adminUser) {
-      navigate('/admin/dashboard');
+      // Route to the correct dashboard based on stored role — do NOT always route to /admin/dashboard
+      const roleUpper = (adminUser.role || '').toUpperCase();
+      switch (roleUpper) {
+        case 'SUPER_ADMIN':
+        case 'ADMIN':
+          navigate('/admin/dashboard');
+          break;
+        case 'RECEPTIONIST':
+          navigate('/reception/dashboard');
+          break;
+        case 'CHEF':
+        case 'KITCHEN_HELPER':
+          navigate('/kitchen/dashboard');
+          break;
+        case 'PANTRY_BOY':
+          navigate('/pantry/dashboard');
+          break;
+        case 'CLEANER':
+          navigate('/housekeeping/dashboard');
+          break;
+        default:
+          navigate('/admin/dashboard');
+      }
     }
   }, [currentPath, guestUser, adminUser]);
 
@@ -262,8 +286,15 @@ function AppContent() {
     });
   };
 
+  // In-flight guard to prevent duplicate concurrent status fetches
+  const statusFetchInFlightRef = useRef(false);
+
   // Load status from backend
   const fetchStatus = useCallback(async () => {
+    if (statusFetchInFlightRef.current) {
+      return; // Avoid duplicate concurrent in-flight status fetches
+    }
+
     const currentToken = adminToken || guestToken;
     const tokenSource = adminToken ? 'AdminAuthContext (localStorage adminToken)' : (guestToken ? 'GuestAuthContext (localStorage guestToken)' : 'None');
     if (!currentToken) {
@@ -271,6 +302,7 @@ function AppContent() {
       return;
     }
 
+    statusFetchInFlightRef.current = true;
     const requestUrl = `${API_URL}/status?_t=${new Date().getTime()}`;
     const authHeader = `Bearer ${currentToken}`;
 
@@ -305,27 +337,41 @@ function AppContent() {
         return;
       }
 
-      if (!res.ok) {
-        const errorText = await res.text().catch(() => '');
-        console.error(`[API Server Error] HTTP ${res.status} - ${errorText}`);
-        throw new Error(`Failed to fetch dashboard data: HTTP ${res.status}`);
+      if (res.ok) {
+        const data = await res.json();
+        console.log('[API Response Body]', data);
+
+        if (Array.isArray(data.rooms)) {
+          setRooms(data.rooms);
+        }
+        if (data.systemDate) setSystemDate(data.systemDate);
+        if (data.todayCheckins !== undefined) setTodayCheckins(data.todayCheckins);
+        if (data.todayCheckouts !== undefined) setTodayCheckouts(data.todayCheckouts);
+        if (data.continuedRooms !== undefined) setContinuedRooms(data.continuedRooms);
+        if (data.cashLog) setCashLog(data.cashLog);
+        if (data.upcomingReservations) setUpcomingReservations(data.upcomingReservations || []);
+
+        setDataStatus(data.data_status || 'fresh');
+        setStaleReason(data.stale_reason || null);
+      } else {
+        const errorJson = await res.json().catch(() => null);
+        console.warn('[API Server Warning] Non-200 status response from backend:', res.status, errorJson);
+        if (res.status === 503 || errorJson?.code === 'FIRESTORE_RESOURCE_EXHAUSTED') {
+          setDataStatus('degraded');
+          setStaleReason('FIRESTORE_RESOURCE_EXHAUSTED');
+        }
       }
-
-      const data = await res.json();
-      console.log('[API Response Body]', data);
-
-      setRooms(data.rooms);
-      setSystemDate(data.systemDate);
-      setTodayCheckins(data.todayCheckins);
-      setTodayCheckouts(data.todayCheckouts);
-      setContinuedRooms(data.continuedRooms);
-      setCashLog(data.cashLog);
-      setUpcomingReservations(data.upcomingReservations || []);
     } catch (err) {
-      console.error('[API Network Error] Backend unreachable / connection error:', err);
-      setIsBackendOnline(false);
+      if (err.name === 'AbortError') {
+        console.warn('[API Warning] Status request timed out (5s). Preserving backend online state.');
+        setDataStatus('degraded');
+        setStaleReason('REQUEST_TIMEOUT');
+      } else {
+        console.error('[API Network Error] Backend unreachable / connection error:', err);
+        setIsBackendOnline(false);
+      }
     } finally {
-      // Always stop loading — no matter what happens
+      statusFetchInFlightRef.current = false;
       setIsLoading(false);
     }
   }, [adminToken, guestToken, navigate]);
@@ -393,6 +439,9 @@ function AppContent() {
     const poll = async () => {
       // Don't poll while a modal is open (to avoid data flickering mid-operation)
       if (activeModal) return;
+      // Skip automatic background interval poll if page/tab is currently hidden
+      if (typeof document !== 'undefined' && document.hidden) return;
+
       setIsSyncing(true);
       try {
         await fetchStatus();
@@ -407,15 +456,28 @@ function AppContent() {
     // Immediate first poll
     poll();
     const interval = setInterval(poll, 20000); // every 20 seconds
-    return () => clearInterval(interval);
+
+    // Visibility change listener: refresh immediately upon returning to tab
+    const handleVisibilityChange = () => {
+      if (typeof document !== 'undefined' && !document.hidden && !activeModal) {
+        poll();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [adminToken, adminUser?.role, activeModal]);
+  }, [adminToken, adminUser?.role, activeModal, fetchStatus]);
 
 
   useEffect(() => {
-    if (adminToken || guestToken) {
+    // For guests (non-admin), trigger initial status load here (admins are polled by the effect above)
+    if (guestToken && !adminToken) {
       fetchStatus();
-    } else {
+    } else if (!adminToken && !guestToken) {
       setIsLoading(false);
     }
 
@@ -789,12 +851,19 @@ function AppContent() {
   };
 
   // Shift guest room
-  const shiftGuest = async (fromRoomNumber, toRoomNumber) => {
+  const shiftGuest = async (fromRoomNumber, toRoomNumber, adjustmentOptions = {}) => {
     try {
       const res = await fetch(`${API_URL}/rooms/shift`, {
         method: 'POST',
         headers: getApiHeaders(adminToken, { 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ fromRoomNumber, toRoomNumber })
+        body: JSON.stringify({
+          fromRoomNumber,
+          toRoomNumber,
+          adjustmentType: adjustmentOptions.adjustmentType || 'AUTOMATIC',
+          manualAdjustmentAmount: adjustmentOptions.manualAdjustmentAmount || 0,
+          manualAdjustmentReason: adjustmentOptions.manualAdjustmentReason || '',
+          idempotencyKey: `shift_${fromRoomNumber}_${toRoomNumber}_${Date.now()}`
+        })
       });
 
       if (!res.ok) {
@@ -814,12 +883,12 @@ function AppContent() {
   };
 
   // Add bill posting ledger item
-  const addLedgerItem = async (roomNumber, desc, amount) => {
+  const addLedgerItem = async (roomNumber, desc, amount, category = 'General') => {
     try {
       const res = await fetch(`${API_URL}/rooms/${roomNumber}/ledger`, {
         method: 'POST',
         headers: getApiHeaders(adminToken, { 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ desc, amount })
+        body: JSON.stringify({ desc, amount, category })
       });
 
       if (!res.ok) {
@@ -834,10 +903,10 @@ function AppContent() {
       // Update selectedRoom state locally for CheckoutModal reactive sync
       setSelectedRoom(prev => {
         if (prev && prev.number === roomNumber) {
-          const nextId = prev.ledger.length > 0 ? Math.max(...prev.ledger.map(item => item.id)) + 1 : 1;
+          const nextId = prev.ledger && prev.ledger.length > 0 ? Math.max(...prev.ledger.map(item => item.id || 0)) + 1 : 1;
           return {
             ...prev,
-            ledger: [...prev.ledger, { id: nextId, desc, qty: 1, amount }]
+            ledger: [...(prev.ledger || []), { id: nextId, desc, qty: 1, amount, category }]
           };
         }
         return prev;
@@ -902,11 +971,13 @@ function AppContent() {
     }
   };
 
-  // Helper date formatter
+  // Helper date formatter — converts YYYY-MM-DD (or "YYYY-MM-DD HH:mm") → DD-Mon-YYYY
   const formatDateString = (dateStr) => {
     if (!dateStr) return '';
-    const parts = dateStr.split('-');
-    if (parts.length !== 3) return dateStr;
+    // Strip any time component (e.g. "2026-08-19 11:00" → "2026-08-19")
+    const datePart = String(dateStr).split(' ')[0];
+    const parts = datePart.split('-');
+    if (parts.length !== 3) return datePart;
     const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     const year = parts[0];
     const month = months[parseInt(parts[1], 10) - 1];
@@ -930,7 +1001,7 @@ function AppContent() {
     inactive: inactiveCount
   };
 
-  const occupancyRate = Math.round((occupiedCount / rooms.length) * 100);
+  const occupancyRate = rooms.length === 0 ? 0 : Math.round((occupiedCount / rooms.length) * 100);
 
   const globalStats = {
     total: rooms.length,
@@ -965,19 +1036,30 @@ function AppContent() {
   }
 
   const handleAuthSuccess = (userData, userToken) => {
-    if (userData.role === 'admin' || userData.loginType === 'staff') {
+    // Determine whether this is a staff/admin user regardless of which auth path delivered it.
+    // getMe now returns loginType:'staff'|'admin' and type:'staff'|'admin'.
+    // Legacy JWT path returns loginType:'staff'.
+    const roleUpper    = (userData.role || '').toUpperCase();
+    const loginType    = (userData.loginType || userData.type || '').toLowerCase();
+    const isStaffLogin = loginType === 'staff' || loginType === 'admin'
+      || roleUpper === 'ADMIN' || roleUpper === 'SUPER_ADMIN'
+      || roleUpper === 'RECEPTIONIST' || roleUpper === 'CHEF'
+      || roleUpper === 'KITCHEN_HELPER' || roleUpper === 'PANTRY_BOY' || roleUpper === 'CLEANER';
+
+    if (isStaffLogin) {
       adminLogin(userData, userToken);
-      
-      // Route based on role
-      switch (userData.role) {
+
+      // Route to the correct dashboard based on the role returned by the server.
+      switch (roleUpper) {
+        case 'SUPER_ADMIN':
         case 'ADMIN':
-        case 'admin':
           navigate('/admin/dashboard');
           break;
         case 'RECEPTIONIST':
           navigate('/reception/dashboard');
           break;
         case 'CHEF':
+        case 'KITCHEN_HELPER':
           navigate('/kitchen/dashboard');
           break;
         case 'PANTRY_BOY':
@@ -987,6 +1069,7 @@ function AppContent() {
           navigate('/housekeeping/dashboard');
           break;
         default:
+          // Unknown staff role — send back to login, do NOT grant admin access
           navigate('/admin/login');
       }
     } else {
@@ -1207,6 +1290,8 @@ function AppContent() {
           <MetricsBar 
             stats={globalStats}
             systemStatus={isBackendOnline}
+            dataStatus={dataStatus}
+            staleReason={staleReason}
           />
 
 
@@ -1223,6 +1308,7 @@ function AppContent() {
             isOpen={activeModal === 'checkout'}
             onClose={() => { setActiveModal(null); setSelectedRoom(null); }}
             room={selectedRoom}
+            token={adminToken}
             onCheckOut={checkOutGuest}
             onAddLedgerItem={addLedgerItem}
             onModifyClick={() => setActiveModal('modify_checkin')}
@@ -1313,6 +1399,7 @@ function AppContent() {
           onCheckInClick={(room) => { setSelectedRoom(room); setActiveModal('checkin'); }}
           onCheckOutClick={(room) => { setSelectedRoom(room); setActiveModal('checkout'); }}
           onRoomStatusChange={handleRoomStatusChange}
+          token={adminToken}
         />
         </div>
       </RoleProtectedRoute>

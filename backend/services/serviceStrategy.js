@@ -15,7 +15,6 @@
  */
 
 import { isFirestoreServicesEnabled, isFirestoreReadsEnabled } from '../config/featureFlags.js';
-import { executeReadCanary } from './dualReadVerificationService.js';
 
 export const STRATEGY_MODE = {
   MYSQL: 'MYSQL',
@@ -168,13 +167,8 @@ export async function executeServiceRead({
 
   // FIRESTORE_WITH_MYSQL_FALLBACK Mode:
   try {
-    const canaryResult = await executeReadCanary({
-      flagCheckFn: () => true,
-      endpointName: domainName,
-      fetchFirestoreFn,
-      validateAndFormatFn,
-      timeoutMs
-    });
+    const raw = await fetchFirestoreFn();
+    const canaryResult = validateAndFormatFn(raw);
 
     if (canaryResult !== null && canaryResult !== undefined) {
       recordLatency();

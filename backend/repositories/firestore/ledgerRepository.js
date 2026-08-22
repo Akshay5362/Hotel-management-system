@@ -34,43 +34,80 @@ export async function getLedgerItemByIdFirestore(itemId, options = {}) {
 
 export async function getLedgerItemsByBookingFirestore(bookingId, options = {}) {
   if (!bookingId) return [];
-  const parentId = String(bookingId).startsWith('bkg_') ? String(bookingId) : formatBookingId(bookingId);
-  const rawId = String(bookingId).replace(/^bkg_/, '');
+  const strId = String(bookingId).trim();
+  const rawId = strId.replace(/^(booking_|bkg_)/, '');
+  const bookingNumber = rawId.startsWith('BKG-') ? rawId : `BKG-${rawId}`;
 
-  // 1. Query root collection by booking_id or mysql_booking_id
-  const rootByDocId = await listDocs(COLLECTION, {
-    filters: [{ field: 'booking_id', op: '==', value: parentId }],
-    transaction: options.transaction
-  });
-
-  const rootByRawId = await listDocs(COLLECTION, {
-    filters: [{ field: 'booking_id', op: '==', value: rawId }],
-    transaction: options.transaction
-  });
-
-  const rootByMysqlId = !isNaN(Number(rawId))
-    ? await listDocs(COLLECTION, {
-        filters: [{ field: 'mysql_booking_id', op: '==', value: Number(rawId) }],
-        transaction: options.transaction
-      })
-    : [];
-
-  // 2. Query subcollection
-  const subDocs = await listDocs(PARENT_COLLECTION, {
-    parentDocId: parentId,
-    subcollectionName: COLLECTION,
-    transaction: options.transaction
-  });
+  const queryIds = Array.from(new Set([
+    strId,
+    rawId,
+    `booking_${rawId}`,
+    `bkg_${rawId}`,
+    `booking_${bookingNumber}`,
+    `bkg_${bookingNumber}`,
+    bookingNumber,
+    formatBookingId(strId)
+  ]));
 
   const map = new Map();
-  [...rootByDocId, ...rootByRawId, ...rootByMysqlId, ...subDocs].forEach(item => {
-    if (item && item.id) {
-      // Normalize description field from legacy 'desc'
-      item.description = item.description || item.desc || '';
-      item.qty = item.qty !== undefined ? item.qty : (item.quantity !== undefined ? item.quantity : 1);
-      map.set(item.id, item);
+
+  for (const idVal of queryIds) {
+    const rootByBookingId = await listDocs(COLLECTION, {
+      filters: [{ field: 'booking_id', op: '==', value: idVal }],
+      transaction: options.transaction
+    });
+    rootByBookingId.forEach(item => {
+      if (item && item.id) {
+        item.description = item.description || item.desc || '';
+        item.qty = item.qty !== undefined ? item.qty : (item.quantity !== undefined ? item.quantity : 1);
+        map.set(item.id, item);
+      }
+    });
+
+    const rootByBookingNumber = await listDocs(COLLECTION, {
+      filters: [{ field: 'booking_number', op: '==', value: idVal }],
+      transaction: options.transaction
+    });
+    rootByBookingNumber.forEach(item => {
+      if (item && item.id) {
+        item.description = item.description || item.desc || '';
+        item.qty = item.qty !== undefined ? item.qty : (item.quantity !== undefined ? item.quantity : 1);
+        map.set(item.id, item);
+      }
+    });
+
+    if (!isNaN(Number(idVal))) {
+      const rootByMysql = await listDocs(COLLECTION, {
+        filters: [{ field: 'mysql_booking_id', op: '==', value: Number(idVal) }],
+        transaction: options.transaction
+      });
+      rootByMysql.forEach(item => {
+        if (item && item.id) {
+          item.description = item.description || item.desc || '';
+          item.qty = item.qty !== undefined ? item.qty : (item.quantity !== undefined ? item.quantity : 1);
+          map.set(item.id, item);
+        }
+      });
     }
-  });
+  }
+
+  // Also query subcollections if parent booking exists
+  for (const pId of queryIds) {
+    try {
+      const subDocs = await listDocs(PARENT_COLLECTION, {
+        parentDocId: pId,
+        subcollectionName: COLLECTION,
+        transaction: options.transaction
+      });
+      subDocs.forEach(item => {
+        if (item && item.id) {
+          item.description = item.description || item.desc || '';
+          item.qty = item.qty !== undefined ? item.qty : (item.quantity !== undefined ? item.quantity : 1);
+          map.set(item.id, item);
+        }
+      });
+    } catch (_) {}
+  }
 
   return Array.from(map.values()).sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0));
 }
@@ -109,10 +146,16 @@ export async function createLedgerItemFirestore(itemData, options = {}) {
     qty: Number(itemData.qty || itemData.quantity || 1),
     quantity: Number(itemData.quantity || itemData.qty || 1),
     amount: Number(itemData.amount),
-    type: itemData.type || 'CHARGE',
+    type: itemData.type || itemData.transaction_type || 'CHARGE',
     status: itemData.status || 'Pending',
     business_date: itemData.business_date || new Date().toISOString().split('T')[0],
     mysql_ledger_id: itemData.mysql_ledger_id || itemData.id || null,
+    // ── New fields (Phase D) ────────────────────────────────────────────────
+    transaction_type: itemData.transaction_type || 'CHARGE',
+    credit_amount:    Number(itemData.credit_amount || 0),
+    payment_mode:     itemData.payment_mode || null,
+    time_of_entry:    itemData.time_of_entry || null,
+    created_by:       itemData.created_by    || null,
     created_at: itemData.created_at || new Date().toISOString()
   };
 

@@ -13,18 +13,72 @@ const COLLECTION = 'bookings';
 
 export async function getBookingByIdFirestore(bookingId, options = {}) {
   if (!bookingId) return null;
-  const docId = String(bookingId).startsWith('bkg_') ? String(bookingId) : formatBookingId(bookingId);
-  return await getDoc(COLLECTION, docId, options);
+  const strId = String(bookingId).trim();
+
+  // 1. Direct document lookup (handles 'booking_BKG-859876', 'bkg_101', exact doc ID)
+  const directDoc = await getDoc(COLLECTION, strId, options);
+  if (directDoc) return directDoc;
+
+  // 2. Try variations of prefixes
+  const candidates = [
+    strId.startsWith('booking_') ? strId : `booking_${strId}`,
+    strId.startsWith('bkg_') ? strId : `bkg_${strId}`,
+    formatBookingId(strId)
+  ];
+
+  for (const candidateId of candidates) {
+    const doc = await getDoc(COLLECTION, candidateId, options);
+    if (doc) return doc;
+  }
+
+  // 3. Query by booking_number field
+  const byNumber = await getBookingByNumberFirestore(strId, options);
+  if (byNumber) return byNumber;
+
+  // 4. If query looks like a room number or room ID, resolve room's active or most recent booking
+  const cleanRoomNum = strId.replace(/^room_/, '');
+  const roomDoc = await getDoc('rooms', `room_${cleanRoomNum}`, options);
+  if (roomDoc && roomDoc.current_booking_id) {
+    const activeBkg = await getDoc(COLLECTION, roomDoc.current_booking_id, options);
+    if (activeBkg) return activeBkg;
+  }
+
+  // Fallback: search most recent booking associated with this room number (sorted in-memory to avoid index dependency)
+  const roomBookingsByNum = await listDocs(COLLECTION, {
+    filters: [{ field: 'room_number', op: '==', value: cleanRoomNum }],
+    transaction: options.transaction
+  });
+  const roomBookingsById = await listDocs(COLLECTION, {
+    filters: [{ field: 'room_id', op: '==', value: `room_${cleanRoomNum}` }],
+    transaction: options.transaction
+  });
+  const combined = [...roomBookingsByNum, ...roomBookingsById].sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+  if (combined.length > 0) {
+    return combined[0];
+  }
+
+  return null;
 }
 
 export async function getBookingByNumberFirestore(bookingNumber, options = {}) {
   if (!bookingNumber) return null;
-  const results = await listDocs(COLLECTION, {
-    filters: [{ field: 'booking_number', op: '==', value: String(bookingNumber) }],
-    limit: 1,
-    transaction: options.transaction
-  });
-  return results[0] || null;
+  const numStr = String(bookingNumber).trim();
+  const candidates = [
+    numStr,
+    numStr.startsWith('BKG-') ? numStr : `BKG-${numStr}`,
+    numStr.replace(/^(booking_|bkg_)/, '')
+  ];
+
+  for (const c of candidates) {
+    const results = await listDocs(COLLECTION, {
+      filters: [{ field: 'booking_number', op: '==', value: c }],
+      limit: 1,
+      transaction: options.transaction
+    });
+    if (results && results.length > 0) return results[0];
+  }
+
+  return null;
 }
 
 export async function getAllBookingsFirestore(options = {}) {
@@ -36,6 +90,36 @@ export async function getAllBookingsFirestore(options = {}) {
     startAfterDoc: cursor,
     transaction
   });
+}
+
+export async function getBookingsByGuestFirestore(guestId, options = {}) {
+  if (!guestId) return [];
+  const gStr = String(guestId).trim();
+  const rawId = gStr.replace(/^guest_/, '');
+  const candidates = Array.from(new Set([
+    gStr,
+    `guest_${rawId}`,
+    rawId
+  ])).slice(0, 10);
+
+  const map = new Map();
+
+  const byGuestId = await listDocs(COLLECTION, {
+    filters: [{ field: 'guest_id', op: 'in', value: candidates }],
+    transaction: options.transaction
+  });
+  byGuestId.forEach(item => { if (item && item.id) map.set(item.id, item); });
+
+  const numIds = candidates.map(Number).filter(n => !isNaN(n));
+  if (numIds.length > 0) {
+    const byMysqlGuestId = await listDocs(COLLECTION, {
+      filters: [{ field: 'mysql_guest_id', op: 'in', value: numIds.slice(0, 10) }],
+      transaction: options.transaction
+    });
+    byMysqlGuestId.forEach(item => { if (item && item.id) map.set(item.id, item); });
+  }
+
+  return Array.from(map.values()).sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
 }
 
 export async function createBookingFirestore(bookingData, options = {}) {
@@ -69,6 +153,10 @@ export async function createBookingFirestore(bookingData, options = {}) {
     notes: bookingData.notes || '',
     billing_instruction: bookingData.billing_instruction || '',
     meal_plan: bookingData.meal_plan || 'EP',
+    // ── New fields (Phase D) ────────────────────────────────────────────────
+    room_tariff:       bookingData.room_tariff !== undefined ? Number(bookingData.room_tariff) || null : null,
+    payment_mode:      bookingData.payment_mode      || null,
+    purpose_of_visit:  bookingData.purpose_of_visit  || null,
     mysql_booking_id: bookingData.mysql_booking_id || bookingData.id || null,
     created_at: bookingData.created_at || new Date().toISOString(),
     updated_at: bookingData.updated_at || new Date().toISOString()

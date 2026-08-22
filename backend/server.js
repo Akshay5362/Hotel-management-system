@@ -80,9 +80,9 @@ app.get('/', (req, res) => {
   res.send('Webline PMS Plus Backend API is running!');
 });
 
-import { isFirestoreOutboxWorkerEnabled, isFirestoreServicesEnabled, isFirestoreReadsEnabled, isFirestoreDualWriteEnabled } from './config/featureFlags.js';
-import { isWorkerRunning, stopOutboxWorker } from './services/outboxWorker.js';
+import { isFirestoreServicesEnabled, isFirestoreReadsEnabled } from './config/featureFlags.js';
 import { getServiceReadMetrics } from './services/serviceStrategy.js';
+import { readBudgetMonitor } from './utils/firestoreReadBudget.js';
 
 // Health check endpoint — used by wait-on in electron:dev workflow & Docker healthcheck
 app.get('/api/health', (req, res) => {
@@ -91,20 +91,32 @@ app.get('/api/health', (req, res) => {
     service: 'hotel-pms-backend',
     port: PORT,
     feature_flags: {
-      outbox_worker: isFirestoreOutboxWorkerEnabled(),
-      dual_write: isFirestoreDualWriteEnabled(),
+      outbox_worker: false,
+      dual_write: false,
       firestore_reads: isFirestoreReadsEnabled(),
       use_firestore_services: isFirestoreServicesEnabled()
     },
     outbox_worker: {
-      enabled: isFirestoreOutboxWorkerEnabled(),
-      running: isWorkerRunning()
+      enabled: false,
+      running: false,
+      decommissioned: true
     },
-    telemetry: getServiceReadMetrics()
+    telemetry: getServiceReadMetrics(),
+    read_budget: {
+      estimated_reads_today: readBudgetMonitor.estimatedReadsToday,
+      safety_budget: readBudgetMonitor.SAFETY_BUDGET,
+      status: readBudgetMonitor.getDiagnostics().status
+    }
   });
 });
 
-
+// Dedicated Firestore Read Budget & Rate-Limit Diagnostics (in-memory, 0 Firestore reads)
+app.get('/api/diagnostics/read-budget', (req, res) => {
+  res.json({
+    status: 'ok',
+    diagnostics: readBudgetMonitor.getDiagnostics()
+  });
+});
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -114,35 +126,12 @@ app.use((err, req, res, next) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Backend server is running on http://0.0.0.0:${PORT}`);
-
-  // ── Outbox Worker Startup ─────────────────────────────────────────────────
-  // Starts the transactional outbox polling daemon only when
-  // ENABLE_FIRESTORE_OUTBOX_WORKER=true. When the flag is false (current safe
-  // state), startOutboxWorker() logs a message and exits — no interval, no
-  // Firestore writes, zero impact on MySQL business operations.
-  import('./services/outboxWorker.js')
-    .then(({ startOutboxWorker }) => {
-      try {
-        startOutboxWorker();
-      } catch (err) {
-        // Worker startup failure must not disrupt hotel operations.
-        console.error('[Server] Outbox worker failed to start:', err.message);
-      }
-    })
-    .catch(err => {
-      console.error('[Server] Failed to import outboxWorker module:', err.message);
-    });
 });
 
 // ── Graceful Shutdown Handlers (SIGTERM / SIGINT) ───────────────────────────
-// Ensures clean worker termination and HTTP connection draining in Docker/K8s environments.
+// Ensures clean HTTP connection draining in Docker/K8s environments.
 const gracefulShutdown = (signal) => {
   console.log(`[Server] ${signal} signal received. Initiating graceful shutdown...`);
-  try {
-    stopOutboxWorker();
-  } catch (err) {
-    console.error('[Server] Error stopping outbox worker during shutdown:', err.message);
-  }
   server.close(() => {
     console.log('[Server] HTTP server closed.');
     process.exit(0);

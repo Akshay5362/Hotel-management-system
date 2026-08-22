@@ -3,10 +3,14 @@ import fs from 'fs';
 import path from 'path';
 import { RoomStatusService } from '../services/roomStatusService.js';
 import { BusinessDateService, BD_ERRORS } from '../services/businessDateService.js';
-import { AvailabilityService } from '../services/AvailabilityService.js';
-import { enqueue } from '../services/outboxService.js';
-import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
-import { CompoundEventBuilder } from '../services/compoundEventBuilder.js';
+import { FirestoreAvailabilityService } from '../services/firestoreAvailabilityService.js';
+import { isFirestoreRoomStatusShadowEnabled, isFirestoreRoomStatusServingEnabled, isFirebaseOnlyBusinessDateEnabled } from '../config/featureFlags.js';
+import { getSystemDateDetailsFirestore } from '../repositories/firestore/systemSettingsRepository.js';
+import { FirestoreShadowComparisonService } from '../services/firestoreShadowComparisonService.js';
+import { FirestoreRoomStatusService } from '../services/firestoreRoomStatusService.js';
+import { SafeCutoverFallbackService } from '../services/safeCutoverFallbackService.js';
+import { GuestAdminService } from '../services/guestAdminService.js';
+import { GuestRequestsService, invalidateGuestRequestsCache } from '../services/guestRequestsService.js';
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -65,91 +69,167 @@ function addDay(d) {
  */
 
 
+import { readBudgetMonitor } from '../utils/firestoreReadBudget.js';
+
+let lastKnownGoodStatusSnapshot = null;
+let quotaExhaustedUntil = 0;
+const NEGATIVE_QUOTA_CACHE_TTL_MS = 15000; // 15 seconds negative cache for quota exhaustion
+
+// Test/Diagnostic inspection helpers
+export const _getQuotaExhaustedUntil = () => quotaExhaustedUntil;
+export const _setQuotaExhaustedUntil = (ts) => { quotaExhaustedUntil = ts; };
+export const _getLastKnownGoodStatusSnapshot = () => lastKnownGoodStatusSnapshot;
+export const _setLastKnownGoodStatusSnapshot = (snap) => { lastKnownGoodStatusSnapshot = snap; };
+
 export const getStatus = async (req, res) => {
-  let connection;
-  try {
-    connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    await connection.commit();
-    connection.release();
-    connection = null;
-
-    const systemDate = await BusinessDateService.getBusinessDate(pool);
-    const [counterRows] = await pool.query(
-      "SELECT key_name, value_val FROM system_settings WHERE key_name IN ('today_checkins','today_checkouts','continued_rooms')"
-    );
-    const counterMap = {};
-    counterRows.forEach(r => { counterMap[r.key_name] = r.value_val; });
-    const todayCheckins  = parseInt(counterMap['today_checkins']  || '0', 10);
-    const todayCheckouts = parseInt(counterMap['today_checkouts'] || '0', 10);
-    const continuedRooms = parseInt(counterMap['continued_rooms'] || '0', 10);
-
-
-    // Compute all dynamic room statuses via RoomStatusService
-    const computedRooms = await RoomStatusService.getRoomStatuses(pool, systemDate);
-
-    // Group ledgers by active booking_id to prevent old checked-out charges from polluting current folio
-    const activeBookingIds = computedRooms
-      .map(r => r.booking_id)
-      .filter(Boolean);
-
-    let ledgerByBookingId = {};
-    if (activeBookingIds.length > 0) {
-      const placeholders = activeBookingIds.map(() => '?').join(',');
-      const [ledgerItems] = await pool.query(
-        `SELECT * FROM ledger_items WHERE booking_id IN (${placeholders})`,
-        activeBookingIds
-      );
-      ledgerItems.forEach(item => {
-        const bookingId = item.booking_id;
-        if (!ledgerByBookingId[bookingId]) {
-          ledgerByBookingId[bookingId] = [];
-        }
-        ledgerByBookingId[bookingId].push({
-          id: item.id,
-          desc: item.desc,
-          qty: item.qty,
-          amount: item.amount
-        });
+  // ── Short-Lived Negative Cache for Firestore Quota Exhaustion ──────────────
+  // If Firestore quota was recently exhausted within the 15s window, avoid repeating live gRPC calls
+  if (Date.now() < quotaExhaustedUntil) {
+    if (lastKnownGoodStatusSnapshot && Array.isArray(lastKnownGoodStatusSnapshot.rooms) && lastKnownGoodStatusSnapshot.rooms.length > 0) {
+      return res.json({
+        ...lastKnownGoodStatusSnapshot,
+        data_status: 'stale',
+        stale_reason: 'FIRESTORE_RESOURCE_EXHAUSTED',
+        stale_since: new Date(lastKnownGoodStatusSnapshot.timestamp).toISOString(),
+        error_message: 'Firestore temporarily quota-degraded (cached 15s window)'
       });
     }
+    return res.status(503).json({
+      error: 'Firestore database is temporarily unavailable due to daily project quota limit (Google Cloud Free Tier).',
+      code: 'FIRESTORE_RESOURCE_EXHAUSTED',
+      firestore_degraded: true,
+      backend_online: true,
+      retry_after_seconds: Math.max(1, Math.ceil((quotaExhaustedUntil - Date.now()) / 1000))
+    });
+  }
 
-    const processedRooms = computedRooms.map(r => ({
-      id: r.id,
-      number: r.number,
-      type: r.type,
-      status: r.status,
-      is_active: r.is_active,
-      housekeeping_status: r.housekeeping_status,
-      rate: r.rate,
-      guestName: r.guestName,
-      phone: r.phone,
-      date_of_birth: r.date_of_birth,
-      pax: r.pax,
-      deposit: r.deposit,
-      checkInDate: r.checkInDate,
-      expectedCheckOutDate: r.expectedCheckOutDate,
-      address: r.address,
-      gst_no: r.gst_no,
-      pincode: r.pincode,
-      country: r.country,
-      arrival_from: r.arrival_from,
-      departure_to: r.departure_to,
-      user_id: r.user_id,
-      booking_id: r.booking_id,
-      reservation_id: r.reservation_id,
-      booking_number: r.booking_number,
-      billing_instruction: r.billing_instruction || 'Direct to Guest',
-      meal_plan: r.meal_plan || 'EP',
-      ledger: (r.booking_id && ledgerByBookingId[r.booking_id]) ? ledgerByBookingId[r.booking_id] : []
-    })).sort((a, b) => {
-      const numA = parseInt(a.number, 10);
-      const numB = parseInt(b.number, 10);
-      if (!isNaN(numA) && !isNaN(numB) && numA !== numB) {
-        return numA - numB;
+  // ── Application Read Budget Safety Guardrail (35K reads) ───────────────────
+  if (readBudgetMonitor.isProtectionThresholdReached()) {
+    if (lastKnownGoodStatusSnapshot && Array.isArray(lastKnownGoodStatusSnapshot.rooms) && lastKnownGoodStatusSnapshot.rooms.length > 0) {
+      return res.json({
+        ...lastKnownGoodStatusSnapshot,
+        data_status: 'stale',
+        stale_reason: 'READ_BUDGET_PROTECTION',
+        stale_since: new Date(lastKnownGoodStatusSnapshot.timestamp).toISOString(),
+        error_message: 'Application safety budget reached (35K reads). Serving cached status to protect remaining daily quota.'
+      });
+    }
+    return res.status(503).json({
+      error: 'Application Firestore daily read budget safety threshold reached (35,000 reads). Non-essential status polling paused.',
+      code: 'READ_BUDGET_PROTECTION',
+      firestore_degraded: true,
+      backend_online: true,
+      budget_diagnostics: readBudgetMonitor.getDiagnostics()
+    });
+  }
+
+  try {
+    const systemDate = await BusinessDateService.getBusinessDate();
+    let todayCheckins = 0;
+    let todayCheckouts = 0;
+    let continuedRooms = 0;
+
+    if (isFirebaseOnlyBusinessDateEnabled()) {
+      try {
+        const details = await getSystemDateDetailsFirestore();
+        if (details) {
+          todayCheckins = details.today_checkins || 0;
+          todayCheckouts = details.today_checkouts || 0;
+          continuedRooms = details.continued_rooms || 0;
+        }
+      } catch (e) {
+        console.warn('[getStatus] Failed to read daily counters from Firestore, falling back to 0:', e.message);
       }
-      return String(a.number || '').localeCompare(String(b.number || ''), undefined, { numeric: true, sensitivity: 'base' });
+    } else {
+      const [counterRows] = await pool.query(
+        "SELECT key_name, value_val FROM system_settings WHERE key_name IN ('today_checkins','today_checkouts','continued_rooms')"
+      );
+      const counterMap = {};
+      counterRows.forEach(r => { counterMap[r.key_name] = r.value_val; });
+      todayCheckins  = parseInt(counterMap['today_checkins']  || '0', 10);
+      todayCheckouts = parseInt(counterMap['today_checkouts'] || '0', 10);
+      continuedRooms = parseInt(counterMap['continued_rooms'] || '0', 10);
+    }
+
+    // Helper function to fetch authoritative MySQL room status data
+    const fetchMysqlProcessedRooms = async () => {
+      const computedRooms = await RoomStatusService.getRoomStatuses(pool, systemDate);
+      const activeBookingIds = computedRooms
+        .map(r => r.booking_id)
+        .filter(Boolean);
+
+      let ledgerByBookingId = {};
+      if (activeBookingIds.length > 0) {
+        const placeholders = activeBookingIds.map(() => '?').join(',');
+        const [ledgerItems] = await pool.query(
+          `SELECT * FROM ledger_items WHERE booking_id IN (${placeholders})`,
+          activeBookingIds
+        );
+        ledgerItems.forEach(item => {
+          const bookingId = item.booking_id;
+          if (!ledgerByBookingId[bookingId]) {
+            ledgerByBookingId[bookingId] = [];
+          }
+          ledgerByBookingId[bookingId].push({
+            id: item.id,
+            desc: item.desc,
+            qty: item.qty,
+            amount: item.amount
+          });
+        });
+      }
+
+      return computedRooms.map(r => ({
+        id: r.id,
+        number: r.number,
+        type: r.type,
+        status: r.status,
+        is_active: r.is_active,
+        housekeeping_status: r.housekeeping_status,
+        rate: r.rate,
+        guestName: r.guestName,
+        phone: r.phone,
+        date_of_birth: r.date_of_birth,
+        pax: r.pax,
+        deposit: r.deposit,
+        checkInDate: r.checkInDate,
+        expectedCheckOutDate: r.expectedCheckOutDate,
+        address: r.address,
+        gst_no: r.gst_no,
+        pincode: r.pincode,
+        country: r.country,
+        arrival_from: r.arrival_from,
+        departure_to: r.departure_to,
+        user_id: r.user_id,
+        booking_id: r.booking_id,
+        reservation_id: r.reservation_id,
+        booking_number: r.booking_number,
+        billing_instruction: r.billing_instruction || 'Direct to Guest',
+        meal_plan: r.meal_plan || 'EP',
+        ledger: (r.booking_id && ledgerByBookingId[r.booking_id]) ? ledgerByBookingId[r.booking_id] : []
+      })).sort((a, b) => {
+        const numA = parseInt(a.number, 10);
+        const numB = parseInt(b.number, 10);
+        if (!isNaN(numA) && !isNaN(numB) && numA !== numB) {
+          return numA - numB;
+        }
+        return String(a.number || '').localeCompare(String(b.number || ''), undefined, { numeric: true, sensitivity: 'base' });
+      });
+    };
+
+    // Controlled Cutover: Primary Firestore Serving with Emergency MySQL Fallback
+    const processedRooms = await SafeCutoverFallbackService.executeWithFallback({
+      domain: 'room_status',
+      servingEnabled: isFirestoreRoomStatusServingEnabled(),
+      firestoreOp: () => FirestoreRoomStatusService.getRoomStatuses(systemDate),
+      mysqlOp: fetchMysqlProcessedRooms,
+      validate: SafeCutoverFallbackService.validateRoomStatuses,
+      shadowCompareFn: (fsRooms, mysqlRooms) => {
+        if (isFirestoreRoomStatusShadowEnabled()) {
+          FirestoreShadowComparisonService.compareRoomStatus(mysqlRooms, fsRooms, { businessDate: systemDate, endpoint: 'GET /api/status' });
+        }
+      },
+      context: { endpoint: 'GET /api/status', systemDate }
     });
 
     const [cashLog] = await pool.query('SELECT * FROM cash_logs WHERE business_date = ?', [systemDate]);
@@ -162,65 +242,107 @@ export const getStatus = async (req, res) => {
         b.room_id,
         b.check_in_date as checkInDate,
         b.expected_check_out_date as expectedCheckOutDate,
-        b.adults,
-        b.total_amount as totalAmount,
-        b.advance_amount as deposit,
         b.booking_status as status,
         g.full_name as guestName,
-        g.phone,
         r.number as roomNumber,
-        rt.code as roomType
+        rt.title as roomType
       FROM bookings b
-      JOIN guests g ON b.guest_id = g.id
-      JOIN rooms r ON b.room_id = r.id
-      JOIN room_types rt ON r.room_type_id = rt.id
+      LEFT JOIN guests g ON b.guest_id = g.id
+      LEFT JOIN rooms r ON b.room_id = r.id
+      LEFT JOIN room_types rt ON r.room_type_id = rt.id
       WHERE b.booking_status = 'Reserved'
+        AND b.check_in_date >= ?
       ORDER BY b.check_in_date ASC
-    `);
+    `, [systemDate]);
 
     const [futureResTable] = await pool.query(`
       SELECT 
         res.id as reservation_id,
-        res.reservation_number as ref_code,
+        res.id as booking_id,
         res.reservation_number as booking_number,
+        res.reservation_number,
         res.room_id,
-        res.room_number,
-        res.room_type as roomType,
-        res.guest_name as guest_name,
-        res.guest_name as guestName,
-        res.phone,
-        res.arrival_date as check_in_date,
         res.arrival_date as checkInDate,
-        res.departure_date as check_out_date,
         res.departure_date as expectedCheckOutDate,
-        res.adults as pax,
-        res.adults,
-        res.advance_payment as total_amount,
-        res.advance_payment as deposit,
-        res.status
+        res.status as status,
+        res.guest_name as guestName,
+        res.phone as phone,
+        res.adults as adults,
+        res.advance_payment as totalAmount,
+        COALESCE(r.number, res.room_number, '') as roomNumber,
+        COALESCE(rt.title, res.room_type, '') as roomType
       FROM reservations res
-      WHERE res.status IN ('Reserved', 'Confirmed')
+      LEFT JOIN rooms r ON res.room_id = r.id
+      LEFT JOIN room_types rt ON r.room_type_id = rt.id
+      WHERE res.status IN ('Confirmed', 'Reserved')
+        AND res.arrival_date >= ?
       ORDER BY res.arrival_date ASC
-    `);
+    `, [systemDate]);
 
     const upcomingReservations = [...futureBookings, ...futureResTable];
 
-    res.json({
+    const responsePayload = {
       systemDate,
       todayCheckins,
       todayCheckouts,
       continuedRooms,
       rooms: processedRooms,
       cashLog,
-      upcomingReservations: upcomingReservations || []
-    });
-  } catch (error) {
-    if (connection) {
-      try { await connection.rollback(); } catch (e) { }
-      connection.release();
+      upcomingReservations: upcomingReservations || [],
+      data_status: 'fresh'
+    };
+
+    // Successful query: clear negative quota cache
+    quotaExhaustedUntil = 0;
+
+    // Save as last-known-good snapshot if rooms array is populated
+    if (Array.isArray(processedRooms) && processedRooms.length > 0) {
+      lastKnownGoodStatusSnapshot = {
+        ...responsePayload,
+        timestamp: Date.now()
+      };
     }
+
+    return res.json(responsePayload);
+  } catch (error) {
     console.error('Error in getStatus controller:', error);
-    res.status(500).json({ error: 'Internal Server Error' });
+
+    const isQuotaError = error.code === 8 ||
+      (error.message && (error.message.includes('RESOURCE_EXHAUSTED') || error.message.includes('Quota exceeded'))) ||
+      (error.details && error.details.includes('Quota exceeded'));
+
+    if (isQuotaError) {
+      // Activate 15-second negative cache window to suppress repeated live Firestore attempts
+      quotaExhaustedUntil = Date.now() + NEGATIVE_QUOTA_CACHE_TTL_MS;
+    }
+
+    // Safe Degradation: If a valid previous snapshot exists, return it with explicit stale metadata
+    if (lastKnownGoodStatusSnapshot && Array.isArray(lastKnownGoodStatusSnapshot.rooms) && lastKnownGoodStatusSnapshot.rooms.length > 0) {
+      console.warn('[getStatus] Returning last-known-good status snapshot due to Firestore degraded state');
+      return res.json({
+        ...lastKnownGoodStatusSnapshot,
+        data_status: 'stale',
+        stale_reason: isQuotaError ? 'FIRESTORE_RESOURCE_EXHAUSTED' : (error.code || 'FIRESTORE_DEGRADED'),
+        stale_since: new Date(lastKnownGoodStatusSnapshot.timestamp).toISOString(),
+        error_message: error.message || 'Firestore temporarily degraded'
+      });
+    }
+
+    if (isQuotaError) {
+      return res.status(503).json({
+        error: 'Firestore database is temporarily unavailable due to daily project quota limit (Google Cloud Free Tier).',
+        code: 'FIRESTORE_RESOURCE_EXHAUSTED',
+        firestore_degraded: true,
+        backend_online: true,
+        retry_after_seconds: Math.max(1, Math.ceil((quotaExhaustedUntil - Date.now()) / 1000))
+      });
+    }
+
+    return res.status(500).json({
+      error: error.message || 'Internal Server Error',
+      code: error.code || 'STATUS_ERROR',
+      backend_online: true
+    });
   }
 };
 
@@ -228,6 +350,24 @@ export const runDayEnd = async (req, res) => {
   const { nextDate } = req.body;
   if (!nextDate) {
     return res.status(400).json({ error: 'Next business date is required' });
+  }
+
+  if (isFirebaseOnlyBusinessDateEnabled()) {
+    try {
+      await BusinessDateService.advanceBusinessDate(null, nextDate, {
+        auditorId: req.user?.id || null,
+        isFirebaseOnly: true
+      });
+
+      const confirmedDate = await BusinessDateService.getBusinessDate();
+      return res.json({ message: `Night audit complete. Business date rolled to ${confirmedDate}` });
+    } catch (error) {
+      if (error.name === 'BusinessDateError') {
+        console.warn(`[DayEnd] Rejected: [${error.code}] ${error.message}`);
+        return res.status(error.httpStatus).json({ error: error.message, code: error.code });
+      }
+      console.error('Error in runDayEnd controller (Firestore), falling back if permitted:', error);
+    }
   }
 
   let connection;
@@ -284,6 +424,122 @@ export const undoDayEnd = async (req, res) => {
   const adminId  = req.user?.id  || null;
   const username = req.user?.username || null;
 
+  // ── Firestore Primary Path for Undo Day End ────────────────────────────────
+  if (isFirebaseOnlyBusinessDateEnabled()) {
+    try {
+      const { listDocs, updateDoc, deleteDoc } = await import('../repositories/firestore/firestoreUtils.js');
+      const { createAuditLogFirestore } = await import('../repositories/firestore/auditLogsRepository.js');
+
+      const currentBusinessDate = await BusinessDateService.getBusinessDate();
+
+      const dayEndLogs = await listDocs('audit_logs', {
+        filters: [{ field: 'action', op: '==', value: 'DAY_END' }],
+        orderBy: [{ field: 'created_at', direction: 'desc' }],
+        limit: 1
+      });
+
+      if (!dayEndLogs || dayEndLogs.length === 0) {
+        return res.status(404).json({
+          error: 'No Day End has been executed yet. Nothing to undo.',
+          code: 'NO_DAY_END_FOUND',
+        });
+      }
+
+      const lastDayEnd = dayEndLogs[0];
+      const dayEndId = lastDayEnd.id;
+      const dayEndAt = new Date(lastDayEnd.created_at);
+      const rolledToDate = BusinessDateService.parseDate(lastDayEnd.business_date || lastDayEnd.new_business_date);
+
+      if (rolledToDate !== currentBusinessDate) {
+        return res.status(409).json({
+          error: `Cannot undo: current Business Date (${currentBusinessDate}) does not match the last Day End target (${rolledToDate}). Another Day End or manual date change may have occurred.`,
+          code: 'BUSINESS_DATE_MISMATCH',
+        });
+      }
+
+      let previousDate = lastDayEnd.previous_business_date;
+      if (!previousDate && lastDayEnd.details) {
+        const detailMatch = lastDayEnd.details.match(/rolled from (\d{4}-\d{2}-\d{2}) to (\d{4}-\d{2}-\d{2})/);
+        if (detailMatch) previousDate = detailMatch[1];
+      }
+
+      if (!previousDate) {
+        return res.status(500).json({
+          error: 'Cannot undo: audit log details do not contain the previous Business Date. The log may be corrupted.',
+          code: 'CORRUPT_AUDIT_LOG',
+        });
+      }
+
+      // Operational data checks in Firestore
+      const blockers = [];
+      const [newBookings, newPayments, newInvoices, newReservations, postLedger] = await Promise.all([
+        listDocs('bookings', { filters: [{ field: 'created_at', op: '>', value: dayEndAt.toISOString() }] }),
+        listDocs('payments', { filters: [{ field: 'created_at', op: '>', value: dayEndAt.toISOString() }] }),
+        listDocs('invoices', { filters: [{ field: 'created_at', op: '>', value: dayEndAt.toISOString() }] }),
+        listDocs('reservations', { filters: [{ field: 'created_at', op: '>', value: dayEndAt.toISOString() }] }),
+        listDocs('ledger_items', { filters: [{ field: 'created_at', op: '>', value: dayEndAt.toISOString() }] })
+      ]);
+
+      const activeNewBookings = (newBookings || []).filter(b => String(b.booking_status || '').toLowerCase() !== 'cancelled');
+      if (activeNewBookings.length > 0) blockers.push(`${activeNewBookings.length} new check-ins`);
+      if ((newPayments || []).length > 0) blockers.push(`${newPayments.length} new payments`);
+      if ((newInvoices || []).length > 0) blockers.push(`${newInvoices.length} new invoices`);
+      if ((newReservations || []).length > 0) blockers.push(`${newReservations.length} new reservations`);
+
+      const nonRolloverLedger = (postLedger || []).filter(item => {
+        const desc = String(item.desc || '');
+        return !desc.includes('Rollover') && !desc.includes('Room Tariff') && !desc.includes('Taxes & GST');
+      });
+      if (nonRolloverLedger.length > 0) blockers.push(`${nonRolloverLedger.length} new ledger entries (non-rollover)`);
+
+      if (blockers.length > 0) {
+        return res.status(409).json({
+          error: `Undo rejected: operational data exists after the last Day End. Remove or reverse these records first.`,
+          code: 'POST_DAY_END_DATA_EXISTS',
+          blockers,
+        });
+      }
+
+      // Delete rollover ledger items in Firestore for rolledToDate
+      const rolloverItems = await listDocs('ledger_items', {
+        filters: [{ field: 'business_date', op: '==', value: rolledToDate }]
+      });
+      for (const item of (rolloverItems || [])) {
+        const desc = String(item.desc || '');
+        if (desc.includes('Rollover') || desc.includes('Room Tariff') || desc.includes('Taxes & GST')) {
+          await deleteDoc('ledger_items', item.id);
+        }
+      }
+
+      // Restore business date in Firestore
+      await BusinessDateService.setBusinessDate(null, previousDate, { allowBackward: true });
+
+      // Mark Day End audit log as undone
+      await updateDoc('audit_logs', dayEndId, { action: 'DAY_END_UNDONE' });
+
+      // Insert UNDO_DAY_END log
+      const undoDetail = `Day End #${dayEndId} reversed by ${username || 'admin'}. Business Date restored from ${rolledToDate} to ${previousDate}.`;
+      await createAuditLogFirestore({
+        user_id: adminId,
+        action: 'UNDO_DAY_END',
+        details: undoDetail,
+        business_date: previousDate,
+        previous_business_date: rolledToDate,
+        new_business_date: previousDate
+      });
+
+      return res.json({
+        message: `Day End undone. Business Date restored from ${rolledToDate} to ${previousDate}.`,
+        previousDate,
+        restoredDate: previousDate
+      });
+
+    } catch (fsErr) {
+      console.warn('[undoDayEnd] Firestore primary undo failed, attempting MySQL fallback:', fsErr.message);
+    }
+  }
+
+  // ── Legacy MySQL Fallback Path ──────────────────────────────────────────
   let connection;
   try {
     connection = await pool.getConnection();
@@ -468,42 +724,6 @@ export const undoDayEnd = async (req, res) => {
     );
     console.log(`[UndoDayEnd] Counters restored: checkins=${restoredCheckins}, checkouts=${restoredCheckouts}, continued_rooms=${restoredContinuedRooms}`);
 
-    // ── Phase 4G-C: Outbox — COMPOUND_UNDO_DAY_END ───────────────────────────
-    // Enqueued AFTER all MySQL mutations and BEFORE commit().
-    // Uses restored absolute counter values — no FieldValue.increment().
-    if (isFirestoreDualWriteEnabled()) {
-      const eventOccurredAt = new Date().toISOString();
-
-      const undoEvent = new CompoundEventBuilder({
-        event_type:     'COMPOUND_UNDO_DAY_END',
-        aggregate_type: 'SYSTEM',
-        aggregate_id:   `undo_day_end_${previousDate}`
-      });
-
-      undoEvent.addRootWrite({
-        collection:  'settings',
-        document_id: 'system_date',
-        operation:   'set_merge',
-        data: {
-          current_date:    previousDate,
-          system_date:     previousDate,
-          today_checkins:  restoredCheckins,
-          today_checkouts: restoredCheckouts,
-          continued_rooms: restoredContinuedRooms,
-          updated_at:      eventOccurredAt
-        }
-      });
-
-      const undoPayload = undoEvent.build();
-      await enqueue(connection, {
-        event_type:     undoPayload.event_type,
-        aggregate_type: undoPayload.aggregate_type,
-        aggregate_id:   undoPayload.aggregate_id,
-        payload:        undoPayload
-      });
-      console.log(`[UndoDayEnd] Compound outbox event enqueued: ${undoPayload.operation_id}`);
-    }
-
     await connection.commit();
 
     const restoredDate = await BusinessDateService.getBusinessDate(pool);
@@ -527,9 +747,18 @@ export const undoDayEnd = async (req, res) => {
 /** Admin endpoint — get all pending guest requests with room & guest details */
 export const getGuestRequests = async (req, res) => {
   try {
+    // Primary: Authoritative Firestore serving with 15s caching and in-flight deduplication
+    try {
+      const fsData = await GuestRequestsService.getGuestRequests({ skipCache: false });
+      if (fsData && Array.isArray(fsData.requests)) {
+        return res.json(fsData);
+      }
+    } catch (fsErr) {
+      console.warn('[getGuestRequests] Firestore serving error, attempting MySQL fallback:', fsErr.message);
+    }
+
+    // ── Fallback: Legacy MySQL Path ──────────────────────────────────────────
     // 1. Ledger-based service requests (food orders, room service, laundry etc.)
-    //    These appear in ledger_items with desc starting with 'Food Order:' or service names
-    //    We join bookings → guests → rooms to get context
     const [serviceItems] = await pool.query(`
       SELECT 
         li.id,
@@ -590,7 +819,6 @@ export const getGuestRequests = async (req, res) => {
 
 
     // 3. Checkout requests — from audit_logs with action GUEST_CHECKOUT_REQUEST
-    // Joined with bookings/rooms to get metadata and only show active stay requests
     const [checkoutRequests] = await pool.query(`
       SELECT 
         al.id,
@@ -661,43 +889,58 @@ export const resolveGuestRequest = async (req, res) => {
   const { id } = req.params;
   if (!id) return res.status(400).json({ error: 'Request ID is required' });
 
-  let connection;
   try {
-    connection = await pool.getConnection();
-    await connection.beginTransaction();
+    // 1. Primary Firestore resolution
+    try {
+      await GuestRequestsService.resolveRequest(id, req.user?.id || 'admin');
+    } catch (fsErr) {
+      if (fsErr.status === 400 || fsErr.status === 404) {
+        return res.status(fsErr.status).json({ error: fsErr.message });
+      }
+      console.warn('[resolveGuestRequest] Firestore resolution warning:', fsErr.message);
+    }
 
-    if (id.startsWith('svc_')) {
-      const realId = id.replace('svc_', '');
-      await connection.query(
-        "UPDATE ledger_items SET status = 'Completed' WHERE id = ?",
-        [realId]
-      );
-    } else if (id.startsWith('mnt_')) {
-      const realId = id.replace('mnt_', '');
-      await connection.query(
-        "UPDATE maintenance SET status = 'Resolved' WHERE id = ?",
-        [realId]
-      );
-    } else if (id.startsWith('co_')) {
-      const realId = id.replace('co_', '');
-      await connection.query(
-        "UPDATE audit_logs SET action = 'GUEST_CHECKOUT_REQUEST_PROCESSED' WHERE id = ?",
-        [realId]
-      );
-    } else {
-      await connection.rollback();
-      return res.status(400).json({ error: 'Invalid request ID format' });
+    // 2. MySQL dual-write update if available
+    let connection;
+    try {
+      connection = await pool.getConnection();
+      await connection.beginTransaction();
+
+      if (id.startsWith('svc_')) {
+        const realId = id.replace('svc_', '');
+        await connection.query(
+          "UPDATE ledger_items SET status = 'Completed' WHERE id = ?",
+          [realId]
+        );
+      } else if (id.startsWith('mnt_')) {
+        const realId = id.replace('mnt_', '');
+        await connection.query(
+          "UPDATE maintenance SET status = 'Resolved' WHERE id = ?",
+          [realId]
+        );
+      } else if (id.startsWith('co_')) {
+        const realId = id.replace('co_', '');
+        await connection.query(
+          "UPDATE audit_logs SET action = 'GUEST_CHECKOUT_REQUEST_PROCESSED' WHERE id = ?",
+          [realId]
+        );
+      }
+      await connection.commit();
+    } catch (mysqlErr) {
+      if (connection) {
+        try { await connection.rollback(); } catch (e) { }
+      }
+      console.warn('[resolveGuestRequest] MySQL dual-write non-fatal error:', mysqlErr.message);
+    } finally {
+      if (connection) connection.release();
     }
-    await connection.commit();
-    res.json({ message: 'Request resolved successfully' });
+
+    // Invalidate caches
+    invalidateGuestRequestsCache();
+    return res.json({ message: 'Request resolved successfully' });
   } catch (error) {
-    if (connection) {
-      try { await connection.rollback(); } catch (e) { }
-    }
     console.error('resolveGuestRequest error:', error);
     res.status(500).json({ error: 'Internal Server Error' });
-  } finally {
-    if (connection) connection.release();
   }
 };
 
@@ -713,177 +956,114 @@ export const resolveExtensionRequest = async (req, res) => {
   const realId = id.replace('ext_', '');
   const adminId = req.user?.id;
 
-  let connection;
   try {
-    connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    const [reqRows] = await connection.query(
-      "SELECT * FROM stay_extension_requests WHERE id = ? AND status = 'Pending' FOR UPDATE",
-      [realId]
-    );
-    if (reqRows.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ error: 'Pending extension request not found' });
-    }
-    const extReq = reqRows[0];
-
-    // Get the booking
-    const [bookingRows] = await connection.query(
-      "SELECT * FROM bookings WHERE id = ? FOR UPDATE",
-      [extReq.booking_id]
-    );
-    const booking = bookingRows[0];
-
-    const [guestRows] = await connection.query(
-      "SELECT user_id FROM guests WHERE id = ?",
-      [extReq.guest_id]
-    );
-    const guestUserId = guestRows[0]?.user_id;
-
-    if (action === 'approve') {
-      console.log(`[ExtensionResolve] Admin ${adminId} called approve API for Request ID ${realId}`);
-
-      // Verify availability for extension period using AvailabilityService
-      const availResult = await AvailabilityService.checkRoomAvailability(connection, {
-        roomId: extReq.room_id,
-        arrivalDate: extReq.current_checkout_date || booking.expected_check_out_date,
-        departureDate: extReq.requested_checkout_date,
-        forUpdate: true
-      });
-      if (!availResult.available) {
-        await connection.rollback();
-        return res.status(400).json({ error: `Cannot approve extension: ${availResult.reason}` });
+    // 1. Primary Firestore resolution
+    let fsResult = null;
+    try {
+      fsResult = await GuestRequestsService.resolveExtensionRequest(id, action, adminId);
+    } catch (fsErr) {
+      if (fsErr.status === 400 || fsErr.status === 404) {
+        return res.status(fsErr.status).json({ error: fsErr.message });
       }
+      console.warn('[resolveExtensionRequest] Firestore resolution warning:', fsErr.message);
+    }
 
-      // Update Booking
-      await connection.query(
-        "UPDATE bookings SET expected_check_out_date = ? WHERE id = ?",
-        [extReq.requested_checkout_date, booking.id]
+    // 2. MySQL dual-write update if available
+    let connection;
+    try {
+      connection = await pool.getConnection();
+      await connection.beginTransaction();
+
+      const [reqRows] = await connection.query(
+        "SELECT * FROM stay_extension_requests WHERE id = ? AND status = 'Pending' FOR UPDATE",
+        [realId]
       );
-      console.log(`[ExtensionResolve] Booking ${booking.id} updated checkout date to ${extReq.requested_checkout_date}`);
+      if (reqRows.length > 0) {
+        const extReq = reqRows[0];
 
-      // Post Ledger Entries immediately for the new extension period
-      const [roomRows] = await connection.query(`
-        SELECT r.number, rt.base_rate FROM rooms r
-        JOIN room_types rt ON r.room_type_id = rt.id
-        WHERE r.id = ?
-      `, [extReq.room_id]);
-      const room = roomRows[0];
-      const tariff = room.base_rate;
-      // GST included in room rate — no separate tax line
-
-      let currentDate = new Date(extReq.current_checkout_date);
-      let endDate = new Date(extReq.requested_checkout_date);
-      currentDate.setHours(0, 0, 0, 0);
-      endDate.setHours(0, 0, 0, 0);
-      let additionalCharges = 0;
-
-      console.log(`[ExtensionResolve] Ledger posting started. Dates: ${currentDate.toISOString()} to ${endDate.toISOString()}`);
-
-      while (currentDate < endDate) {
-        const bizDateStr = currentDate.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
-
-        // Post Room Tariff
-        const [existingTariff] = await connection.query(
-          "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Room Tariff%Rollover%'",
-          [room.number, bizDateStr, booking.id]
+        const [bookingRows] = await connection.query(
+          "SELECT * FROM bookings WHERE id = ? FOR UPDATE",
+          [extReq.booking_id]
         );
-        if (existingTariff.length === 0) {
+        const booking = bookingRows[0];
+
+        const [guestRows] = await connection.query(
+          "SELECT user_id FROM guests WHERE id = ?",
+          [extReq.guest_id]
+        );
+        const guestUserId = guestRows[0]?.user_id;
+
+        if (action === 'approve') {
           await connection.query(
-            'INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)',
-            [room.number, 'Room Tariff (Rollover, Incl. GST)', tariff, bizDateStr, booking.id]
+            "UPDATE bookings SET expected_check_out_date = ? WHERE id = ?",
+            [extReq.requested_checkout_date, booking.id]
           );
-          additionalCharges += tariff;
-          console.log(`[ExtensionResolve] Room tariff ₹${tariff} inserted for ${bizDateStr}`);
-        } else {
-          console.log(`[ExtensionResolve] Room tariff skipped (already exists) for ${bizDateStr}`);
+
+          // Update Request status
+          await connection.query(
+            "UPDATE stay_extension_requests SET status = 'Approved', admin_id = ? WHERE id = ?",
+            [adminId, realId]
+          );
+
+          if (guestUserId) {
+            await connection.query(
+              "INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)",
+              [guestUserId, '✅ Extension Approved', `Your request to extend your stay until ${extReq.requested_checkout_date} has been approved.`]
+            );
+          }
+
+          await connection.query(
+            `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'EXTENSION_APPROVED', ?, CURDATE())`,
+            [adminId, `Admin approved stay extension for Booking ${booking.id} to ${extReq.requested_checkout_date}`]
+          );
+        } else if (action === 'reject') {
+          await connection.query(
+            "UPDATE stay_extension_requests SET status = 'Rejected', admin_id = ? WHERE id = ?",
+            [adminId, realId]
+          );
+
+          if (guestUserId) {
+            await connection.query(
+              "INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)",
+              [guestUserId, '❌ Extension Rejected', `Your request to extend your stay until ${extReq.requested_checkout_date} could not be approved due to unavailability.`]
+            );
+          }
+
+          await connection.query(
+            `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'EXTENSION_REJECTED', ?, CURDATE())`,
+            [adminId, `Admin rejected stay extension for Booking ${booking.id}`]
+          );
         }
 
-        currentDate.setDate(currentDate.getDate() + 1);
+        await connection.commit();
+        req.app.get('io')?.emit('guest_dashboard_refresh', { guestUserId });
       }
-
-      console.log(`[ExtensionResolve] Balance recalculated successfully. Total added: ₹${additionalCharges}`);
-
-      // Update Request status
-      await connection.query(
-        "UPDATE stay_extension_requests SET status = 'Approved', admin_id = ? WHERE id = ?",
-        [adminId, realId]
-      );
-
-      // Notify Guest
-      if (guestUserId) {
-        await connection.query(
-          "INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)",
-          [guestUserId, '✅ Extension Approved', `Your request to extend your stay until ${extReq.requested_checkout_date} has been approved.`]
-        );
+    } catch (mysqlErr) {
+      if (connection) {
+        try { await connection.rollback(); } catch (e) { }
       }
-
-      await connection.query(
-        `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'EXTENSION_APPROVED', ?, CURDATE())`,
-        [adminId, `Admin approved stay extension for Booking ${booking.id} to ${extReq.requested_checkout_date}`]
-      );
-
-      await connection.commit();
-      console.log(`[ExtensionResolve] Transaction committed successfully for Request ${realId}`);
-      req.app.get('io')?.emit('guest_dashboard_refresh', { guestUserId });
-      return res.json({ message: `Stay extension approved. Additional charges of ₹${additionalCharges.toLocaleString('en-IN')} have been added to the guest folio.` });
-
-    } else if (action === 'reject') {
-      // Update Request status
-      await connection.query(
-        "UPDATE stay_extension_requests SET status = 'Rejected', admin_id = ? WHERE id = ?",
-        [adminId, realId]
-      );
-
-      // Notify Guest
-      if (guestUserId) {
-        await connection.query(
-          "INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)",
-          [guestUserId, '❌ Extension Rejected', `Your request to extend your stay until ${extReq.requested_checkout_date} could not be approved due to unavailability.`]
-        );
-      }
-
-      await connection.query(
-        `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'EXTENSION_REJECTED', ?, CURDATE())`,
-        [adminId, `Admin rejected stay extension for Booking ${booking.id}`]
-      );
+      console.warn('[resolveExtensionRequest] MySQL dual-write non-fatal error:', mysqlErr.message);
+    } finally {
+      if (connection) connection.release();
     }
 
-    await connection.commit();
-    // Notify clients to refresh dashboards
-    req.app.get('io')?.emit('guest_dashboard_refresh', { guestUserId });
-    res.json({ message: `Extension request ${action}d successfully` });
+    // Invalidate caches
+    invalidateGuestRequestsCache();
+
+    if (fsResult && fsResult.message) {
+      return res.json({ message: fsResult.message });
+    }
+    return res.json({ message: `Extension request ${action}d successfully` });
   } catch (error) {
-    if (connection) {
-      try { await connection.rollback(); } catch (e) { }
-    }
     console.error('resolveExtensionRequest error:', error);
     res.status(500).json({ error: 'Internal Server Error' });
-  } finally {
-    if (connection) connection.release();
   }
 };
 
 // ─── ADMIN: GET ALL GUEST DOCUMENTS ──────────────────────────────────────────
 export const getGuestDocuments = async (req, res) => {
   try {
-    const [guests] = await pool.query(`
-      SELECT 
-        g.id, g.full_name, g.government_id, g.id_type, g.id_document_path, 
-        g.id_upload_timestamp, g.id_verification_status, g.id_rejection_reason, 
-        g.id_verified_by, g.id_verified_at, g.id_ocr_text,
-        r.number AS room_number,
-        b.booking_status,
-        b.check_in_date,
-        b.expected_check_out_date
-      FROM guests g
-      LEFT JOIN bookings b ON b.guest_id = g.id 
-        AND b.booking_status IN ('Reserved', 'Checked In')
-      LEFT JOIN rooms r ON r.id = b.room_id
-      WHERE g.id_document_path IS NOT NULL
-      ORDER BY g.id_upload_timestamp DESC
-    `);
+    const guests = await GuestAdminService.getGuestDocuments();
     res.json({ success: true, guests });
   } catch (error) {
     console.error('Error fetching guest documents:', error);
@@ -904,220 +1084,41 @@ export const verifyGuestDocument = async (req, res) => {
     return res.status(400).json({ success: false, message: 'Rejection reason is required' });
   }
 
-  let connection;
   try {
-    connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    const [result] = await connection.query(`
-      UPDATE guests 
-      SET id_verification_status = ?, 
-          id_rejection_reason = ?, 
-          id_verified_by = ?, 
-          id_verified_at = NOW()
-      WHERE id = ?
-    `, [status, status === 'Rejected' ? rejectionReason : null, adminId, guestId]);
-
-    if (result.affectedRows === 0) {
-      await connection.rollback();
-      return res.status(404).json({ success: false, message: 'Guest document not found' });
-    }
-
-    // ── Send notification to the guest ───────────────────────────────────────
-    // Fetch the guest's user_id so we can target their notification inbox
-    const [guestRows] = await connection.query(
-      'SELECT user_id, full_name, id_type FROM guests WHERE id = ?',
-      [guestId]
-    );
-    const guest = guestRows[0];
-
-    if (guest?.user_id) {
-      if (status === 'Rejected') {
-        await connection.query(
-          `INSERT INTO notifications (user_id, title, message, type) VALUES (?, ?, ?, ?)`,
-          [
-            guest.user_id,
-            '❌ Document Verification Failed',
-            `Your ${guest.id_type || 'ID document'} was reviewed by the front desk and could not be accepted.\n\nReason: ${rejectionReason}\n\nPlease re-upload a clear, legible copy of your document to complete verification.`,
-            'id_rejected'
-          ]
-        );
-      } else if (status === 'Verified') {
-        await connection.query(
-          `INSERT INTO notifications (user_id, title, message, type) VALUES (?, ?, ?, ?)`,
-          [
-            guest.user_id,
-            '✅ Identity Verified',
-            `Great news, ${guest.full_name?.split(' ')[0] || 'Guest'}! Your ${guest.id_type || 'ID document'} has been verified successfully by our front desk team.`,
-            'id_verified'
-          ]
-        );
-      }
-    }
-
-    await connection.commit();
-    res.json({ success: true, message: `Document successfully marked as ${status}` });
+    const result = await GuestAdminService.verifyGuestDocument(guestId, {
+      status,
+      rejectionReason,
+      adminId
+    });
+    res.json(result);
   } catch (error) {
-    if (connection) { try { await connection.rollback(); } catch (e) { } }
     console.error('Error verifying guest document:', error);
-    res.status(500).json({ success: false, message: 'Internal Server Error' });
-  } finally {
-    if (connection) connection.release();
+    res.status(error.status || 500).json({ success: false, message: error.message || 'Internal Server Error' });
   }
 };
 
 // ─── ADMIN: DELETE GUEST DOCUMENT ──────────────────────────────────────────────────
 export const deleteGuestDocument = async (req, res) => {
   const { guestId } = req.params;
-
-  let connection;
   try {
-    connection = await pool.getConnection();
-
-    const [guestRows] = await connection.query(
-      'SELECT id_document_path FROM guests WHERE id = ?',
-      [guestId]
-    );
-
-    if (guestRows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Guest not found' });
-    }
-
-    const docPath = guestRows[0].id_document_path;
-
-    // Start transaction to clean up DB
-    await connection.beginTransaction();
-
-    await connection.query(`
-      UPDATE guests 
-      SET id_document_path = NULL,
-          id_upload_timestamp = NULL,
-          id_verification_status = 'Pending',
-          id_rejection_reason = NULL,
-          id_verified_by = NULL,
-          id_verified_at = NULL,
-          id_ocr_text = NULL
-      WHERE id = ?
-    `, [guestId]);
-
-    await connection.commit();
-
-    // Delete the file from disk if it exists
-    if (docPath) {
-      let filePath;
-      if (path.isAbsolute(docPath)) {
-        filePath = docPath;
-      } else {
-        const backendRoot = process.cwd();
-        const relativePath = docPath.startsWith('/') ? docPath.slice(1) : docPath;
-        filePath = path.join(backendRoot, relativePath);
-      }
-
-      try {
-        await fs.promises.unlink(filePath);
-      } catch (err) {
-        if (err.code !== 'ENOENT') {
-          console.error(`Failed to delete document file ${filePath}:`, err);
-        }
-      }
-    }
-
-    res.json({ success: true, message: 'Identity document deleted successfully' });
+    const result = await GuestAdminService.deleteGuestDocument(guestId);
+    res.json(result);
   } catch (error) {
-    if (connection) {
-      try { await connection.rollback(); } catch (e) { }
-    }
     console.error('deleteGuestDocument error:', error);
-    res.status(500).json({ success: false, message: 'Internal Server Error' });
-  } finally {
-    if (connection) connection.release();
+    res.status(error.status || 500).json({ success: false, message: error.message || 'Internal Server Error' });
   }
 };
 
 // ─── ADMIN: LIST ALL GUESTS (paginated, filterable) ──────────────────────────
 export const listGuests = async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page || '1', 10));
-  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit || '25', 10)));
-  const offset = (page - 1) * limit;
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '25', 10)));
   const q = (req.query.q || '').trim();
   const filter = req.query.filter || 'all'; // all | inhouse | checkedout | reserved | vip | blacklisted
 
-  // Build WHERE clauses
-  const whereClauses = [];
-  const params = [];
-
-  if (q.length >= 2) {
-    const term = `%${q.toUpperCase()}%`;
-    whereClauses.push(`(UPPER(g.full_name) LIKE ? OR g.phone LIKE ? OR UPPER(g.email) LIKE ? OR g.government_id LIKE ?)`);
-    params.push(term, term, term, term);
-  }
-
-  if (filter === 'inhouse') {
-    whereClauses.push(`EXISTS (SELECT 1 FROM bookings ab WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved'))`);
-  } else if (filter === 'checkedout') {
-    whereClauses.push(`EXISTS (SELECT 1 FROM bookings ab WHERE ab.guest_id = g.id AND ab.booking_status = 'Checked Out')`);
-    whereClauses.push(`NOT EXISTS (SELECT 1 FROM bookings ab2 WHERE ab2.guest_id = g.id AND ab2.booking_status IN ('Checked In','Reserved'))`);
-  } else if (filter === 'reserved') {
-    whereClauses.push(`EXISTS (SELECT 1 FROM bookings ab WHERE ab.guest_id = g.id AND ab.booking_status = 'Reserved')`);
-  } else if (filter === 'vip') {
-    whereClauses.push(`g.loyalty_tier IN ('Gold','Platinum')`);
-  } else if (filter === 'blacklisted') {
-    whereClauses.push(`g.loyalty_tier = 'Blacklisted'`);
-  }
-
-  const whereSQL = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : '';
-
   try {
-    const [statsResult] = await pool.query(`
-      SELECT 
-        COUNT(g.id) as total,
-        SUM(CASE WHEN EXISTS (SELECT 1 FROM bookings ab WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved')) THEN 1 ELSE 0 END) as inhouse,
-        SUM(CASE WHEN EXISTS (SELECT 1 FROM bookings ab WHERE ab.guest_id = g.id AND ab.booking_status = 'Checked Out') AND NOT EXISTS (SELECT 1 FROM bookings ab2 WHERE ab2.guest_id = g.id AND ab2.booking_status IN ('Checked In','Reserved')) THEN 1 ELSE 0 END) as checkedout,
-        SUM(CASE WHEN g.loyalty_tier IN ('Gold','Platinum') THEN 1 ELSE 0 END) as vip,
-        SUM(CASE WHEN g.loyalty_tier = 'Blacklisted' THEN 1 ELSE 0 END) as blacklisted,
-        SUM(CASE WHEN DATE(g.created_at) = CURDATE() THEN 1 ELSE 0 END) as new_today
-      FROM guests g
-    `);
-    const stats = statsResult[0];
-
-    // Total count
-    const [[{ total }]] = await pool.query(
-      `SELECT COUNT(DISTINCT g.id) AS total FROM guests g ${whereSQL}`,
-      params
-    );
-
-    // Page of results
-    const [guests] = await pool.query(
-      `SELECT
-         g.id, g.full_name, g.phone, g.email, g.address, g.gst_no, g.pincode, g.country, g.date_of_birth,
-         g.arrival_from, g.departure_to,
-         g.government_id, g.id_type, g.gender, g.age,
-         g.id_verification_status,
-         g.loyalty_tier, g.loyalty_points,
-         g.created_at, g.updated_at,
-         COUNT(b.id)                                                 AS total_bookings,
-         COALESCE(SUM(b.total_amount), 0)                           AS lifetime_spend,
-         MAX(b.created_at)                                          AS last_booking_at,
-         (SELECT r.number FROM bookings ab JOIN rooms r ON ab.room_id = r.id
-          WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved') LIMIT 1) AS current_room,
-         (SELECT ab.booking_status FROM bookings ab
-          WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved') LIMIT 1) AS current_status,
-         (SELECT ab.booking_number FROM bookings ab
-          WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved') LIMIT 1) AS current_booking_number
-       FROM guests g
-       LEFT JOIN bookings b ON b.guest_id = g.id
-       ${whereSQL}
-       GROUP BY g.id
-       ORDER BY last_booking_at DESC, g.id DESC
-       LIMIT ? OFFSET ?`,
-      [...params, limit, offset]
-    );
-
-    res.json({
-      guests,
-      stats,
-      pagination: { total, page, limit, pages: Math.ceil(total / limit) }
-    });
+    const result = await GuestAdminService.listGuests({ page, limit, q, filter });
+    res.json(result);
   } catch (error) {
     console.error('listGuests error:', error);
     res.status(500).json({ error: 'Internal Server Error' });
@@ -1130,25 +1131,8 @@ export const searchGuests = async (req, res) => {
   if (!q || q.trim().length < 2) {
     return res.status(400).json({ error: 'Search query must be at least 2 characters' });
   }
-  const term = `%${q.trim().toUpperCase()}%`;
   try {
-    const [guests] = await pool.query(`
-      SELECT 
-        g.id, g.full_name, g.phone, g.email, g.loyalty_tier, g.loyalty_points,
-        g.id_verification_status,
-        COUNT(b.id) as total_bookings,
-        MAX(b.created_at) as last_booking_at,
-        (SELECT r.number FROM bookings ab JOIN rooms r ON ab.room_id = r.id 
-         WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved') LIMIT 1) as current_room,
-        (SELECT ab.booking_status FROM bookings ab 
-         WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved') LIMIT 1) as current_status
-      FROM guests g
-      LEFT JOIN bookings b ON b.guest_id = g.id
-      WHERE UPPER(g.full_name) LIKE ? OR g.phone LIKE ?
-      GROUP BY g.id
-      ORDER BY MAX(b.created_at) DESC
-      LIMIT 20
-    `, [term, term]);
+    const guests = await GuestAdminService.searchGuests(q);
     res.json({ guests });
   } catch (error) {
     console.error('searchGuests error:', error);
@@ -1157,79 +1141,13 @@ export const searchGuests = async (req, res) => {
 };
 
 // ─── RECEPTION STAFF: GUEST SEARCH (name / phone / email / booking number) ───
-// Available to any authenticated staff — no requireAdmin.
-// Returns all guests (in-house, checked-out, reserved) across all history.
 export const searchGuestsStaff = async (req, res) => {
   const { q } = req.query;
   if (!q || q.trim().length < 2) {
     return res.status(400).json({ error: 'Search query must be at least 2 characters' });
   }
-  const term = `%${q.trim().toUpperCase()}%`;
-  const termRaw = `%${q.trim()}%`;          // for booking_number (case-sensitive in some engines)
   try {
-    // First try: match by booking number — find the guest via their booking
-    const [byBooking] = await pool.query(`
-      SELECT DISTINCT g.id
-      FROM guests g
-      JOIN bookings b ON b.guest_id = g.id
-      WHERE UPPER(b.booking_number) LIKE ?
-    `, [term]);
-    const bookingGuestIds = byBooking.map(r => r.id);
-
-    // Main search: by name, phone, email — plus any guest_ids from booking match
-    const idPlaceholders = bookingGuestIds.length > 0
-      ? `OR g.id IN (${bookingGuestIds.map(() => '?').join(',')})`
-      : '';
-
-    const queryParams = [term, termRaw, termRaw, ...bookingGuestIds];
-
-    const [guests] = await pool.query(`
-      SELECT 
-        g.id,
-        g.full_name,
-        g.phone,
-        g.email,
-        g.loyalty_tier,
-        g.loyalty_points,
-        g.id_verification_status,
-        COUNT(DISTINCT b.id)  AS total_bookings,
-        MAX(b.created_at)     AS last_booking_at,
-        -- current room / status if currently in-house
-        (SELECT r.number FROM bookings ab
-          JOIN rooms r ON ab.room_id = r.id
-          WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved')
-          ORDER BY ab.check_in_date DESC LIMIT 1) AS current_room,
-        (SELECT ab.booking_status FROM bookings ab
-          WHERE ab.guest_id = g.id AND ab.booking_status IN ('Checked In','Reserved')
-          ORDER BY ab.check_in_date DESC LIMIT 1) AS current_status,
-        -- most recent booking summary
-        (SELECT ab.booking_number FROM bookings ab
-          WHERE ab.guest_id = g.id
-          ORDER BY ab.created_at DESC LIMIT 1) AS last_booking_number,
-        (SELECT ab.booking_status FROM bookings ab
-          WHERE ab.guest_id = g.id
-          ORDER BY ab.created_at DESC LIMIT 1) AS last_booking_status,
-        (SELECT ab.check_in_date FROM bookings ab
-          WHERE ab.guest_id = g.id
-          ORDER BY ab.created_at DESC LIMIT 1) AS last_check_in,
-        (SELECT ab.check_out_date FROM bookings ab
-          WHERE ab.guest_id = g.id
-          ORDER BY ab.created_at DESC LIMIT 1) AS last_check_out
-      FROM guests g
-      LEFT JOIN bookings b ON b.guest_id = g.id
-      WHERE UPPER(g.full_name) LIKE ?
-         OR g.phone             LIKE ?
-         OR UPPER(g.email)      LIKE ?
-         ${idPlaceholders}
-      GROUP BY g.id
-      ORDER BY
-        CASE WHEN g.id IN (
-          SELECT ab.guest_id FROM bookings ab WHERE ab.booking_status IN ('Checked In','Reserved')
-        ) THEN 0 ELSE 1 END,
-        MAX(b.created_at) DESC
-      LIMIT 30
-    `, queryParams);
-
+    const guests = await GuestAdminService.searchGuestsStaff(q);
     res.json({ guests });
   } catch (error) {
     console.error('searchGuestsStaff error:', error);

@@ -8,6 +8,7 @@ import {
   validateRequiredFields,
   RepositoryError
 } from './firestoreUtils.js';
+import { invalidateGuestDirectoryCache } from '../../services/guestAdminService.js';
 
 const COLLECTION = 'guests';
 
@@ -81,6 +82,10 @@ export async function createGuestFirestore(guestData, options = {}) {
     email: guestData.email ? String(guestData.email).toLowerCase().trim() : null,
     phone: guestData.phone ? String(guestData.phone).trim() : null,
     address: guestData.address || '',
+    pincode: guestData.pincode || null,
+    gender: guestData.gender || null,
+    age: (guestData.age !== undefined && guestData.age !== null && guestData.age !== '') ? Number(guestData.age) : null,
+    country: guestData.country || null,
     date_of_birth: guestData.date_of_birth || guestData.dob || null,
     government_id: guestData.government_id || null,
     id_type: guestData.id_type || null,
@@ -91,6 +96,11 @@ export async function createGuestFirestore(guestData, options = {}) {
     user_uid: guestData.user_uid || null,
     mysql_guest_id: guestData.mysql_guest_id || guestData.id || null,
     mysql_user_id: guestData.mysql_user_id || null,
+    // ── Additional profile fields ──────────────────────────────────────────
+    gst_no:       guestData.gst_no       || null,
+    company_name: guestData.company_name || null,
+    city:         guestData.city         || null,
+    state:        guestData.state        || null,
     created_at: guestData.created_at || new Date().toISOString(),
     updated_at: guestData.updated_at || new Date().toISOString()
   };
@@ -100,10 +110,14 @@ export async function createGuestFirestore(guestData, options = {}) {
       console.log(`[OutboxGuard] Ignored stale guest create/upsert for ${docId}`);
       return existing;
     }
-    return await setDoc(COLLECTION, docId, payload, { ...options, merge: true });
+    const res = await setDoc(COLLECTION, docId, payload, { ...options, merge: true });
+    invalidateGuestDirectoryCache();
+    return res;
   }
 
-  return await setDoc(COLLECTION, docId, payload, { ...options, merge: true });
+  const res = await setDoc(COLLECTION, docId, payload, { ...options, merge: true });
+  invalidateGuestDirectoryCache();
+  return res;
 }
 
 export async function updateGuestFirestore(guestId, guestData, options = {}) {
@@ -130,14 +144,20 @@ export async function updateGuestFirestore(guestId, guestData, options = {}) {
     if (!payload.full_name) {
       throw new RepositoryError(`Guest '${guestId}' not found`, 'NOT_FOUND', 404);
     }
-    return await setDoc(COLLECTION, docId, payload, { ...options, merge: true });
+    const res = await setDoc(COLLECTION, docId, payload, { ...options, merge: true });
+    invalidateGuestDirectoryCache();
+    return res;
   }
 
-  return await setDoc(COLLECTION, docId, payload, { ...options, merge: true });
+  const res = await setDoc(COLLECTION, docId, payload, { ...options, merge: true });
+  invalidateGuestDirectoryCache();
+  return res;
 }
 
 export async function deleteGuestFirestore(guestId, options = {}) {
   if (!guestId) throw new RepositoryError('Guest ID is required for deletion', 'VALIDATION_ERROR', 400);
   const docId = String(guestId).startsWith('guest_') ? String(guestId) : formatGuestId(guestId);
-  return await deleteDoc(COLLECTION, docId, options);
+  const res = await deleteDoc(COLLECTION, docId, options);
+  invalidateGuestDirectoryCache();
+  return res;
 }

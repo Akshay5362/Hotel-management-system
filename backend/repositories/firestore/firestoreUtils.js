@@ -1,5 +1,6 @@
 import { db } from '../../config/firebaseAdmin.js';
 import { Timestamp, FieldValue } from 'firebase-admin/firestore';
+import { readBudgetMonitor } from '../../utils/firestoreReadBudget.js';
 
 export class RepositoryError extends Error {
   constructor(message, code = 'REPOSITORY_ERROR', status = 500, details = null) {
@@ -146,9 +147,9 @@ export function formatDocSnapshot(docSnap) {
   if (!docSnap.exists) return null;
   const d = docSnap.data();
   return sanitizeSensitiveFields({
+    ...d,
     id: docSnap.id,
-    doc_id: docSnap.id,
-    ...d
+    doc_id: docSnap.id
   });
 }
 
@@ -177,7 +178,41 @@ export async function getDoc(collectionName, docId, options = {}) {
     docSnap = await ref.get();
   }
 
+  readBudgetMonitor.recordReads(1, { collection: collectionName });
   return formatDocSnapshot(docSnap);
+}
+
+/**
+ * Generic Batch Read by IDs supporting optional Firestore Transactions.
+ * Chunks requests to avoid Firestore argument limits.
+ */
+export async function getDocsByIds(collectionName, docIds = [], options = {}) {
+  if (!docIds || !Array.isArray(docIds) || docIds.length === 0) return [];
+  const uniqueIds = Array.from(new Set(docIds.map(String).filter(Boolean)));
+  if (uniqueIds.length === 0) return [];
+
+  const { transaction } = options;
+  const refs = uniqueIds.map(id => db.collection(collectionName).doc(id));
+
+  const results = [];
+  const chunkSize = 30;
+  for (let i = 0; i < refs.length; i += chunkSize) {
+    const chunk = refs.slice(i, i + chunkSize);
+    let snaps;
+    if (transaction) {
+      snaps = await transaction.getAll(...chunk);
+    } else {
+      snaps = await db.getAll(...chunk);
+    }
+    snaps.forEach(snap => {
+      if (snap && snap.exists) {
+        results.push(formatDocSnapshot(snap));
+      }
+    });
+  }
+
+  readBudgetMonitor.recordReads(uniqueIds.length, { collection: collectionName });
+  return results;
 }
 
 /**
@@ -187,7 +222,7 @@ export async function listDocs(collectionName, options = {}) {
   const {
     filters = [],
     orderBy = [],
-    limit = 50,
+    limit = null,
     startAfterDoc = null,
     transaction = null,
     subcollectionName = null,
@@ -237,6 +272,7 @@ export async function listDocs(collectionName, options = {}) {
     results.push(formatDocSnapshot(doc));
   });
 
+  readBudgetMonitor.recordReads(Math.max(1, results.length), { collection: collectionName });
   return results;
 }
 
@@ -308,11 +344,51 @@ export async function deleteDoc(collectionName, docId, options = {}) {
 }
 
 // ── Deterministic ID Formatters ──────────────────────────────────────────────
-export const formatRoomId = (roomNumber) => `room_${String(roomNumber).trim()}`;
-export const formatBookingId = (ref) => `bkg_${String(ref).trim()}`;
-export const formatReservationId = (ref) => `res_${String(ref).trim()}`;
-export const formatGuestId = (uidOrId) => `guest_${String(uidOrId).trim()}`;
-export const formatStaffId = (uidOrId) => `staff_${String(uidOrId).trim()}`;
-export const formatInvoiceId = (num) => `inv_${String(num).trim()}`;
-export const formatCategoryDocId = (val) => `cat_${String(val).toLowerCase().trim().replace(/[^a-z0-9]/g, '_')}`;
-export const formatProductDocId = (val) => `prod_${String(val).toLowerCase().trim().replace(/[^a-z0-9]/g, '_')}`;
+export const formatRoomId = (roomNumber) => String(roomNumber).startsWith('room_') ? String(roomNumber).trim() : `room_${String(roomNumber).trim()}`;
+export const formatBookingId = (ref) => String(ref).startsWith('bkg_') ? String(ref).trim() : `bkg_${String(ref).trim()}`;
+export const formatReservationId = (ref) => String(ref).startsWith('res_') ? String(ref).trim() : `res_${String(ref).trim()}`;
+export const formatGuestId = (uidOrId) => String(uidOrId).startsWith('guest_') ? String(uidOrId).trim() : `guest_${String(uidOrId).trim()}`;
+export const formatStaffId = (uidOrId) => String(uidOrId).startsWith('staff_') ? String(uidOrId).trim() : `staff_${String(uidOrId).trim()}`;
+export const formatInvoiceId = (num) => String(num).startsWith('inv_') ? String(num).trim() : `inv_${String(num).trim()}`;
+export const formatCategoryDocId = (val) => String(val).startsWith('cat_') ? String(val).toLowerCase().trim() : `cat_${String(val).toLowerCase().trim().replace(/[^a-z0-9]/g, '_')}`;
+export const formatProductDocId = (val) => String(val).startsWith('prod_') ? String(val).toLowerCase().trim() : `prod_${String(val).toLowerCase().trim().replace(/[^a-z0-9]/g, '_')}`;
+
+export const formatLedgerItemId = (mysqlId) => {
+  if (mysqlId === null || mysqlId === undefined || String(mysqlId).trim() === '') {
+    throw new RepositoryError('formatLedgerItemId requires a non-empty MySQL id', 'INVALID_LEDGER_ID', 400);
+  }
+  const s = String(mysqlId).trim();
+  return s.startsWith('ledger_') ? s : `ledger_${s}`;
+};
+
+export const formatPaymentId = (mysqlId) => {
+  if (mysqlId === null || mysqlId === undefined || String(mysqlId).trim() === '') {
+    throw new RepositoryError('formatPaymentId requires a non-empty MySQL id', 'INVALID_PAYMENT_ID', 400);
+  }
+  const s = String(mysqlId).trim();
+  return s.startsWith('payment_') ? s : `payment_${s}`;
+};
+
+export const formatCashLogId = (mysqlId) => {
+  if (mysqlId === null || mysqlId === undefined || String(mysqlId).trim() === '') {
+    throw new RepositoryError('formatCashLogId requires a non-empty MySQL id', 'INVALID_CASH_LOG_ID', 400);
+  }
+  const s = String(mysqlId).trim();
+  return s.startsWith('cash_log_') ? s : `cash_log_${s}`;
+};
+
+export const formatHistoryId = (mysqlId) => {
+  if (mysqlId === null || mysqlId === undefined || String(mysqlId).trim() === '') {
+    throw new RepositoryError('formatHistoryId requires a non-empty MySQL id', 'INVALID_HISTORY_ID', 400);
+  }
+  const s = String(mysqlId).trim();
+  return s.startsWith('history_') ? s : `history_${s}`;
+};
+
+export const formatCashSubmissionId = (receiptId) => {
+  if (!receiptId || String(receiptId).trim() === '') {
+    throw new RepositoryError('formatCashSubmissionId requires a non-empty receipt_id', 'INVALID_CASH_SUBMISSION_ID', 400);
+  }
+  const s = String(receiptId).trim();
+  return s.startsWith('cs_') ? s : `cs_${s}`;
+};

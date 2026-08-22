@@ -9,23 +9,52 @@ import {
   RepositoryError
 } from './firestoreUtils.js';
 
+import { globalTtlCache } from '../../utils/ttlCache.js';
+
 const COLLECTION = 'inventory_categories';
+
+/**
+ * Invalidate all cached inventory categories immediately upon mutation.
+ */
+export function invalidateInventoryCategoriesCache() {
+  globalTtlCache.deleteByPrefix('inventory_categories_');
+}
 
 export async function getInventoryCategoryByIdFirestore(catId, options = {}) {
   if (!catId) return null;
   const docId = String(catId).startsWith('cat_') ? String(catId) : formatCategoryDocId(catId);
-  return await getDoc(COLLECTION, docId, options);
+  const direct = await getDoc(COLLECTION, docId, options);
+  if (direct) return direct;
+
+  if (!isNaN(Number(catId))) {
+    const byMySqlId = await listDocs(COLLECTION, {
+      filters: [{ field: 'mysql_category_id', op: '==', value: Number(catId) }],
+      limit: 1,
+      transaction: options.transaction
+    });
+    if (byMySqlId[0]) return byMySqlId[0];
+  }
+  return null;
 }
 
 export async function getAllInventoryCategoriesFirestore(options = {}) {
-  const { filters = [], orderBy = [{ field: 'name', direction: 'asc' }], limit = 100, cursor = null, transaction = null } = options;
-  return await listDocs(COLLECTION, {
-    filters,
-    orderBy,
-    limit,
-    startAfterDoc: cursor,
-    transaction
-  });
+  const { filters = [], orderBy = [{ field: 'name', direction: 'asc' }], limit = 100, cursor = null, transaction = null, skipCache = false } = options;
+
+  if (transaction || cursor || filters.length > 0 || limit !== 100 || skipCache) {
+    return await listDocs(COLLECTION, {
+      filters,
+      orderBy,
+      limit,
+      startAfterDoc: cursor,
+      transaction
+    });
+  }
+
+  return await globalTtlCache.getOrSet(
+    'inventory_categories_all',
+    () => listDocs(COLLECTION, { filters, orderBy, limit, startAfterDoc: cursor, transaction }),
+    600000 // 10 minutes TTL
+  );
 }
 
 /**
@@ -60,7 +89,9 @@ export async function createInventoryCategoryFirestore(catData, options = {}) {
     updated_at: nowIso
   };
 
-  return await setDoc(COLLECTION, docId, payload, { ...options, merge: true });
+  const result = await setDoc(COLLECTION, docId, payload, { ...options, merge: true });
+  invalidateInventoryCategoriesCache();
+  return result;
 }
 
 export async function updateInventoryCategoryFirestore(catId, catData, options = {}) {
@@ -70,12 +101,14 @@ export async function updateInventoryCategoryFirestore(catId, catData, options =
   const existing = await getDoc(COLLECTION, docId, options);
   if (!existing) {
     // Upsert fallback if document does not exist in Firestore yet
-    return await setDoc(COLLECTION, docId, {
+    const res = await setDoc(COLLECTION, docId, {
       name: String(catData.name || catId).trim(),
       department: catData.department || 'General',
       ...catData,
       updated_at: catData.updated_at || new Date().toISOString()
     }, { ...options, merge: true });
+    invalidateInventoryCategoriesCache();
+    return res;
   }
 
   if (isStaleUpdate(existing, catData)) {
@@ -88,14 +121,18 @@ export async function updateInventoryCategoryFirestore(catId, catData, options =
     updated_at: catData.updated_at || new Date().toISOString()
   };
 
-  return await updateDoc(COLLECTION, docId, updatePayload, options);
+  const result = await updateDoc(COLLECTION, docId, updatePayload, options);
+  invalidateInventoryCategoriesCache();
+  return result;
 }
 
 export async function deleteInventoryCategoryFirestore(catId, options = {}) {
   if (!catId) throw new RepositoryError('Category ID is required for deletion', 'VALIDATION_ERROR', 400);
   const docId = String(catId).startsWith('cat_') ? String(catId) : formatCategoryDocId(catId);
-  return await deleteDoc(COLLECTION, docId, options).catch(err => {
+  const result = await deleteDoc(COLLECTION, docId, options).catch(err => {
     if (err.code === 'NOT_FOUND') return null; // Idempotent deletion handling
     throw err;
   });
+  invalidateInventoryCategoriesCache();
+  return result;
 }

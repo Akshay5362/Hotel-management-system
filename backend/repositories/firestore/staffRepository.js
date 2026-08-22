@@ -14,7 +14,18 @@ const COLLECTION = 'staff';
 export async function getStaffByIdFirestore(staffId, options = {}) {
   if (!staffId) return null;
   const docId = String(staffId).startsWith('staff_') ? String(staffId) : formatStaffId(staffId);
-  return await getDoc(COLLECTION, docId, options);
+  const direct = await getDoc(COLLECTION, docId, options);
+  if (direct) return direct;
+
+  if (!isNaN(Number(staffId))) {
+    const byMySqlId = await listDocs(COLLECTION, {
+      filters: [{ field: 'mysql_staff_id', op: '==', value: Number(staffId) }],
+      limit: 1,
+      transaction: options.transaction
+    });
+    if (byMySqlId[0]) return byMySqlId[0];
+  }
+  return null;
 }
 
 export async function getStaffByUidFirestore(uid, options = {}) {

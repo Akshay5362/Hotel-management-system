@@ -33,13 +33,13 @@
  */
 
 import pool from '../db.js';
-import { enqueue } from './outboxService.js';
-import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
+import { db } from '../config/firebaseAdmin.js';
+import { isFirebaseOnlyBusinessDateEnabled } from '../config/featureFlags.js';
 import {
-  createCompoundEventBuilder,
-  formatLedgerItemId,
-  formatBookingId,
-} from './compoundEventBuilder.js';
+  getSystemDateFirestore,
+  getSystemDateDetailsFirestore,
+  invalidateSystemDateCache
+} from '../repositories/firestore/systemSettingsRepository.js';
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 export const BD_ERRORS = {
@@ -170,12 +170,32 @@ export const BusinessDateService = {
   // ── Database operations ─────────────────────────────────────────────────
 
   /**
-   * Read the current Business Date from MySQL.
+   * Read the current Business Date from MySQL or Firestore.
    * @param {object} [conn] Optional existing connection/pool. Defaults to pool.
+   * @param {object} [options] Optional dependency injection for testing.
    * @returns {Promise<string>} 'YYYY-MM-DD'
-   * @throws BusinessDateError (BD_MISSING) if row not found.
+   * @throws BusinessDateError (BD_MISSING) if row/document not found.
    */
-  async getBusinessDate(conn) {
+  async getBusinessDate(conn, { getSystemDateFirestoreFn = getSystemDateFirestore } = {}) {
+    if (isFirebaseOnlyBusinessDateEnabled()) {
+      try {
+        const firestoreDate = await getSystemDateFirestoreFn();
+        if (firestoreDate) {
+          const iso = _normalise(firestoreDate);
+          if (iso) return iso;
+          throw new BusinessDateError(
+            BD_ERRORS.INVALID_FORMAT,
+            `[CRITICAL] Firestore settings/system_date has an unrecognised format: "${firestoreDate}"`
+          );
+        }
+      } catch (err) {
+        if (err instanceof BusinessDateError && err.code === BD_ERRORS.INVALID_FORMAT) {
+          throw err;
+        }
+        console.warn('[BusinessDateService] Firestore error reading business date, checking fallback:', err.message);
+      }
+    }
+
     const db = conn || pool;
     const [rows] = await db.query(
       "SELECT value_val FROM system_settings WHERE key_name = 'system_date'"
@@ -223,10 +243,35 @@ export const BusinessDateService = {
       throw new BusinessDateError(BD_ERRORS.BACKWARD, `Business Date cannot move backward (current: ${currentIso}, requested: ${newIso}).`);
     }
 
+    if (isFirebaseOnlyBusinessDateEnabled()) {
+      if (db) {
+        const settingsRef = db.collection('settings').doc('system_date');
+        const nowIso = new Date().toISOString();
+        await settingsRef.set({
+          current_date: newIso,
+          system_date: newIso,
+          value_val: newIso,
+          updated_at: nowIso
+        }, { merge: true });
+      }
+      if (conn) {
+        try {
+          await conn.query(
+            "UPDATE system_settings SET value_val = ? WHERE key_name = 'system_date'",
+            [newIso]
+          );
+        } catch (_) {}
+      }
+      invalidateSystemDateCache();
+      return;
+    }
+
     await conn.query(
       "UPDATE system_settings SET value_val = ? WHERE key_name = 'system_date'",
       [newIso]
     );
+
+    invalidateSystemDateCache();
 
     if (isFirestoreDualWriteEnabled()) {
       await enqueue(conn, {
@@ -246,11 +291,28 @@ export const BusinessDateService = {
 
   /**
    * Reset today_checkins and today_checkouts to '0'.
-   * Must be called within an active transaction.
+   * When conn is provided, executes MySQL query on active connection.
    */
   async resetDailyCounters(conn) {
-    await conn.query("UPDATE system_settings SET value_val = '0' WHERE key_name = 'today_checkins'");
-    await conn.query("UPDATE system_settings SET value_val = '0' WHERE key_name = 'today_checkouts'");
+    if (conn) {
+      await conn.query("UPDATE system_settings SET value_val = '0' WHERE key_name = 'today_checkins'");
+      await conn.query("UPDATE system_settings SET value_val = '0' WHERE key_name = 'today_checkouts'");
+    }
+    if (isFirebaseOnlyBusinessDateEnabled() && (!conn || db)) {
+      try {
+        if (db) {
+          const settingsRef = db.collection('settings').doc('system_date');
+          await settingsRef.set({
+            today_checkins: 0,
+            today_checkouts: 0,
+            updated_at: new Date().toISOString()
+          }, { merge: true });
+        }
+      } catch (e) {
+        console.warn('[resetDailyCounters] Firestore sync error:', e.message);
+      }
+    }
+    invalidateSystemDateCache();
   },
 
   /**
@@ -275,6 +337,83 @@ export const BusinessDateService = {
     const nextIso = _normalise(nextDate);
     if (!nextIso) {
       throw new BusinessDateError(BD_ERRORS.INVALID_FORMAT, `Invalid nextDate format: "${nextDate}".`);
+    }
+
+    if (opts.useFirestoreTransaction || (isFirebaseOnlyBusinessDateEnabled() && (!conn || opts.isFirebaseOnly))) {
+      if (!db) {
+        throw new BusinessDateError(BD_ERRORS.MISSING, 'Firestore database is not initialized');
+      }
+
+      await db.runTransaction(async (transaction) => {
+        const settingsRef = db.collection('settings').doc('system_date');
+        const auditLogDupRef = db.collection('audit_logs').doc(`day_end_${nextIso}`);
+
+        // 1. All Reads First
+        const systemDoc = await transaction.get(settingsRef);
+        const dupDoc = await transaction.get(auditLogDupRef);
+
+        if (!systemDoc.exists) {
+          throw new BusinessDateError(BD_ERRORS.MISSING, '[CRITICAL] Firestore settings/system_date is missing');
+        }
+
+        const data = systemDoc.data() || {};
+        const currentIso = _normalise(data.current_date || data.system_date);
+        if (!currentIso) {
+          throw new BusinessDateError(BD_ERRORS.INVALID_FORMAT, 'Invalid current business date in Firestore');
+        }
+
+        const expectedNext = this.addDays(currentIso, 1);
+        const cmp = this.compareDates(nextIso, currentIso);
+
+        // Same-date guard
+        if (cmp === 0) {
+          throw new BusinessDateError(BD_ERRORS.SAME_DATE,
+            `Day End rejected: nextDate (${nextIso}) equals current Business Date (${currentIso}). Business Date has not changed.`);
+        }
+        // Backward guard
+        if (cmp < 0) {
+          throw new BusinessDateError(BD_ERRORS.BACKWARD,
+            `Day End rejected: nextDate (${nextIso}) is before current Business Date (${currentIso}).`);
+        }
+        // Skip guard — must be exactly +1 day
+        if (nextIso !== expectedNext) {
+          throw new BusinessDateError(BD_ERRORS.SKIP,
+            `Day End rejected: nextDate (${nextIso}) skips a calendar day. Expected exactly ${expectedNext}.`);
+        }
+
+        // Duplicate run guard
+        if (dupDoc.exists) {
+          throw new BusinessDateError(BD_ERRORS.ALREADY_RAN,
+            `Day End has already been executed for ${nextIso} (audit log day_end_${nextIso}).`);
+        }
+
+        const nowIso = new Date().toISOString();
+        const auditorId = opts.auditorId || null;
+        const auditDetail = `Night audit run. Business date rolled from ${currentIso} to ${nextIso}.`;
+
+        // 2. All Writes
+        transaction.set(settingsRef, {
+          current_date: nextIso,
+          system_date: nextIso,
+          today_checkins: 0,
+          today_checkouts: 0,
+          continued_rooms: data.continued_rooms || 0,
+          updated_at: nowIso
+        }, { merge: true });
+
+        transaction.set(auditLogDupRef, {
+          log_id: `day_end_${nextIso}`,
+          action: 'DAY_END',
+          user_id: auditorId ? String(auditorId) : null,
+          details: auditDetail,
+          business_date: nextIso,
+          created_at: nowIso
+        });
+      });
+
+      console.log(`[DayEnd:FirebaseOnly] Complete. Business Date is now ${nextIso}.`);
+      invalidateSystemDateCache();
+      return;
     }
 
     // ── Lock system_settings to block concurrent Day End calls ────────────
@@ -323,14 +462,22 @@ export const BusinessDateService = {
     const newTariffRecords = [];
 
     for (const room of occupiedRooms) {
-      const tariff = room.rate;
-      // GST is included in the room rate — no separate tax line
-
+      // ── B12: Use booking-specific tariff (room_tariff) if set; fallback to room.rate ──
       const [bookings] = await conn.query(
-        "SELECT id FROM bookings WHERE room_id = ? AND booking_status = 'Checked In'",
+        "SELECT id, room_tariff FROM bookings WHERE room_id = ? AND booking_status = 'Checked In'",
         [room.id]
       );
       const bookingId = bookings[0]?.id || null;
+      const tariff = bookings[0]?.room_tariff || room.rate;
+      // GST is included in the tariff — no separate tax line
+
+      const dayEndTime = (() => {
+        const n = new Date();
+        const h = n.getHours(), mi = n.getMinutes();
+        const ampm = h >= 12 ? 'PM' : 'AM';
+        const h12 = h % 12 === 0 ? 12 : h % 12;
+        return `${String(h12).padStart(2,'0')}:${String(mi).padStart(2,'0')} ${ampm}`;
+      })();
 
       const [existingTariff] = await conn.query(
         "SELECT id FROM ledger_items WHERE room_number = ? AND business_date = ? AND booking_id = ? AND `desc` LIKE 'Room Tariff%Rollover%'",
@@ -339,8 +486,10 @@ export const BusinessDateService = {
       if (existingTariff.length === 0) {
         // ── B7 Change 1: Capture insertId from tariff INSERT ──────────────
         const [tariffResult] = await conn.query(
-          "INSERT INTO ledger_items (room_number, `desc`, qty, amount, business_date, booking_id) VALUES (?, ?, 1, ?, ?, ?)",
-          [room.number, 'Room Tariff (Rollover, Incl. GST)', tariff, nextIso, bookingId]
+          `INSERT INTO ledger_items (room_number, \`desc\`, qty, amount, business_date, booking_id,
+            transaction_type, credit_amount, time_of_entry)
+           VALUES (?, ?, 1, ?, ?, ?, 'ROLLOVER', 0, ?)`,
+          [room.number, 'Room Tariff (Rollover, Incl. GST)', tariff, nextIso, bookingId, dayEndTime]
         );
         const insertedId = tariffResult.insertId;
         // Accumulate for compound event (only newly-inserted rows)
@@ -373,95 +522,7 @@ export const BusinessDateService = {
       [auditorId, auditDetail, nextIso]
     );
 
-    // ── B7 Changes 2/3/4: Build and enqueue compound Outbox event ─────────
-    // Guarded by feature flag. Runs BEFORE connection.commit() in the controller.
-    if (isFirestoreDualWriteEnabled()) {
-      // B7 Change 4: Generate frozen timestamp exactly once during event construction.
-      // Must NOT be recalculated on Firestore retry to enable isStaleUpdate() guard.
-      const eventOccurredAt = new Date().toISOString();
-
-      const builder = createCompoundEventBuilder({
-        event_type:     'COMPOUND_NIGHT_AUDIT',
-        aggregate_type: 'SYSTEM',
-        aggregate_id:   `day_end_${nextIso}`,
-        occurred_at:    eventOccurredAt,
-        business_date:  nextIso,
-      });
-
-      // B7 Change 3: settings/system_date write — all 4 absolute counter values.
-      // Includes frozen updated_at (Change 4) to enable isStaleUpdate() guard.
-      builder.addRootWrite({
-        collection:  'settings',
-        document_id: 'system_date',
-        operation:   'set_merge',
-        data: {
-          current_date:    nextIso,
-          system_date:     nextIso,
-          today_checkins:  0,
-          today_checkouts: 0,
-          continued_rooms: occupiedRooms.length,
-          updated_at:      eventOccurredAt,
-        },
-      });
-
-      // B7 Change 2: One dual-write per newly-inserted tariff ledger item.
-      // Root:         /ledger_items/{ledger_id}
-      // Subcollection: /bookings/{bkg_id}/ledger_items/{ledger_id}
-      for (const record of newTariffRecords) {
-        const ledgerDocId = formatLedgerItemId(record.insertedId);
-        const bkgDocId    = record.bookingId ? formatBookingId(record.bookingId) : null;
-
-        const ledgerData = {
-          item_id:         ledgerDocId,
-          booking_id:      bkgDocId,
-          mysql_booking_id: record.bookingId,
-          room_number:     record.roomNumber,
-          description:     'Room Tariff (Rollover, Incl. GST)',
-          desc:            'Room Tariff (Rollover, Incl. GST)',
-          qty:             1,
-          quantity:        1,
-          amount:          record.tariff,
-          type:            'CHARGE',
-          status:          'Pending',
-          business_date:   nextIso,
-          mysql_ledger_id: record.insertedId,
-          created_at:      eventOccurredAt,
-        };
-
-        if (bkgDocId) {
-          // Dual write: root + subcollection under the booking
-          builder.addDualWrite({
-            rootCollection:   'ledger_items',
-            document_id:       ledgerDocId,
-            parentCollection:  'bookings',
-            parent_id:         bkgDocId,
-            subcollection:     'ledger_items',
-            operation:         'set_merge',
-            data:              ledgerData,
-          });
-        } else {
-          // No booking (edge case) — root write only
-          builder.addRootWrite({
-            collection:  'ledger_items',
-            document_id: ledgerDocId,
-            operation:   'set_merge',
-            data:        ledgerData,
-          });
-        }
-      }
-
-      const compoundPayload = builder.build();
-
-      await enqueue(conn, {
-        event_type:     compoundPayload.event_type,
-        aggregate_type: compoundPayload.aggregate_type,
-        aggregate_id:   compoundPayload.aggregate_id,
-        payload:        compoundPayload,
-      });
-
-      console.log(`[DayEnd] Compound outbox event enqueued: ${compoundPayload.operation_id} (${compoundPayload.writes.length} writes, ${newTariffRecords.length} new tariffs)`);
-    }
-
+    invalidateSystemDateCache();
     console.log(`[DayEnd] Complete. Business Date is now ${nextIso}.`);
   },
 
@@ -496,6 +557,58 @@ export const BusinessDateService = {
       throw new BusinessDateError(BD_ERRORS.INVALID_FORMAT, 'A reason is required for rollback operations.');
     }
 
+    if (opts.useFirestoreTransaction || (isFirebaseOnlyBusinessDateEnabled() && (!conn || opts.isFirebaseOnly))) {
+      if (!db) {
+        throw new BusinessDateError(BD_ERRORS.MISSING, 'Firestore database is not initialized');
+      }
+
+      let currentIso = null;
+      let previousIso = null;
+
+      await db.runTransaction(async (transaction) => {
+        const settingsRef = db.collection('settings').doc('system_date');
+        const systemDoc = await transaction.get(settingsRef);
+
+        if (!systemDoc.exists) {
+          throw new BusinessDateError(BD_ERRORS.MISSING, '[CRITICAL] Firestore settings/system_date is missing');
+        }
+
+        const data = systemDoc.data() || {};
+        currentIso = _normalise(data.current_date || data.system_date);
+        if (!currentIso) {
+          throw new BusinessDateError(BD_ERRORS.INVALID_FORMAT, 'Invalid current business date in Firestore');
+        }
+
+        previousIso = this.addDays(currentIso, -1);
+        const nowIso = new Date().toISOString();
+        const rollbackLogRef = db.collection('audit_logs').doc(`rollback_${Date.now()}`);
+
+        transaction.set(settingsRef, {
+          current_date: previousIso,
+          system_date: previousIso,
+          updated_at: nowIso
+        }, { merge: true });
+
+        transaction.set(rollbackLogRef, {
+          action: 'ROLLBACK_DATE',
+          user_id: userId ? String(userId) : null,
+          username: username || null,
+          role: role || null,
+          reason: reason.trim(),
+          client_ip: clientIp || null,
+          previous_business_date: currentIso,
+          new_business_date: previousIso,
+          business_date: previousIso,
+          details: `Manual rollback. Business date rolled back from ${currentIso} to ${previousIso}. Reason: ${reason}`,
+          created_at: nowIso
+        });
+      });
+
+      invalidateSystemDateCache();
+      console.log(`[Rollback:FirebaseOnly] Complete. Business Date is now ${previousIso}.`);
+      return { previousDate: currentIso, newDate: previousIso };
+    }
+
     // Lock
     await conn.query("SELECT value_val FROM system_settings WHERE key_name = 'system_date' FOR UPDATE");
 
@@ -519,6 +632,7 @@ export const BusinessDateService = {
       [userId, auditDetails, previousIso, currentIso, previousIso, reason, username, role, clientIp]
     );
 
+    invalidateSystemDateCache();
     console.log(`[Rollback] Complete. Business Date is now ${previousIso}.`);
     return { previousDate: currentIso, newDate: previousIso };
   },
@@ -571,6 +685,7 @@ export const BusinessDateService = {
       [userId, auditDetails, todayIso, currentIso, todayIso, reason, username, role, clientIp]
     );
 
+    invalidateSystemDateCache();
     console.log(`[DevReset] Complete. Business Date is now ${todayIso}.`);
     return { previousDate: currentIso, newDate: todayIso };
   },

@@ -1,5 +1,6 @@
 import React, { createContext, useState, useEffect } from 'react';
 import { auth, signOut, onAuthStateChanged } from '../config/firebaseClient';
+import { API_BASE_URL, getApiHeaders } from '../config/apiConfig';
 
 export const AdminAuthContext = createContext(null);
 
@@ -21,6 +22,28 @@ export function AdminAuthProvider({ children }) {
           const freshToken = await firebaseUser.getIdToken(false);
           setAdminToken(freshToken);
           localStorage.setItem('adminToken', freshToken);
+
+          // Re-validate role from server on every auth state change (page refresh).
+          // This prevents a stale localStorage role from surviving a role change.
+          try {
+            const meRes = await fetch(`${API_BASE_URL}/api/auth/me`, {
+              method: 'GET',
+              headers: getApiHeaders(freshToken)
+            });
+            if (meRes.ok) {
+              const meData = await meRes.json();
+              if (meData.user && meData.user.role) {
+                // Merge fresh server role into existing stored user (preserves extra fields)
+                const existingUser = JSON.parse(localStorage.getItem('adminUser') || 'null');
+                const refreshedUser = { ...(existingUser || {}), ...meData.user };
+                localStorage.setItem('adminUser', JSON.stringify(refreshedUser));
+                setAdminUser(refreshedUser);
+              }
+            }
+          } catch (meErr) {
+            // Non-fatal: keep existing stored user if /auth/me is unreachable
+            console.warn('[AdminAuthContext] Role re-validation skipped (network):', meErr.message);
+          }
         } catch (e) {
           console.warn('[AdminAuthContext] Token refresh failed:', e.message);
         }

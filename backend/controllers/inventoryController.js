@@ -6,47 +6,19 @@
 
 import pool from '../db.js';
 import { db } from '../config/firebaseAdmin.js';
-import { BusinessDateService } from '../services/businessDateService.js';
+import { InventoryCutoverService } from '../services/inventoryCutoverService.js';
 import { VALID_UNITS, VALID_STATUSES } from '../utils/inventoryConstants.js';
 import { removeOldProductPhoto } from '../middleware/inventoryUploadMiddleware.js';
-import { enqueue } from '../services/outboxService.js';
-import { isFirestoreDualWriteEnabled, isInventoryCategoriesReadCanaryEnabled, isInventoryProductsReadCanaryEnabled } from '../config/featureFlags.js';
-import { executeReadCanary } from '../services/dualReadVerificationService.js';
+import { isInventoryCategoriesReadCanaryEnabled, isInventoryProductsReadCanaryEnabled } from '../config/featureFlags.js';
 
 /**
  * GET /api/inventory/categories
  * Retrieves all inventory categories.
  */
 export const getCategories = async (req, res) => {
-  const canaryResult = await executeReadCanary({
-    flagCheckFn: isInventoryCategoriesReadCanaryEnabled,
-    endpointName: '/api/inventory/categories',
-    fetchFirestoreFn: async () => {
-      const snap = await db.collection('inventory_categories').get();
-      return snap.docs.map(doc => ({ ...doc.data(), firestore_id: doc.id }));
-    },
-    validateAndFormatFn: (docs) => {
-      if (!Array.isArray(docs) || docs.length === 0) return null;
-      const categories = docs.map(d => ({
-        id: d.id || d.mysql_category_id || d.firestore_id,
-        name: d.name || '',
-        department: d.department || 'General',
-        created_at: d.created_at || null
-      }));
-      categories.sort((a, b) => String(a.name).localeCompare(String(b.name)));
-      return categories.length >= 1 ? { categories } : null;
-    }
-  });
-
-  if (canaryResult) {
-    return res.json(canaryResult);
-  }
-
   try {
-    const [rows] = await pool.query(
-      'SELECT id, name, department, created_at FROM inventory_categories ORDER BY name ASC'
-    );
-    return res.json({ categories: rows });
+    const result = await InventoryCutoverService.getCategories();
+    return res.json(result);
   } catch (error) {
     console.error('getCategories error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
@@ -63,46 +35,15 @@ export const createCategory = async (req, res) => {
     return res.status(400).json({ error: 'Category name is required.' });
   }
 
-  let connection;
   try {
-    connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    const catName = name.trim();
-    const catDept = (department && typeof department === 'string' && department.trim()) ? department.trim() : 'General';
-
-    const [result] = await connection.query(
-      'INSERT INTO inventory_categories (name, department) VALUES (?, ?)',
-      [catName, catDept]
-    );
-
-    const catId = result.insertId;
-
-    if (isFirestoreDualWriteEnabled()) {
-      await enqueue(connection, {
-        event_type: 'INVENTORY_CATEGORY_CREATED',
-        aggregate_type: 'INVENTORY_CATEGORY',
-        aggregate_id: catName,
-        payload: {
-          name: catName,
-          department: catDept,
-          mysql_category_id: catId,
-          updated_at: new Date().toISOString()
-        }
-      });
-    }
-
-    await connection.commit();
-    return res.status(201).json({ message: 'Category created successfully.', category: { id: catId, name: catName, department: catDept } });
+    const category = await InventoryCutoverService.createCategory({ name, department });
+    return res.status(201).json({ message: 'Category created successfully.', category });
   } catch (error) {
-    if (connection) await connection.rollback();
-    if (error.code === 'ER_DUP_ENTRY') {
+    if (error.status === 409 || error.code === 'ER_DUP_ENTRY') {
       return res.status(409).json({ error: `Category '${name.trim()}' already exists.` });
     }
     console.error('createCategory error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
-  } finally {
-    if (connection) connection.release();
   }
 };
 
@@ -114,53 +55,20 @@ export const updateCategory = async (req, res) => {
   const { id } = req.params;
   const { name, department } = req.body;
 
-  if (!id) return res.status(400).json({ error: 'Category ID is required.' });
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ error: 'Category name is required.' });
+  }
 
-  let connection;
   try {
-    connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    const [existing] = await connection.query('SELECT * FROM inventory_categories WHERE id = ? FOR UPDATE', [id]);
-    if (existing.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ error: 'Category not found.' });
-    }
-
-    const currentCat = existing[0];
-    const catName = (name && typeof name === 'string' && name.trim()) ? name.trim() : currentCat.name;
-    const catDept = (department && typeof department === 'string' && department.trim()) ? department.trim() : currentCat.department;
-
-    await connection.query(
-      'UPDATE inventory_categories SET name = ?, department = ? WHERE id = ?',
-      [catName, catDept, id]
-    );
-
-    if (isFirestoreDualWriteEnabled()) {
-      await enqueue(connection, {
-        event_type: 'INVENTORY_CATEGORY_UPDATED',
-        aggregate_type: 'INVENTORY_CATEGORY',
-        aggregate_id: catName,
-        payload: {
-          name: catName,
-          department: catDept,
-          mysql_category_id: Number(id),
-          updated_at: new Date().toISOString()
-        }
-      });
-    }
-
-    await connection.commit();
-    return res.json({ message: 'Category updated successfully.', category: { id: Number(id), name: catName, department: catDept } });
+    const category = await InventoryCutoverService.updateCategory(id, { name, department });
+    return res.json({ message: 'Category updated successfully.', category });
   } catch (error) {
-    if (connection) await connection.rollback();
-    if (error.code === 'ER_DUP_ENTRY') {
+    if (error.status === 404) return res.status(404).json({ error: 'Category not found.' });
+    if (error.status === 409 || error.code === 'ER_DUP_ENTRY') {
       return res.status(409).json({ error: `Category name '${name}' is already taken.` });
     }
     console.error('updateCategory error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
-  } finally {
-    if (connection) connection.release();
   }
 };
 
@@ -172,48 +80,14 @@ export const deleteCategory = async (req, res) => {
   const { id } = req.params;
   if (!id) return res.status(400).json({ error: 'Category ID is required.' });
 
-  let connection;
   try {
-    connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    const [existing] = await connection.query('SELECT * FROM inventory_categories WHERE id = ? FOR UPDATE', [id]);
-    if (existing.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ error: 'Category not found.' });
-    }
-
-    const catRecord = existing[0];
-
-    const [prods] = await connection.query('SELECT COUNT(*) as count FROM inventory_products WHERE category_id = ?', [id]);
-    if (prods[0].count > 0) {
-      await connection.rollback();
-      return res.status(400).json({ error: 'Cannot delete category that contains inventory products.' });
-    }
-
-    await connection.query('DELETE FROM inventory_categories WHERE id = ?', [id]);
-
-    if (isFirestoreDualWriteEnabled()) {
-      await enqueue(connection, {
-        event_type: 'INVENTORY_CATEGORY_DELETED',
-        aggregate_type: 'INVENTORY_CATEGORY',
-        aggregate_id: catRecord.name,
-        payload: {
-          name: catRecord.name,
-          docId: `cat_${catRecord.name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')}`,
-          mysql_category_id: Number(id)
-        }
-      });
-    }
-
-    await connection.commit();
-    return res.json({ message: 'Category deleted successfully.' });
+    const result = await InventoryCutoverService.deleteCategory(id);
+    return res.json(result);
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (error.status === 404) return res.status(404).json({ error: 'Category not found.' });
+    if (error.status === 400) return res.status(400).json({ error: error.message });
     console.error('deleteCategory error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
-  } finally {
-    if (connection) connection.release();
   }
 };
 
@@ -222,142 +96,9 @@ export const deleteCategory = async (req, res) => {
  * Retrieves product list with filters and calculates stock statuses & dashboard summary metrics.
  */
 export const getProducts = async (req, res) => {
-  const canaryResult = await executeReadCanary({
-    flagCheckFn: isInventoryProductsReadCanaryEnabled,
-    endpointName: '/api/inventory/products',
-    fetchFirestoreFn: async () => {
-      const snap = await db.collection('inventory_products').get();
-      return snap.docs.map(doc => ({ ...doc.data(), firestore_id: doc.id }));
-    },
-    validateAndFormatFn: (docs) => {
-      if (!Array.isArray(docs) || docs.length === 0) return null;
-      const products = docs.map(p => {
-        const cur = parseFloat(p.current_stock || 0);
-        const min = parseFloat(p.minimum_stock_level || 0);
-        let stock_status = 'In Stock';
-        if (cur <= 0) stock_status = 'Out of Stock';
-        else if (cur <= min) stock_status = 'Low Stock';
-
-        return {
-          id: p.id || p.mysql_product_id || p.firestore_id,
-          sku: p.sku || '',
-          name: p.name || '',
-          category_id: p.category_id || 1,
-          category_name: p.category_name || 'General',
-          category_department: p.category_department || 'General',
-          unit_of_measure: p.unit_of_measure || 'pcs',
-          minimum_stock_level: min,
-          current_stock: cur,
-          unit_price: parseFloat(p.unit_price || 0),
-          photo_url: p.photo_url || null,
-          status: p.status || 'Active',
-          created_at: p.created_at || null,
-          updated_at: p.updated_at || null,
-          stock_status
-        };
-      });
-
-      const metrics = {
-        totalProducts: products.length,
-        activeProducts: products.filter(p => p.status === 'Active').length,
-        lowStockProducts: products.filter(p => p.status === 'Active' && p.current_stock > 0 && p.current_stock <= p.minimum_stock_level).length,
-        outOfStockProducts: products.filter(p => p.status === 'Active' && p.current_stock <= 0).length
-      };
-
-      return products.length >= 1 ? { products, metrics } : null;
-    }
-  });
-
-  if (canaryResult) {
-    return res.json(canaryResult);
-  }
-
   try {
-    const { search, category_id, status, low_stock } = req.query;
-
-    let whereClause = ['1=1'];
-    const params = [];
-
-    if (search && search.trim()) {
-      whereClause.push('(p.name LIKE ? OR p.sku LIKE ?)');
-      const term = `%${search.trim()}%`;
-      params.push(term, term);
-    }
-
-    if (category_id && !isNaN(parseInt(category_id, 10))) {
-      whereClause.push('p.category_id = ?');
-      params.push(parseInt(category_id, 10));
-    }
-
-    if (status && VALID_STATUSES.includes(status)) {
-      whereClause.push('p.status = ?');
-      params.push(status);
-    }
-
-    if (low_stock === 'true' || low_stock === '1') {
-      whereClause.push('p.current_stock <= p.minimum_stock_level');
-    }
-
-    const query = `
-      SELECT 
-        p.id,
-        p.sku,
-        p.name,
-        p.category_id,
-        c.name AS category_name,
-        c.department AS category_department,
-        p.unit_of_measure,
-        CAST(p.minimum_stock_level AS DOUBLE) AS minimum_stock_level,
-        CAST(p.current_stock AS DOUBLE) AS current_stock,
-        CAST(p.unit_price AS DOUBLE) AS unit_price,
-        p.photo_url,
-        p.status,
-        p.created_at,
-        p.updated_at
-      FROM inventory_products p
-      JOIN inventory_categories c ON p.category_id = c.id
-      WHERE ${whereClause.join(' AND ')}
-      ORDER BY p.name ASC
-    `;
-
-    const [rows] = await pool.query(query, params);
-
-    // Compute stock_status for each product
-    const products = rows.map(p => {
-      let stock_status = 'In Stock';
-      if (p.current_stock <= 0) {
-        stock_status = 'Out of Stock';
-      } else if (p.current_stock <= p.minimum_stock_level) {
-        stock_status = 'Low Stock';
-      }
-      return { ...p, stock_status };
-    });
-
-    // Compute Overall Inventory Metrics Summary
-    const [allProducts] = await pool.query(
-      `SELECT 
-        CAST(current_stock AS DOUBLE) AS current_stock, 
-        CAST(minimum_stock_level AS DOUBLE) AS minimum_stock_level, 
-        status 
-       FROM inventory_products`
-    );
-
-    const metrics = {
-      totalProducts: allProducts.length,
-      activeProducts: allProducts.filter(p => p.status === 'Active').length,
-      lowStockProducts: allProducts.filter(p => {
-        const cur = parseFloat(p.current_stock);
-        const min = parseFloat(p.minimum_stock_level);
-        return p.status === 'Active' && cur > 0 && cur <= min;
-      }).length,
-      outOfStockProducts: allProducts.filter(p => {
-        const cur = parseFloat(p.current_stock);
-        return p.status === 'Active' && cur <= 0;
-      }).length
-    };
-
-
-    return res.json({ products, metrics });
+    const result = await InventoryCutoverService.getProducts(req.query);
+    return res.json(result);
   } catch (error) {
     console.error('getProducts error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
@@ -371,33 +112,9 @@ export const getProducts = async (req, res) => {
 export const getProductById = async (req, res) => {
   try {
     const { id } = req.params;
-    const [rows] = await pool.query(
-      `SELECT 
-        p.*,
-        c.name AS category_name,
-        c.department AS category_department
-       FROM inventory_products p
-       JOIN inventory_categories c ON p.category_id = c.id
-       WHERE p.id = ?`,
-      [id]
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: 'Product not found.' });
-    }
-
-    const p = rows[0];
-    const cur = parseFloat(p.current_stock);
-    const min = parseFloat(p.minimum_stock_level);
-    let stock_status = 'In Stock';
-    if (cur <= 0) {
-      stock_status = 'Out of Stock';
-    } else if (cur <= min) {
-      stock_status = 'Low Stock';
-    }
-
-
-    return res.json({ product: { ...p, stock_status } });
+    const product = await InventoryCutoverService.getProductById(id);
+    if (!product) return res.status(404).json({ error: 'Product not found.' });
+    return res.json({ product });
   } catch (error) {
     console.error('getProductById error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
@@ -409,7 +126,6 @@ export const getProductById = async (req, res) => {
  * Creates a new product with initial opening stock and optional photo upload.
  */
 export const createProduct = async (req, res) => {
-  let connection;
   try {
     const {
       sku,
@@ -422,7 +138,6 @@ export const createProduct = async (req, res) => {
       status
     } = req.body;
 
-    // Validation
     const errors = [];
     if (!sku || typeof sku !== 'string' || !sku.trim()) errors.push('SKU is required.');
     if (!name || typeof name !== 'string' || !name.trim()) errors.push('Product name is required.');
@@ -443,137 +158,45 @@ export const createProduct = async (req, res) => {
     const priceNum = parseFloat(unit_price ?? 0);
     if (isNaN(priceNum) || priceNum < 0) errors.push('Unit price cannot be negative.');
 
-    const prodStatus = status && VALID_STATUSES.includes(status) ? status : 'Active';
-
     if (errors.length > 0) {
       return res.status(400).json({ error: 'Validation failed.', details: errors });
     }
 
-    connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    // Verify SKU uniqueness
-    const [existingSku] = await connection.query(
-      'SELECT id FROM inventory_products WHERE sku = ?',
-      [sku.trim()]
-    );
-    if (existingSku.length > 0) {
-      await connection.rollback();
-      return res.status(409).json({ error: `SKU '${sku.trim()}' is already in use. Please enter a unique SKU.` });
+    let photo_url = null;
+    if (req.file) {
+      photo_url = `/inventory-photos/${req.file.filename}`;
     }
 
-    // Verify category existence
-    const [existingCat] = await connection.query(
-      'SELECT id FROM inventory_categories WHERE id = ?',
-      [catIdNum]
-    );
-    if (existingCat.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ error: 'Selected category does not exist.' });
-    }
-
-    // Photo URL
-    const photo_url = req.file ? `/inventory-photos/${req.file.filename}` : null;
-
-    // Insert Product
-    const [result] = await connection.query(
-      `INSERT INTO inventory_products 
-        (sku, name, category_id, unit_of_measure, minimum_stock_level, current_stock, unit_price, photo_url, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        sku.trim().toUpperCase(),
-        name.trim(),
-        catIdNum,
-        unit_of_measure,
-        minStockNum,
-        currentStockNum,
-        priceNum,
-        photo_url,
-        prodStatus
-      ]
-    );
-
-    const productId = result.insertId;
-
-    // Audit log
-    const businessDate = await BusinessDateService.getBusinessDate(connection);
-    const userId = req.user?.id || null;
-    await connection.query(
-      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'INVENTORY_PRODUCT_CREATED', ?, ?)`,
-      [userId, `Created inventory product: SKU=${sku.trim().toUpperCase()}, Name=${name.trim()}, InitialStock=${currentStockNum}`, businessDate]
-    );
-
-    if (isFirestoreDualWriteEnabled()) {
-      await enqueue(connection, {
-        event_type: 'INVENTORY_PRODUCT_CREATED',
-        aggregate_type: 'INVENTORY_PRODUCT',
-        aggregate_id: sku.trim().toUpperCase(),
-        payload: {
-          sku: sku.trim().toUpperCase(),
-          name: name.trim(),
-          category_id: catIdNum,
-          mysql_category_id: catIdNum,
-          unit_of_measure,
-          unit: unit_of_measure,
-          minimum_stock_level: minStockNum,
-          reorder_level: minStockNum,
-          current_stock: currentStockNum,
-          stock_quantity: currentStockNum,
-          unit_price: priceNum,
-          photo_url,
-          status: prodStatus,
-          mysql_product_id: productId,
-          updated_at: new Date().toISOString()
-        }
-      });
-    }
-
-    await connection.commit();
-
-    return res.status(201).json({
-      message: 'Product created successfully.',
-      productId
+    const product = await InventoryCutoverService.createProduct({
+      sku,
+      name,
+      category_id,
+      unit_of_measure,
+      minimum_stock_level,
+      current_stock,
+      unit_price,
+      status,
+      photo_url
     });
+
+    return res.status(201).json({ message: 'Product created successfully.', product });
   } catch (error) {
-    if (connection) {
-      try { await connection.rollback(); } catch (e) {}
-    }
-    if (error.code === 'ER_DUP_ENTRY') {
-      return res.status(409).json({ error: 'A product with this SKU already exists.' });
+    if (error.status === 409 || error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: `Product with SKU '${req.body.sku}' already exists.` });
     }
     console.error('createProduct error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
-  } finally {
-    if (connection) connection.release();
   }
 };
 
 /**
  * PUT /api/inventory/products/:id
  * Updates product details.
- * CRITICAL ADJUSTMENT 3: Does NOT allow arbitrary editing of current_stock.
- * CRITICAL ADJUSTMENT 2: Manages photo replacement safely.
  */
 export const updateProduct = async (req, res) => {
   const { id } = req.params;
-  let connection;
 
   try {
-    connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    // Check existing product
-    const [existing] = await connection.query(
-      'SELECT * FROM inventory_products WHERE id = ?',
-      [id]
-    );
-
-    if (existing.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ error: 'Product not found.' });
-    }
-
-    const currentProduct = existing[0];
     const {
       name,
       category_id,
@@ -587,177 +210,61 @@ export const updateProduct = async (req, res) => {
     if (name !== undefined && (typeof name !== 'string' || !name.trim())) {
       errors.push('Product name cannot be empty.');
     }
-
-    if (category_id !== undefined) {
-      const catIdNum = parseInt(category_id, 10);
-      if (isNaN(catIdNum)) {
-        errors.push('Valid Category ID is required.');
-      } else {
-        const [catCheck] = await connection.query('SELECT id FROM inventory_categories WHERE id = ?', [catIdNum]);
-        if (catCheck.length === 0) errors.push('Selected category does not exist.');
-      }
-    }
-
     if (unit_of_measure !== undefined && !VALID_UNITS.includes(unit_of_measure)) {
       errors.push(`Unit of measure must be one of: ${VALID_UNITS.join(', ')}.`);
     }
-
     if (minimum_stock_level !== undefined) {
       const minStockNum = parseFloat(minimum_stock_level);
       if (isNaN(minStockNum) || minStockNum < 0) errors.push('Minimum stock level cannot be negative.');
     }
-
     if (unit_price !== undefined) {
       const priceNum = parseFloat(unit_price);
       if (isNaN(priceNum) || priceNum < 0) errors.push('Unit price cannot be negative.');
     }
-
     if (status !== undefined && !VALID_STATUSES.includes(status)) {
       errors.push(`Status must be one of: ${VALID_STATUSES.join(', ')}.`);
     }
 
     if (errors.length > 0) {
-      await connection.rollback();
       return res.status(400).json({ error: 'Validation failed.', details: errors });
     }
 
-    // Photo Replacement Lifecycle Handling
-    let newPhotoUrl = currentProduct.photo_url;
-    let oldPhotoToDelete = null;
-
+    let newPhotoUrl = undefined;
     if (req.file) {
       newPhotoUrl = `/inventory-photos/${req.file.filename}`;
-      oldPhotoToDelete = currentProduct.photo_url;
     }
 
-    // Build updates (explicitly excluding current_stock to prevent silent stock corruption)
-    const updates = {
-      name: name !== undefined ? name.trim() : currentProduct.name,
-      category_id: category_id !== undefined ? parseInt(category_id, 10) : currentProduct.category_id,
-      unit_of_measure: unit_of_measure !== undefined ? unit_of_measure : currentProduct.unit_of_measure,
-      minimum_stock_level: minimum_stock_level !== undefined ? parseFloat(minimum_stock_level) : currentProduct.minimum_stock_level,
-      unit_price: unit_price !== undefined ? parseFloat(unit_price) : currentProduct.unit_price,
-      photo_url: newPhotoUrl,
-      status: status !== undefined ? status : currentProduct.status
+    const payload = {
+      name,
+      category_id,
+      unit_of_measure,
+      minimum_stock_level,
+      unit_price,
+      status
     };
+    if (newPhotoUrl) payload.photo_url = newPhotoUrl;
 
-    await connection.query('UPDATE inventory_products SET ? WHERE id = ?', [updates, id]);
-
-    // Audit log
-    const businessDate = await BusinessDateService.getBusinessDate(connection);
-    const userId = req.user?.id || null;
-    await connection.query(
-      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'INVENTORY_PRODUCT_UPDATED', ?, ?)`,
-      [userId, `Updated inventory product: SKU=${currentProduct.sku}, Name=${updates.name}`, businessDate]
-    );
-
-    if (isFirestoreDualWriteEnabled()) {
-      await enqueue(connection, {
-        event_type: 'INVENTORY_PRODUCT_UPDATED',
-        aggregate_type: 'INVENTORY_PRODUCT',
-        aggregate_id: currentProduct.sku,
-        payload: {
-          sku: currentProduct.sku,
-          name: updates.name,
-          category_id: updates.category_id,
-          mysql_category_id: updates.category_id,
-          unit_of_measure: updates.unit_of_measure,
-          unit: updates.unit_of_measure,
-          minimum_stock_level: updates.minimum_stock_level,
-          reorder_level: updates.minimum_stock_level,
-          unit_price: updates.unit_price,
-          photo_url: updates.photo_url,
-          status: updates.status,
-          mysql_product_id: Number(id),
-          updated_at: new Date().toISOString()
-        }
-      });
-    }
-
-    await connection.commit();
-
-    // Safely remove old photo if it was replaced (post-commit to ensure DB safety)
-    if (oldPhotoToDelete) {
-      removeOldProductPhoto(oldPhotoToDelete).catch(err => {
-        console.warn('Old photo cleanup warning:', err);
-      });
-    }
-
-    return res.json({ message: 'Product updated successfully.' });
+    const result = await InventoryCutoverService.updateProduct(id, payload, req.user);
+    return res.json(result);
   } catch (error) {
-    if (connection) {
-      try { await connection.rollback(); } catch (e) {}
-    }
+    if (error.status === 404) return res.status(404).json({ error: 'Product not found.' });
     console.error('updateProduct error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
-  } finally {
-    if (connection) connection.release();
   }
 };
 
 /**
  * DELETE /api/inventory/products/:id
  * Soft deactivates product (`status = 'Inactive'`).
- * Does NOT delete the photo.
  */
 export const deleteProduct = async (req, res) => {
-  let connection;
+  const { id } = req.params;
   try {
-    const { id } = req.params;
-    connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    const [existing] = await connection.query(
-      'SELECT id, sku, name FROM inventory_products WHERE id = ?',
-      [id]
-    );
-
-    if (existing.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ error: 'Product not found.' });
-    }
-
-    const product = existing[0];
-
-    // Soft deactivation
-    await connection.query(
-      "UPDATE inventory_products SET status = 'Inactive' WHERE id = ?",
-      [id]
-    );
-
-    // Audit log
-    const businessDate = await BusinessDateService.getBusinessDate(connection);
-    const userId = req.user?.id || null;
-    await connection.query(
-      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'INVENTORY_PRODUCT_DEACTIVATED', ?, ?)`,
-      [userId, `Deactivated inventory product: SKU=${product.sku}, Name=${product.name}`, businessDate]
-    );
-
-    if (isFirestoreDualWriteEnabled()) {
-      await enqueue(connection, {
-        event_type: 'INVENTORY_PRODUCT_DEACTIVATED',
-        aggregate_type: 'INVENTORY_PRODUCT',
-        aggregate_id: product.sku,
-        payload: {
-          sku: product.sku,
-          name: product.name,
-          status: 'Inactive',
-          mysql_product_id: Number(id),
-          updated_at: new Date().toISOString()
-        }
-      });
-    }
-
-    await connection.commit();
-
-    return res.json({ message: 'Product deactivated successfully.' });
+    const result = await InventoryCutoverService.deleteProduct(id);
+    return res.json(result);
   } catch (error) {
-    if (connection) {
-      try { await connection.rollback(); } catch (e) {}
-    }
+    if (error.status === 404) return res.status(404).json({ error: 'Product not found.' });
     console.error('deleteProduct error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
-  } finally {
-    if (connection) connection.release();
   }
 };

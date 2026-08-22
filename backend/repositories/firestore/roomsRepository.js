@@ -8,6 +8,7 @@ import {
   validateRequiredFields,
   RepositoryError
 } from './firestoreUtils.js';
+import { invalidateRoomStatusCache } from '../../services/firestoreRoomStatusService.js';
 
 const COLLECTION = 'rooms';
 
@@ -78,7 +79,9 @@ export async function createRoomFirestore(roomData, options = {}) {
     updated_at: nowIso
   };
 
-  return await setDoc(COLLECTION, docId, payload, { ...options, merge: true });
+  const result = await setDoc(COLLECTION, docId, payload, { ...options, merge: true });
+  invalidateRoomStatusCache();
+  return result;
 }
 
 export async function updateRoomFirestore(roomId, roomData, options = {}) {
@@ -88,12 +91,14 @@ export async function updateRoomFirestore(roomId, roomData, options = {}) {
   const existing = await getDoc(COLLECTION, docId, options);
   if (!existing) {
     // If doc doesn't exist yet, create room cleanly
-    return await setDoc(COLLECTION, docId, {
+    const res = await setDoc(COLLECTION, docId, {
       number: String(roomData.number || roomId),
       type: String(roomData.type || 'SUITE'),
       ...roomData,
       updated_at: roomData.updated_at || new Date().toISOString()
     }, { ...options, merge: true });
+    invalidateRoomStatusCache();
+    return res;
   }
 
   if (isStaleUpdate(existing, roomData)) {
@@ -106,7 +111,9 @@ export async function updateRoomFirestore(roomId, roomData, options = {}) {
     updated_at: roomData.updated_at || new Date().toISOString()
   };
 
-  return await updateDoc(COLLECTION, docId, updatePayload, options);
+  const result = await updateDoc(COLLECTION, docId, updatePayload, options);
+  invalidateRoomStatusCache();
+  return result;
 }
 
 export async function updateRoomStatusFirestore(roomId, statusData, options = {}) {
@@ -118,14 +125,18 @@ export async function updateRoomStatusFirestore(roomId, statusData, options = {}
   }
 
   payload.updated_at = payload.updated_at || new Date().toISOString();
-  return await updateRoomFirestore(docId, payload, options);
+  const result = await updateRoomFirestore(docId, payload, options);
+  invalidateRoomStatusCache();
+  return result;
 }
 
 export async function deleteRoomFirestore(roomId, options = {}) {
   if (!roomId) throw new RepositoryError('Room ID is required for deletion', 'VALIDATION_ERROR', 400);
   const docId = String(roomId).startsWith('room_') ? String(roomId) : formatRoomId(roomId);
-  return await deleteDoc(COLLECTION, docId, options).catch(err => {
+  const result = await deleteDoc(COLLECTION, docId, options).catch(err => {
     if (err.code === 'NOT_FOUND') return null; // Idempotent delete
     throw err;
   });
+  invalidateRoomStatusCache();
+  return result;
 }

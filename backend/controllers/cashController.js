@@ -1,21 +1,16 @@
 import pool from '../db.js';
 import { BusinessDateService } from '../services/businessDateService.js';
-import { enqueue } from '../services/outboxService.js';
-import { isFirestoreDualWriteEnabled } from '../config/featureFlags.js';
-import {
-  CompoundEventBuilder,
-  formatCashSubmissionId
-} from '../services/compoundEventBuilder.js';
+import { isFirestoreCashServingEnabled } from '../config/featureFlags.js';
+import { CashCutoverService } from '../services/cashCutoverService.js';
 
-// â”€â”€ Helper: format current time â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Helper: format current time ───────────────────────────────────────────
 function formatTime(date) {
   return date.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
 }
 
-// â”€â”€ Helper: generate receipt ID â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Helper: generate receipt ID ───────────────────────────────────────────
 // Format: CS-YYYYMMDD-NNNN (e.g. CS-20260722-0001)
 async function generateReceiptId(businessDate, connection) {
-  // Derive YYYYMMDD from business date string (e.g. "22-Jul-2026" â†’ "20260722")
   const parsed = new Date(businessDate);
   const datePart = isNaN(parsed.getTime())
     ? businessDate.replace(/-/g, '').replace(/[A-Za-z]/g, '').slice(0, 8)
@@ -29,9 +24,10 @@ async function generateReceiptId(businessDate, connection) {
   return `CS-${datePart}-${seq}`;
 }
 
-// â”€â”€ POST /api/cash/submit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── POST /api/cash/submit ─────────────────────────────────────────────────
 export const submitCash = async (req, res) => {
   const { amount, receivedBy, shift, name, notes } = req.body;
+  const idempotencyKey = req.body?.idempotencyKey || req.headers['idempotency-key'] || null;
 
   // Use the receptionist-entered name if provided; fall back to token name
   const receptionistName =
@@ -41,7 +37,7 @@ export const submitCash = async (req, res) => {
     req.user?.username ||
     'Receptionist';
 
-  // Validation â€” only amount is required; receivedBy and shift are optional
+  // Validation — only amount is required; receivedBy and shift are optional
   if (!amount || isNaN(amount) || Number(amount) <= 0) {
     return res.status(400).json({ error: 'Invalid amount. Must be a positive number.' });
   }
@@ -54,150 +50,128 @@ export const submitCash = async (req, res) => {
     notes ? notes.trim() : ''
   ].filter(Boolean).join(' | ') || null;
 
-  const connection = await pool.getConnection();
-  try {
-    await connection.beginTransaction();
+  const mysqlHandler = async () => {
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
 
-    // Get current business date
-    const businessDate = await BusinessDateService.getBusinessDate(connection);
+      // Get current business date
+      const businessDate = await BusinessDateService.getBusinessDate(connection);
 
-    // Calculate cash in hand (advances + settlements - refunds - already submitted)
-    const [cashLogRows] = await connection.query(
-      `SELECT type, amount FROM cash_logs WHERE business_date = ?`, [businessDate]
-    );
-    const [submittedRows] = await connection.query(
-      `SELECT COALESCE(SUM(amount), 0) as total FROM cash_submissions WHERE business_date = ?`, [businessDate]
-    );
+      // Calculate cash in hand (advances + settlements - refunds - already submitted)
+      const [cashLogRows] = await connection.query(
+        `SELECT type, amount FROM cash_logs WHERE business_date = ?`, [businessDate]
+      );
+      const [submittedRows] = await connection.query(
+        `SELECT COALESCE(SUM(amount), 0) as total FROM cash_submissions WHERE business_date = ?`, [businessDate]
+      );
 
-    let advances = 0, settlements = 0, refunds = 0;
-    for (const row of cashLogRows) {
-      if (row.type === 'Advance Deposit') advances += Number(row.amount);
-      else if (row.type === 'Checkout Settlement') settlements += Number(row.amount);
-      else if (row.type.toLowerCase().includes('refund')) refunds += Number(row.amount);
-    }
-    const alreadySubmitted = Number(submittedRows[0].total);
-    const cashInHand       = advances + settlements - refunds - alreadySubmitted;
-
-    if (parsedAmount > cashInHand) {
-      await connection.rollback();
-      connection.release();
-      return res.status(400).json({
-        error: `Cannot submit â‚¹${parsedAmount.toLocaleString('en-IN')}. Cash in hand is only â‚¹${cashInHand.toLocaleString('en-IN')}.`
-      });
-    }
-
-    const remainingCash = cashInHand - parsedAmount;
-    const receiptId     = await generateReceiptId(businessDate, connection);
-    const submittedAt   = new Date();
-
-    // Insert cash submission record
-    const [insertResult] = await connection.query(
-      `INSERT INTO cash_submissions
-         (receipt_id, business_date, submitted_at, receptionist_name, receiver_name, amount, remaining_cash, remarks)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [receiptId, businessDate, submittedAt, receptionistName, receiverName, parsedAmount, remainingCash, combinedRemarks]
-    );
-
-    // Structured audit log
-    const structuredDetails = JSON.stringify({
-      Receipt:      receiptId,
-      Amount:       `â‚¹${parsedAmount}`,
-      Receptionist: receptionistName,
-      Shift:        shiftLabel,
-      Received_By:  receiverName,
-      Business_Date: businessDate
-    });
-    await connection.query(
-      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'CASH_HANDOVER', ?, ?)`,
-      [req.user?.type === 'staff' ? null : (req.user?.id || null), structuredDetails, businessDate]
-    );
-
-    // ── Phase 4G-C: Outbox — COMPOUND_CASH_SUBMITTED ──────────────────────
-    // Placed AFTER all MySQL mutations and BEFORE commit().
-    // receiptId (e.g. CS-20260813-0001) is deterministic — generated from
-    // business_date + sequential count. formatCashSubmissionId() produces
-    // cs_{receiptId}. No Math.random(), no Date.now(), no randomUUID().
-    if (isFirestoreDualWriteEnabled()) {
-      const eventOccurredAt = new Date().toISOString();
-
-      const cashEvent = new CompoundEventBuilder({
-        event_type:     'COMPOUND_CASH_SUBMITTED',
-        aggregate_type: 'CASH_SUBMISSION',
-        aggregate_id:   receiptId
-      });
-
-      cashEvent.addRootWrite({
-        collection:  'cash_submissions',
-        document_id: formatCashSubmissionId(receiptId),
-        operation:   'set_merge',
-        data: {
-          receipt_id:        receiptId,
-          business_date:     businessDate,
-          submitted_at:      submittedAt.toISOString(),
-          receptionist_name: receptionistName,
-          receiver_name:     receiverName,
-          shift:             shiftLabel,
-          amount:            parsedAmount,
-          remaining_cash:    remainingCash,
-          remarks:           combinedRemarks,
-          mysql_submission_id: insertResult.insertId,
-          created_at:        eventOccurredAt,
-          updated_at:        eventOccurredAt
-        }
-      });
-
-      const cashPayload = cashEvent.build();
-      await enqueue(connection, {
-        event_type:     cashPayload.event_type,
-        aggregate_type: cashPayload.aggregate_type,
-        aggregate_id:   cashPayload.aggregate_id,
-        payload:        cashPayload
-      });
-      console.log(`[submitCash] Compound outbox event enqueued: ${cashPayload.operation_id}`);
-    }
-
-    await connection.commit();
-    connection.release();
-
-    return res.json({
-      success: true,
-      message: `â‚¹${parsedAmount.toLocaleString('en-IN')} submitted successfully.`,
-      submission: {
-        id:               insertResult.insertId,
-        receipt_id:       receiptId,
-        business_date:    businessDate,
-        submitted_at:     submittedAt.toISOString(),
-        receptionist_name: receptionistName,
-        receiver_name:    receiverName,
-        shift:            shiftLabel,
-        amount:           parsedAmount,
-        remaining_cash:   remainingCash,
-        remarks:          combinedRemarks,
-        time:             formatTime(submittedAt),
+      let advances = 0, settlements = 0, refunds = 0;
+      for (const row of cashLogRows) {
+        if (row.type === 'Advance Deposit') advances += Number(row.amount);
+        else if (row.type === 'Checkout Settlement') settlements += Number(row.amount);
+        else if (row.type.toLowerCase().includes('refund')) refunds += Number(row.amount);
       }
-    });
+      const alreadySubmitted = Number(submittedRows[0].total);
+      const cashInHand       = advances + settlements - refunds - alreadySubmitted;
+
+      if (parsedAmount > cashInHand) {
+        await connection.rollback();
+        const err = new Error(`Cannot submit ₹${parsedAmount.toLocaleString('en-IN')}. Cash in hand is only ₹${cashInHand.toLocaleString('en-IN')}.`);
+        err.status = 400;
+        err.code = 'INSUFFICIENT_CASH_IN_HAND';
+        throw err;
+      }
+
+      const remainingCash = cashInHand - parsedAmount;
+      const receiptId     = await generateReceiptId(businessDate, connection);
+      const submittedAt   = new Date();
+
+      // Insert cash submission record
+      const [insertResult] = await connection.query(
+        `INSERT INTO cash_submissions
+           (receipt_id, business_date, submitted_at, receptionist_name, receiver_name, amount, remaining_cash, remarks)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [receiptId, businessDate, submittedAt, receptionistName, receiverName, parsedAmount, remainingCash, combinedRemarks]
+      );
+
+      // Structured audit log
+      const structuredDetails = JSON.stringify({
+        Receipt:      receiptId,
+        Amount:       `₹${parsedAmount}`,
+        Receptionist: receptionistName,
+        Shift:        shiftLabel,
+        Received_By:  receiverName,
+        Business_Date: businessDate
+      });
+      await connection.query(
+        `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'CASH_HANDOVER', ?, ?)`,
+        [req.user?.type === 'staff' ? null : (req.user?.id || null), structuredDetails, businessDate]
+      );
+
+      await connection.commit();
+
+      return {
+        success: true,
+        message: `₹${parsedAmount.toLocaleString('en-IN')} submitted successfully.`,
+        submission: {
+          id:               insertResult.insertId,
+          receipt_id:       receiptId,
+          business_date:    businessDate,
+          submitted_at:     submittedAt.toISOString(),
+          receptionist_name: receptionistName,
+          receiver_name:    receiverName,
+          shift:            shiftLabel,
+          amount:           parsedAmount,
+          remaining_cash:   remainingCash,
+          remarks:          combinedRemarks,
+          time:             formatTime(submittedAt),
+        }
+      };
+    } finally {
+      connection.release();
+    }
+  };
+
+  try {
+    const businessDate = await BusinessDateService.getBusinessDate(pool);
+    const result = await CashCutoverService.submitCash(
+      {
+        amount: parsedAmount,
+        receivedBy: receiverName,
+        shift: shiftLabel,
+        name: receptionistName,
+        notes,
+        businessDate,
+        idempotencyKey
+      },
+      mysqlHandler
+    );
+    return res.json(result);
   } catch (error) {
-    try { await connection.rollback(); } catch (e) {}
-    connection.release();
     console.error('submitCash error:', error);
-    return res.status(500).json({ error: 'Internal Server Error' });
+    return res.status(error.status || 500).json({ error: error.message || 'Internal Server Error' });
   }
 };
 
-// â”€â”€ GET /api/cash/submissions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── GET /api/cash/submissions ─────────────────────────────────────────────
 export const getCashSubmissions = async (req, res) => {
   try {
     const businessDate = await BusinessDateService.getBusinessDate(pool);
 
-    const [rows] = await pool.query(
-      `SELECT * FROM cash_submissions WHERE business_date = ? ORDER BY submitted_at ASC`,
-      [businessDate]
-    );
+    const mysqlHandler = async () => {
+      const [rows] = await pool.query(
+        `SELECT * FROM cash_submissions WHERE business_date = ? ORDER BY submitted_at ASC`,
+        [businessDate]
+      );
+      return { submissions: rows };
+    };
 
-    return res.json({ submissions: rows });
+    const result = await CashCutoverService.getCashSubmissions(businessDate, mysqlHandler);
+    return res.json(result);
   } catch (error) {
     console.error('getCashSubmissions error:', error);
-    return res.status(500).json({ error: 'Internal Server Error' });
+    return res.status(error.status || 500).json({ error: error.message || 'Internal Server Error' });
   }
 };
 

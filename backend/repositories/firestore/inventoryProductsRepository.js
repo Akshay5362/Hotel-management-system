@@ -27,7 +27,18 @@ function isStaleUpdate(existingDoc, incomingData) {
 export async function getInventoryProductByIdFirestore(productId, options = {}) {
   if (!productId) return null;
   const docId = String(productId).startsWith('prod_') ? String(productId) : formatProductDocId(productId);
-  return await getDoc(COLLECTION, docId, options);
+  const direct = await getDoc(COLLECTION, docId, options);
+  if (direct) return direct;
+
+  if (!isNaN(Number(productId))) {
+    const byMySqlId = await listDocs(COLLECTION, {
+      filters: [{ field: 'mysql_product_id', op: '==', value: Number(productId) }],
+      limit: 1,
+      transaction: options.transaction
+    });
+    if (byMySqlId[0]) return byMySqlId[0];
+  }
+  return null;
 }
 
 export async function getInventoryProductBySkuFirestore(sku, options = {}) {
@@ -134,14 +145,22 @@ export async function updateProductStockFirestore(productId, quantityDelta, opti
   if (transaction) {
     const existing = await getDoc(COLLECTION, docId, { transaction });
     if (!existing) throw new RepositoryError(`Inventory product '${productId}' not found`, 'NOT_FOUND', 404);
-    const newQty = (existing.stock_quantity || 0) + delta;
+    const newQty = (existing.stock_quantity !== undefined ? existing.stock_quantity : (existing.current_stock || 0)) + delta;
     if (newQty < 0) {
       throw new RepositoryError(`Insufficient stock quantity for product '${existing.name}'`, 'INSUFFICIENT_STOCK', 400);
     }
     return await updateDoc(COLLECTION, docId, { stock_quantity: newQty, current_stock: newQty, updated_at: new Date().toISOString() }, options);
   }
 
-  return await updateDoc(COLLECTION, docId, { stock_quantity: FieldValue.increment(delta), current_stock: FieldValue.increment(delta), updated_at: new Date().toISOString() }, options);
+  const existing = await getDoc(COLLECTION, docId, options);
+  if (!existing) throw new RepositoryError(`Inventory product '${productId}' not found`, 'NOT_FOUND', 404);
+  const currentQty = existing.stock_quantity !== undefined ? existing.stock_quantity : (existing.current_stock || 0);
+  const newQty = currentQty + delta;
+  if (newQty < 0) {
+    throw new RepositoryError(`Insufficient stock quantity for product '${existing.name}'`, 'INSUFFICIENT_STOCK', 400);
+  }
+
+  return await updateDoc(COLLECTION, docId, { stock_quantity: newQty, current_stock: newQty, updated_at: new Date().toISOString() }, options);
 }
 
 export async function deleteInventoryProductFirestore(productId, options = {}) {

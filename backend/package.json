@@ -6,13 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js",
-    "migrate": "node migrations/runner.js up",
-    "migrate:up": "node migrations/runner.js up",
-    "migrate:down": "node migrations/runner.js down",
-    "migrate:status": "node migrations/runner.js status",
-    "migrate:fresh": "node migrations/runner.js fresh",
-    "init-db-DANGER": "node init_db.js"
+    "dev": "nodemon server.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

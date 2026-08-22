@@ -79,6 +79,37 @@ export async function updateInvoiceFirestore(invId, invData, options = {}) {
   return await updateDoc(COLLECTION, docId, invData, options);
 }
 
+export async function getInvoiceByBookingFirestore(bookingId, options = {}) {
+  if (!bookingId) return null;
+  const rawId = String(bookingId).replace(/^bkg_/, '');
+  const parentId = String(bookingId).startsWith('bkg_') ? String(bookingId) : `bkg_${bookingId}`;
+
+  const byDocId = await listDocs(COLLECTION, {
+    filters: [{ field: 'booking_id', op: '==', value: parentId }],
+    limit: 1,
+    transaction: options.transaction
+  });
+  if (byDocId.length > 0) return byDocId[0];
+
+  const byRawId = await listDocs(COLLECTION, {
+    filters: [{ field: 'booking_id', op: '==', value: rawId }],
+    limit: 1,
+    transaction: options.transaction
+  });
+  if (byRawId.length > 0) return byRawId[0];
+
+  if (!isNaN(Number(rawId))) {
+    const byMysqlId = await listDocs(COLLECTION, {
+      filters: [{ field: 'mysql_booking_id', op: '==', value: Number(rawId) }],
+      limit: 1,
+      transaction: options.transaction
+    });
+    if (byMysqlId.length > 0) return byMysqlId[0];
+  }
+
+  return null;
+}
+
 export async function deleteInvoiceFirestore(invId, options = {}) {
   if (!invId) throw new RepositoryError('Invoice ID is required for deletion', 'VALIDATION_ERROR', 400);
   const docId = String(invId).startsWith('inv_') ? String(invId) : formatInvoiceId(invId);

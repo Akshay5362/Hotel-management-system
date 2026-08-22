@@ -1,11 +1,11 @@
 import express from 'express';
-import { checkIn, checkOut, clean, addLedgerItem, shift, bookRoom, modifyCheckIn, guestRequestCheckIn, guestAddService, guestReportMaintenance, guestExtendStay, getGuestBill, getGuestNotifications, markNotificationRead, guestRequestCheckout, guestSubmitFeedback, getGuestHistory, getGuestHistoryAdmin, uploadIdentity, getRefundPolicy, updateRefundPolicy, processRefundCheckout, getPublicRooms, adminExtendStay, adminLateCheckout, adminNoShow, updateRoomStatus } from '../controllers/roomController.js';
+import { checkIn, checkOut, clean, addLedgerItem, recordPayment, adjustRoomRent, shift, bookRoom, modifyCheckIn, guestRequestCheckIn, guestAddService, guestReportMaintenance, guestExtendStay, getGuestBill, getGuestNotifications, markNotificationRead, guestRequestCheckout, guestSubmitFeedback, getGuestHistory, getGuestHistoryAdmin, uploadIdentity, getRefundPolicy, updateRefundPolicy, processRefundCheckout, getPublicRooms, adminExtendStay, adminLateCheckout, adminNoShow, updateRoomStatus, getLedger } from '../controllers/roomController.js';
 import { getStatus, runDayEnd, undoDayEnd, getGuestRequests, resolveGuestRequest, resolveExtensionRequest, getGuestDocuments, verifyGuestDocument, deleteGuestDocument, searchGuests, listGuests, searchGuestsStaff } from '../controllers/auditController.js';
-import { getBusinessDateInfo, updateBusinessDate } from '../controllers/settingsController.js';
+import { getBusinessDateInfo, updateBusinessDate, getHotelConfig, updateHotelConfig } from '../controllers/settingsController.js';
 import { submitCash, getCashSubmissions } from '../controllers/cashController.js';
 import { staffLogin, getAllStaff, getStaffById, createStaff, updateStaff, updateStaffStatus, deleteStaff } from '../controllers/staffController.js';
 import { uploadIDDocument } from '../middleware/uploadMiddleware.js';
-import { signUp, signIn, authenticate, requireAdmin, requireSuperAdmin, requireGuest, requireRole } from '../controllers/authController.js';
+import { signUp, signIn, authenticate, requireAdmin, requireSuperAdmin, requireGuest, requireRole, getMe } from '../controllers/authController.js';
 import paymentRoutes from './paymentRoutes.js';
 import reportsRoutes from './reportsRoutes.js';
 import invoiceRoutes from './invoiceRoutes.js';
@@ -27,6 +27,12 @@ router.get('/public/rooms', getPublicRooms);
 router.post('/auth/signup', signUp);
 router.post('/auth/signin', signIn);
 
+// ── Identity Resolution — Secure role lookup for Firebase-authenticated staff ─
+// Does NOT use `authenticate` middleware: getMe performs its own full verification
+// so that the admin/staff role is sourced from the server-side Firebase token
+// + MySQL record, never from client-supplied body data.
+router.get('/auth/me', getMe);
+
 // ── Staff Auth (public — no token required) ───────────────────────────────────────
 router.post('/staff/auth/login', staffLogin);
 
@@ -42,6 +48,8 @@ router.post('/dayend/undo', authenticate, requireSuperAdmin, undoDayEnd);
 // This allows fine-grained control via the roles/permissions tables.
 router.get('/settings/business-date', authenticate, getBusinessDateInfo);
 router.post('/settings/business-date', authenticate, updateBusinessDate);
+router.get('/settings/hotel-config', getHotelConfig);
+router.post('/settings/hotel-config', authenticate, requireAdmin, updateHotelConfig);
 
 // Room routes (Admin & Receptionist)
 router.post('/rooms/:number/checkin', authenticate, requireRole('admin', 'receptionist'), checkIn);
@@ -49,6 +57,9 @@ router.put('/rooms/:number/checkin', authenticate, requireRole('admin', 'recepti
 router.post('/rooms/:number/checkout', authenticate, requireRole('admin', 'receptionist'), checkOut);
 router.post('/rooms/:number/clean', authenticate, requireRole('admin', 'receptionist', 'housekeeper'), clean);
 router.post('/rooms/:number/ledger', authenticate, requireRole('admin', 'receptionist'), addLedgerItem);
+router.post('/rooms/:number/adjust-rent', authenticate, requireRole('admin', 'receptionist'), adjustRoomRent);
+router.post('/rooms/:number/payments', authenticate, requireRole('admin', 'receptionist'), recordPayment);
+router.get('/rooms/:number/ledger', authenticate, requireRole('admin', 'receptionist'), getLedger);
 router.post('/rooms/shift', authenticate, requireRole('admin', 'receptionist'), shift);
 router.post('/rooms/:number/book', authenticate, bookRoom);
 router.post('/rooms/:number/refund-checkout', authenticate, requireRole('admin'), processRefundCheckout);

@@ -38,41 +38,48 @@ export async function getPaymentByIdFirestore(paymentId, options = {}) {
 
 export async function getPaymentsByBookingFirestore(bookingId, options = {}) {
   if (!bookingId) return [];
-  const parentId = String(bookingId).startsWith('bkg_') ? String(bookingId) : formatBookingId(bookingId);
-  const rawId = String(bookingId).replace(/^bkg_/, '');
+  const strId = String(bookingId).trim();
+  const rawId = strId.replace(/^(booking_|bkg_)/, '');
+  const bookingNumber = rawId.startsWith('BKG-') ? rawId : `BKG-${rawId}`;
 
-  // 1. Query root collection by booking_id or mysql_booking_id
-  const rootByDocId = await listDocs(COLLECTION, {
-    filters: [{ field: 'booking_id', op: '==', value: parentId }],
-    transaction: options.transaction
-  });
+  const queryIds = Array.from(new Set([
+    strId,
+    rawId,
+    `booking_${rawId}`,
+    `bkg_${rawId}`,
+    `booking_${bookingNumber}`,
+    `bkg_${bookingNumber}`,
+    bookingNumber,
+    formatBookingId(strId)
+  ])).slice(0, 10);
 
-  const rootByRawId = await listDocs(COLLECTION, {
-    filters: [{ field: 'booking_id', op: '==', value: rawId }],
-    transaction: options.transaction
-  });
-
-  const rootByMysqlId = !isNaN(Number(rawId))
-    ? await listDocs(COLLECTION, {
-        filters: [{ field: 'mysql_booking_id', op: '==', value: Number(rawId) }],
-        transaction: options.transaction
-      })
-    : [];
-
-  // 2. Query subcollection
-  const subDocs = await listDocs(PARENT_COLLECTION, {
-    parentDocId: parentId,
-    subcollectionName: COLLECTION,
-    transaction: options.transaction
-  });
-
-  // Deduplicate results by document ID
   const map = new Map();
-  [...rootByDocId, ...rootByRawId, ...rootByMysqlId, ...subDocs].forEach(item => {
-    if (item && item.id) map.set(item.id, item);
-  });
 
-  return Array.from(map.values()).sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+  const [byBookingId, byBookingNumber] = await Promise.all([
+    listDocs(COLLECTION, {
+      filters: [{ field: 'booking_id', op: 'in', value: queryIds }],
+      transaction: options.transaction
+    }),
+    listDocs(COLLECTION, {
+      filters: [{ field: 'booking_number', op: 'in', value: queryIds }],
+      transaction: options.transaction
+    })
+  ]);
+
+  byBookingId.forEach(item => { if (item && item.id) map.set(item.id, item); });
+  byBookingNumber.forEach(item => { if (item && item.id) map.set(item.id, item); });
+
+  const numIds = queryIds.map(Number).filter(n => !isNaN(n));
+  if (numIds.length > 0) {
+    const byMysql = await listDocs(COLLECTION, {
+      filters: [{ field: 'mysql_booking_id', op: 'in', value: numIds.slice(0, 10) }],
+      transaction: options.transaction
+    });
+    byMysql.forEach(item => { if (item && item.id) map.set(item.id, item); });
+  }
+
+  // Deduplicate and sort chronologically
+  return Array.from(map.values()).sort((a, b) => new Date(a.created_at || 0) - new Date(a.created_at || 0));
 }
 
 export async function getPaymentsByGuestFirestore(userId, options = {}) {
