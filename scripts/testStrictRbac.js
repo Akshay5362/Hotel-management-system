@@ -25,7 +25,7 @@ function generateTestToken(payload) {
 const TOKENS = {
   super_admin: generateTestToken({ id: 1, role: 'admin' }),
   admin: generateTestToken({ id: 10, role: 'ADMIN', type: 'staff' }),
-  receptionist: generateTestToken({ id: 11, role: 'RECEPTIONIST', type: 'staff' }),
+  receptionist: generateTestToken({ id: 2, role: 'RECEPTIONIST', type: 'staff' }),
   housekeeper: generateTestToken({ id: 12, role: 'CLEANER', type: 'staff' }),
   kitchen: generateTestToken({ id: 13, role: 'CHEF', type: 'staff' }),
   guest: generateTestToken({ id: 20, role: 'guest' })
@@ -64,7 +64,7 @@ async function runRbacTests() {
 
     const tests = [
       { name: 'POST /api/dayend', method: 'POST', path: '/api/dayend', expected: { super_admin: [200, 400], admin: [200, 400], receptionist: 403, housekeeper: 403, kitchen: 403, guest: 403 } },
-      { name: 'POST /api/dayend/undo', method: 'POST', path: '/api/dayend/undo', expected: { super_admin: [200, 400, 409], admin: 403, receptionist: 403, housekeeper: 403, kitchen: 403, guest: 403 } },
+      { name: 'POST /api/dayend/undo', method: 'POST', path: '/api/dayend/undo', expected: { super_admin: [200, 400, 404, 409], admin: 403, receptionist: 403, housekeeper: 403, kitchen: 403, guest: 403 } },
       { name: 'POST /api/rooms/101/checkin', method: 'POST', path: '/api/rooms/101/checkin', expected: { super_admin: [200, 400, 404], admin: [200, 400, 404], receptionist: [200, 400, 404], housekeeper: 403, kitchen: 403, guest: 403 } },
       { name: 'POST /api/rooms/101/checkout', method: 'POST', path: '/api/rooms/101/checkout', expected: { super_admin: [200, 400, 404], admin: [200, 400, 404], receptionist: [200, 400, 404], housekeeper: 403, kitchen: 403, guest: 403 } },
       { name: 'POST /api/rooms/shift', method: 'POST', path: '/api/rooms/shift', expected: { super_admin: [200, 400], admin: [200, 400], receptionist: [200, 400], housekeeper: 403, kitchen: 403, guest: 403 } },

@@ -85,3 +85,5 @@ backend/tests/*.txt
 backend/tests/output/
 *_backup.json
 
+
+.env.production

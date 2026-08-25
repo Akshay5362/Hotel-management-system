@@ -4,8 +4,11 @@ import path from 'path';
 import { RoomStatusService } from '../services/roomStatusService.js';
 import { BusinessDateService, BD_ERRORS } from '../services/businessDateService.js';
 import { FirestoreAvailabilityService } from '../services/firestoreAvailabilityService.js';
-import { isFirestoreRoomStatusShadowEnabled, isFirestoreRoomStatusServingEnabled, isFirebaseOnlyBusinessDateEnabled } from '../config/featureFlags.js';
+import { isFirestoreRoomStatusShadowEnabled, isFirestoreRoomStatusServingEnabled, isFirebaseOnlyBusinessDateEnabled, isMysqlCutoverFallbacksDisabled } from '../config/featureFlags.js';
 import { getSystemDateDetailsFirestore } from '../repositories/firestore/systemSettingsRepository.js';
+import { getAllCashLogsFirestore } from '../repositories/firestore/cashLogsRepository.js';
+import { getAllReservationsFirestore } from '../repositories/firestore/reservationsRepository.js';
+import { getAllBookingsFirestore } from '../repositories/firestore/bookingsRepository.js';
 import { FirestoreShadowComparisonService } from '../services/firestoreShadowComparisonService.js';
 import { FirestoreRoomStatusService } from '../services/firestoreRoomStatusService.js';
 import { SafeCutoverFallbackService } from '../services/safeCutoverFallbackService.js';
@@ -129,7 +132,7 @@ export const getStatus = async (req, res) => {
     let todayCheckouts = 0;
     let continuedRooms = 0;
 
-    if (isFirebaseOnlyBusinessDateEnabled()) {
+    if (isFirebaseOnlyBusinessDateEnabled() || isMysqlCutoverFallbacksDisabled()) {
       try {
         const details = await getSystemDateDetailsFirestore();
         if (details) {
@@ -222,7 +225,7 @@ export const getStatus = async (req, res) => {
       domain: 'room_status',
       servingEnabled: isFirestoreRoomStatusServingEnabled(),
       firestoreOp: () => FirestoreRoomStatusService.getRoomStatuses(systemDate),
-      mysqlOp: fetchMysqlProcessedRooms,
+      mysqlOp: isMysqlCutoverFallbacksDisabled() ? null : fetchMysqlProcessedRooms,
       validate: SafeCutoverFallbackService.validateRoomStatuses,
       shadowCompareFn: (fsRooms, mysqlRooms) => {
         if (isFirestoreRoomStatusShadowEnabled()) {
@@ -232,54 +235,90 @@ export const getStatus = async (req, res) => {
       context: { endpoint: 'GET /api/status', systemDate }
     });
 
-    const [cashLog] = await pool.query('SELECT * FROM cash_logs WHERE business_date = ?', [systemDate]);
+    let cashLog = [];
+    let upcomingReservations = [];
 
-    // Query upcoming future reservations for the side panel component
-    const [futureBookings] = await pool.query(`
-      SELECT 
-        b.id as booking_id,
-        b.booking_number,
-        b.room_id,
-        b.check_in_date as checkInDate,
-        b.expected_check_out_date as expectedCheckOutDate,
-        b.booking_status as status,
-        g.full_name as guestName,
-        r.number as roomNumber,
-        rt.title as roomType
-      FROM bookings b
-      LEFT JOIN guests g ON b.guest_id = g.id
-      LEFT JOIN rooms r ON b.room_id = r.id
-      LEFT JOIN room_types rt ON r.room_type_id = rt.id
-      WHERE b.booking_status = 'Reserved'
-        AND b.check_in_date >= ?
-      ORDER BY b.check_in_date ASC
-    `, [systemDate]);
+    if (isMysqlCutoverFallbacksDisabled()) {
+      try {
+        cashLog = await getAllCashLogsFirestore({ filters: [{ field: 'business_date', op: '==', value: systemDate }], orderBy: [] }) || [];
+      } catch (e) {
+        console.warn('[getStatus] Failed to read cash logs from Firestore:', e.message);
+      }
 
-    const [futureResTable] = await pool.query(`
-      SELECT 
-        res.id as reservation_id,
-        res.id as booking_id,
-        res.reservation_number as booking_number,
-        res.reservation_number,
-        res.room_id,
-        res.arrival_date as checkInDate,
-        res.departure_date as expectedCheckOutDate,
-        res.status as status,
-        res.guest_name as guestName,
-        res.phone as phone,
-        res.adults as adults,
-        res.advance_payment as totalAmount,
-        COALESCE(r.number, res.room_number, '') as roomNumber,
-        COALESCE(rt.title, res.room_type, '') as roomType
-      FROM reservations res
-      LEFT JOIN rooms r ON res.room_id = r.id
-      LEFT JOIN room_types rt ON r.room_type_id = rt.id
-      WHERE res.status IN ('Confirmed', 'Reserved')
-        AND res.arrival_date >= ?
-      ORDER BY res.arrival_date ASC
-    `, [systemDate]);
+      try {
+        const fsReservations = await getAllReservationsFirestore({ filters: [{ field: 'check_in_date', op: '>=', value: systemDate }] }) || [];
+        upcomingReservations = (fsReservations || [])
+          .filter(r => r.status === 'Confirmed' || r.status === 'Reserved')
+          .map(r => ({
+            reservation_id: r.id || r.reservation_number,
+            booking_id: r.booking_id || r.id,
+            booking_number: r.reservation_number || r.booking_number,
+            reservation_number: r.reservation_number,
+            room_id: r.room_id,
+            checkInDate: r.check_in_date || r.arrival_date,
+            expectedCheckOutDate: r.check_out_date || r.departure_date,
+            status: r.status,
+            guestName: r.guest_name,
+            phone: r.phone,
+            adults: r.adults || 1,
+            totalAmount: r.advance_payment || r.total_amount || 0,
+            roomNumber: r.room_number || '',
+            roomType: r.room_type || ''
+          }));
+      } catch (e) {
+        console.warn('[getStatus] Failed to read upcoming reservations from Firestore:', e.message);
+      }
+    } else {
+      const [dbCashLog] = await pool.query('SELECT * FROM cash_logs WHERE business_date = ?', [systemDate]);
+      cashLog = dbCashLog;
 
-    const upcomingReservations = [...futureBookings, ...futureResTable];
+      // Query upcoming future reservations for the side panel component
+      const [futureBookings] = await pool.query(`
+        SELECT 
+          b.id as booking_id,
+          b.booking_number,
+          b.room_id,
+          b.check_in_date as checkInDate,
+          b.expected_check_out_date as expectedCheckOutDate,
+          b.booking_status as status,
+          g.full_name as guestName,
+          r.number as roomNumber,
+          rt.title as roomType
+        FROM bookings b
+        LEFT JOIN guests g ON b.guest_id = g.id
+        LEFT JOIN rooms r ON b.room_id = r.id
+        LEFT JOIN room_types rt ON r.room_type_id = rt.id
+        WHERE b.booking_status = 'Reserved'
+          AND b.check_in_date >= ?
+        ORDER BY b.check_in_date ASC
+      `, [systemDate]);
+
+      const [futureResTable] = await pool.query(`
+        SELECT 
+          res.id as reservation_id,
+          res.id as booking_id,
+          res.reservation_number as booking_number,
+          res.reservation_number,
+          res.room_id,
+          res.arrival_date as checkInDate,
+          res.departure_date as expectedCheckOutDate,
+          res.status as status,
+          res.guest_name as guestName,
+          res.phone as phone,
+          res.adults as adults,
+          res.advance_payment as totalAmount,
+          COALESCE(r.number, res.room_number, '') as roomNumber,
+          COALESCE(rt.title, res.room_type, '') as roomType
+        FROM reservations res
+        LEFT JOIN rooms r ON res.room_id = r.id
+        LEFT JOIN room_types rt ON r.room_type_id = rt.id
+        WHERE res.status IN ('Confirmed', 'Reserved')
+          AND res.arrival_date >= ?
+        ORDER BY res.arrival_date ASC
+      `, [systemDate]);
+
+      upcomingReservations = [...futureBookings, ...futureResTable];
+    }
 
     const responsePayload = {
       systemDate,

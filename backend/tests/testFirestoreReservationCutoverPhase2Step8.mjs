@@ -555,25 +555,31 @@ async function main() {
     assert.strictEqual(calledMysql, false);
   });
 
-  await runTest('7.4 ReservationCutoverService safely falls back to MySQL on timeout', async () => {
+  await runTest('7.4 ReservationCutoverService fails closed with FIRESTORE_TIMEOUT on timeout (no MySQL fallback)', async () => {
     process.env.USE_FIRESTORE_RESERVATIONS = 'true';
     let calledMysql = false;
-    const res = await ReservationCutoverService.createReservation(
-      {
-        guestName: 'Timeout Test',
-        phone: '9876543226',
-        arrivalDate: '2027-05-01',
-        departureDate: '2027-05-05',
-        roomNumber: testRoom1,
-        timeoutMs: 0 // trigger timeout
-      },
-      async () => {
-        calledMysql = true;
-        return { success: true, fromMysql: true };
-      }
-    );
-    assert.strictEqual(calledMysql, true);
-    assert.strictEqual(res.source, 'MYSQL_FALLBACK');
+    let threw = false;
+    try {
+      await ReservationCutoverService.createReservation(
+        {
+          guestName: 'Timeout Test',
+          phone: '9876543226',
+          arrivalDate: '2027-05-01',
+          departureDate: '2027-05-05',
+          roomNumber: testRoom1,
+          timeoutMs: 0 // trigger timeout
+        },
+        async () => {
+          calledMysql = true;
+          return { success: true, fromMysql: true };
+        }
+      );
+    } catch (err) {
+      threw = true;
+      assert.strictEqual(err.code, 'FIRESTORE_TIMEOUT');
+    }
+    assert.strictEqual(threw, true);
+    assert.strictEqual(calledMysql, false);
   });
 
   await runTest('7.5 ReservationCutoverService reconciles previously committed transaction on timeout', async () => {
@@ -606,33 +612,45 @@ async function main() {
     assert.strictEqual(res.resReconciled, true);
   });
 
-  await runTest('7.6 ReservationCutoverService update & cancel fallback to MySQL on timeout', async () => {
+  await runTest('7.6 ReservationCutoverService update & cancel fail closed on timeout (no MySQL fallback)', async () => {
     process.env.USE_FIRESTORE_RESERVATIONS = 'true';
     let calledMysqlUpdate = false;
-    const resUp = await ReservationCutoverService.updateReservation(
-      'res_test_timeout',
-      { timeoutMs: 0 },
-      {},
-      async () => {
-        calledMysqlUpdate = true;
-        return { success: true, fromMysql: true };
-      }
-    );
-    assert.strictEqual(calledMysqlUpdate, true);
-    assert.strictEqual(resUp.source, 'MYSQL_FALLBACK');
+    let threwUpdate = false;
+    try {
+      await ReservationCutoverService.updateReservation(
+        'res_test_timeout',
+        { timeoutMs: 0 },
+        {},
+        async () => {
+          calledMysqlUpdate = true;
+          return { success: true, fromMysql: true };
+        }
+      );
+    } catch (err) {
+      threwUpdate = true;
+      assert.strictEqual(err.code, 'FIRESTORE_TIMEOUT');
+    }
+    assert.strictEqual(threwUpdate, true);
+    assert.strictEqual(calledMysqlUpdate, false);
 
     let calledMysqlCancel = false;
-    const resCan = await ReservationCutoverService.cancelReservation(
-      'res_test_timeout',
-      { timeoutMs: 0 },
-      {},
-      async () => {
-        calledMysqlCancel = true;
-        return { success: true, fromMysql: true };
-      }
-    );
-    assert.strictEqual(calledMysqlCancel, true);
-    assert.strictEqual(resCan.source, 'MYSQL_FALLBACK');
+    let threwCancel = false;
+    try {
+      await ReservationCutoverService.cancelReservation(
+        'res_test_timeout',
+        { timeoutMs: 0 },
+        {},
+        async () => {
+          calledMysqlCancel = true;
+          return { success: true, fromMysql: true };
+        }
+      );
+    } catch (err) {
+      threwCancel = true;
+      assert.strictEqual(err.code, 'FIRESTORE_TIMEOUT');
+    }
+    assert.strictEqual(threwCancel, true);
+    assert.strictEqual(calledMysqlCancel, false);
   });
 
   // ──────────────────────────────────────────────────────────────────────────

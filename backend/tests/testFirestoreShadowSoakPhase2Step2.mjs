@@ -228,6 +228,7 @@ async function runShadowSoakTestSuite() {
     });
     createdTestDocs.push({ collection: 'reservations', id: resDoc1 });
 
+    FirestoreRoomStatusService.invalidateCache();
     const room1StatusBooked = await FirestoreRoomStatusService.getRoomStatus(roomNum1, sysDate);
     recordScenario('room_status', '5. Booked/Reserved room surfaces as booked', room1StatusBooked && room1StatusBooked.status === 'booked' && room1StatusBooked.guestName === 'AMITAV GHOSH');
 
@@ -549,6 +550,7 @@ async function runShadowSoakTestSuite() {
     });
     createdTestDocs.push({ collection: 'bookings', id: flowABkg });
 
+    FirestoreRoomStatusService.invalidateCache();
     // Step A2: Check room status reflects Occupied
     const flowAStatus = await FirestoreRoomStatusService.getRoomStatus(flowARoomNum, sysDate);
     const flowAOccupied = flowAStatus && flowAStatus.status === 'occupied' && flowAStatus.guestName === 'RAJESH KHANNA';
@@ -563,6 +565,7 @@ async function runShadowSoakTestSuite() {
       housekeeping_status: 'Dirty'
     });
 
+    FirestoreRoomStatusService.invalidateCache();
     const flowAStatusAfterCO = await FirestoreRoomStatusService.getRoomStatus(flowARoomNum, sysDate);
     const flowACheckoutValid = flowAStatusAfterCO && flowAStatusAfterCO.status === 'dirty';
     recordScenario('lifecycle_flow', 'FLOW A: Vacant → Check-In → Folio → Checkout → Dirty Transition', flowAOccupied && flowACheckoutValid);

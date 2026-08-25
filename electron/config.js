@@ -31,9 +31,13 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
+import { app } from 'electron';
+
 // ─── Mode detection ───────────────────────────────────────────────────────────
-// Value is injected by npm scripts via cross-env. Never hardcoded at runtime.
-const ELECTRON_MODE = process.env.ELECTRON_MODE || 'local';
+// In packaged mode (app.isPackaged === true), ALWAYS force 'production'.
+// In development, read process.env.ELECTRON_MODE or default to 'local'.
+const isPackaged = typeof app !== 'undefined' ? app.isPackaged : (process.env.ELECTRON_IS_DEV !== '1' && !process.defaultApp);
+const ELECTRON_MODE = isPackaged ? 'production' : (process.env.ELECTRON_MODE || 'local');
 
 export const MODES = Object.freeze({
   LOCAL:      'local',
@@ -48,13 +52,14 @@ export const MODES = Object.freeze({
  * true  → Electron loads http://localhost:5173 (Vite dev server must be running)
  * false → Electron loads dist/index.html       (production build must exist)
  */
-export const USES_VITE = ELECTRON_MODE === MODES.LOCAL || ELECTRON_MODE === MODES.DOCKER_DEV;
+export const USES_VITE = !isPackaged && (ELECTRON_MODE === MODES.LOCAL || ELECTRON_MODE === MODES.DOCKER_DEV);
 
 /**
- * Electron never spawns a local Node child process in production.
- * The backend runs inside Docker (or as an external service) at http://localhost:5000.
+ * Electron automatically spawns the local Node backend child process in production mode,
+ * or when explicitly enabled via process.env.SPAWNS_BACKEND.
+ * In local/docker-dev modes, backend is managed externally.
  */
-export const SPAWNS_BACKEND = false;
+export const SPAWNS_BACKEND = isPackaged || ELECTRON_MODE === MODES.PRODUCTION || process.env.SPAWNS_BACKEND === 'true';
 
 // ─── URL constants ────────────────────────────────────────────────────────────
 

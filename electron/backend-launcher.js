@@ -1,68 +1,192 @@
 /**
  * electron/backend-launcher.js
  * ─────────────────────────────────────────────────────────────────────────────
- * Spawns and manages the Express backend server as a child process.
+ * Spawns and manages the embedded Express backend server as a child process.
  *
- * DIAGNOSTIC MODE: All backend stdout/stderr, exit events, and errors are
- * written synchronously to resources/logs/backend.log so the exact failure
- * point is visible even when the process exits immediately.
+ * PRODUCTION HARDENED:
+ * - Directs all logs to app.getPath('userData')/logs/backend.log (100% user-writable).
+ * - Safe port 5000 conflict detection (verifies HPMS process ownership before terminating).
+ * - Immediate fail-fast with exact error diagnostics if the backend exits prematurely.
+ * - Robust path resolution for packaged extraResources.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-import { spawn } from 'child_process';
-import path   from 'path';
+import { app } from 'electron';
+import { spawn, execSync } from 'child_process';
+import path from 'path';
 import { fileURLToPath } from 'url';
-import http   from 'http';
-import fs     from 'fs';
-import os     from 'os';
+import http from 'http';
+import fs from 'fs';
+import os from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
-// ─── Backend log ──────────────────────────────────────────────────────────────
-// Written with appendFileSync so every line is on disk before the next runs.
+// ─── Logging ──────────────────────────────────────────────────────────────────
+let BLOG = null;
+const recentLogs = [];
+const MAX_LOG_BUFFER = 50;
 
-let BLOG = null;  // backend log file path
-
-function initBackendLog(resourcesPath) {
-  const dirs = [
-    resourcesPath ? path.join(resourcesPath, 'logs') : null,
-    (() => { try { return path.join(
-      (typeof app !== 'undefined' ? app.getPath('userData') : null) ?? os.homedir(),
-      'webline-logs'
-    ); } catch { return path.join(os.homedir(), 'webline-logs'); } })(),
-    path.join(os.homedir(), 'Desktop'),
-    os.tmpdir(),
-  ].filter(Boolean);
-
-  for (const dir of dirs) {
+export function initBackendLog(resourcesPath) {
+  try {
+    const userDataDir = app && typeof app.getPath === 'function' 
+      ? path.join(app.getPath('userData'), 'logs') 
+      : path.join(os.homedir(), '.hpms-logs');
+    
+    fs.mkdirSync(userDataDir, { recursive: true });
+    const logPath = path.join(userDataDir, 'backend.log');
+    fs.writeFileSync(logPath, ''); // Create / truncate on startup
+    BLOG = logPath;
+  } catch (err) {
+    // Fallback to temp
     try {
-      fs.mkdirSync(dir, { recursive: true });
-      const f = path.join(dir, 'backend.log');
-      fs.writeFileSync(f, '');  // truncate/create
-      BLOG = f;
-      break;
-    } catch { /* try next */ }
+      const tempPath = path.join(os.tmpdir(), 'hpms-backend.log');
+      fs.writeFileSync(tempPath, '');
+      BLOG = tempPath;
+    } catch {}
   }
 }
 
-function blog(tag, msg) {
+export function blog(tag, msg) {
   const ts   = new Date().toISOString().replace('T', ' ').slice(0, 23);
-  const line = `[${ts}] [${tag}] ${msg}\n`;
-  try { process.stdout.write(line); } catch {}
-  if (BLOG) { try { fs.appendFileSync(BLOG, line); } catch {} }
+  const line = `[${ts}] [${tag}] ${msg}`;
+  recentLogs.push(line);
+  if (recentLogs.length > MAX_LOG_BUFFER) recentLogs.shift();
+
+  try { process.stdout.write(line + '\n'); } catch {}
+  if (BLOG) {
+    try { fs.appendFileSync(BLOG, line + '\n'); } catch {}
+  }
 }
 
-function blogSection(title) {
+export function blogSection(title) {
   const bar = '─'.repeat(60);
   blog('────', bar);
   blog('SECT', title);
   blog('────', bar);
 }
 
-// ─── State ────────────────────────────────────────────────────────────────────
+export function getLastBackendError() {
+  const errorLines = recentLogs.filter(l => l.includes('[STDERR]') || l.includes('[ERROR]') || l.includes('[EXIT]'));
+  if (errorLines.length > 0) {
+    return errorLines.slice(-10).join('\n');
+  }
+  return recentLogs.slice(-10).join('\n');
+}
 
+// ─── State ────────────────────────────────────────────────────────────────────
 let backendProcess = null;
+let prematureExitError = null;
+
+// ─── Safe Port 5000 Inspector & Cleanup ───────────────────────────────────────
+
+/**
+ * Checks whether port 5000 is in use.
+ * If in use:
+ * 1. Checks if it is already a healthy HPMS backend (/api/health -> hotel-pms-backend). If so, returns true (reuse).
+ * 2. On Windows, inspects the listening PID using netstat/wmic.
+ *    - If the PID belongs to an HPMS process (HPMS.exe or contains server.js), terminates it safely.
+ *    - If the PID belongs to another unrelated application, DOES NOT kill it and throws a descriptive error.
+ */
+async function inspectAndHandlePortConflict(port = 5000) {
+  blog('PORT', `Inspecting port ${port} status...`);
+  const isHealthy = await checkHealthOnce(port, 1500);
+  if (isHealthy) {
+    blog('PORT', `✓ Existing healthy HPMS backend detected on port ${port}. Reusing instance.`);
+    return { canReuse: true };
+  }
+
+  if (process.platform !== 'win32') {
+    return { canReuse: false };
+  }
+
+  try {
+    const netstatOut = execSync(`netstat -ano | findstr :${port}`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const lines = netstatOut.split('\n').map(l => l.trim()).filter(Boolean);
+    const listeningLines = lines.filter(l => l.toUpperCase().includes('LISTENING'));
+
+    if (listeningLines.length === 0) {
+      blog('PORT', `Port ${port} is free.`);
+      return { canReuse: false };
+    }
+
+    // Extract listening PIDs
+    const pids = [...new Set(listeningLines.map(l => {
+      const parts = l.split(/\s+/);
+      return parts[parts.length - 1];
+    }).filter(p => /^\d+$/.test(p)))];
+
+    blog('PORT', `Found listening PID(s) on port ${port}: ${pids.join(', ')}`);
+
+    for (const pid of pids) {
+      // Inspect process command line / executable
+      let processInfo = '';
+      try {
+        processInfo = execSync(`wmic process where "ProcessId=${pid}" get CommandLine,ExecutablePath /format:list`, {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore']
+        });
+      } catch {
+        try {
+          processInfo = execSync(`tasklist /fi "PID eq ${pid}" /fo list`, {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore']
+          });
+        } catch {}
+      }
+
+      const isHpmsProcess = (
+        processInfo.toLowerCase().includes('hpms') ||
+        processInfo.toLowerCase().includes('server.js') ||
+        processInfo.toLowerCase().includes('hotel-pms-backend')
+      );
+
+      if (isHpmsProcess) {
+        blog('PORT', `PID ${pid} is identified as a stale HPMS process. Terminating safely...`);
+        try {
+          execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' });
+          blog('PORT', `✓ Stale HPMS PID ${pid} terminated.`);
+        } catch (killErr) {
+          blog('PORT', `Warning: Failed to terminate stale HPMS PID ${pid}: ${killErr.message}`);
+        }
+      } else {
+        blog('PORT', `✗ PID ${pid} does NOT belong to HPMS. Process info:\n${processInfo}`);
+        throw new Error(`Port ${port} is already in use by another application (PID ${pid}). Please close conflicting software before starting HPMS.`);
+      }
+    }
+
+    // Short pause after cleanup
+    await new Promise(r => setTimeout(r, 500));
+  } catch (err) {
+    if (err.message && err.message.includes('already in use by another application')) {
+      throw err;
+    }
+    // Netstat returned 1 when nothing matched -> port is free
+  }
+
+  return { canReuse: false };
+}
+
+// ─── Health Check Probe ───────────────────────────────────────────────────────
+
+export function checkHealthOnce(port = 5000, timeout = 1500) {
+  return new Promise((resolve) => {
+    const req = http.get(`http://127.0.0.1:${port}/api/health`, (res) => {
+      let body = '';
+      res.on('data', c => body += c);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(body);
+          resolve(res.statusCode === 200 && parsed.status === 'ok');
+        } catch {
+          resolve(res.statusCode === 200);
+        }
+      });
+    });
+    req.on('error', () => resolve(false));
+    req.setTimeout(timeout, () => { req.destroy(); resolve(false); });
+  });
+}
 
 // ─── waitForBackend ───────────────────────────────────────────────────────────
 
@@ -73,29 +197,40 @@ export function waitForBackend(port = 5000, maxWaitMs = 30000, intervalMs = 500)
 
     const check = () => {
       if (resolved) return;
-      // Use 127.0.0.1 (IPv4 literal) instead of 'localhost'.
-      // On macOS, 'localhost' resolves to ::1 (IPv6) first, but Docker publishes
-      // the port on 0.0.0.0 (IPv4). Using the IPv4 literal guarantees the correct path.
+
+      // Fail fast if the child process has already crashed/exited
+      if (prematureExitError) {
+        resolved = true;
+        blog('HEALTH', `✗ Backend child process failed: ${prematureExitError}`);
+        reject(new Error(prematureExitError));
+        return;
+      }
+
       const req = http.get(`http://127.0.0.1:${port}/api/health`, (res) => {
         if (resolved) return;
-        if (res.statusCode === 200) {
-          resolved = true;
-          blog('HEALTH', `✓ Backend health check PASSED on port ${port} (HTTP ${res.statusCode})`);
-          resolve();
-        } else {
-          blog('HEALTH', `Health check returned HTTP ${res.statusCode} — retrying...`);
-          retry();
-        }
+        let body = '';
+        res.on('data', c => body += c);
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            resolved = true;
+            blog('HEALTH', `✓ Backend health check PASSED on port ${port} (HTTP ${res.statusCode})`);
+            resolve();
+          } else {
+            blog('HEALTH', `Health check returned HTTP ${res.statusCode} — retrying...`);
+            retry();
+          }
+        });
       });
+
       req.on('error', (e) => {
         if (resolved) return;
-        // Don't log every retry — only log first and every 5s
         if (elapsed === 0 || elapsed % 5000 === 0) {
           blog('HEALTH', `Waiting for backend... elapsed=${elapsed}ms  error=${e.code}`);
         }
         retry();
       });
-      req.setTimeout(400, () => { req.destroy(); });
+
+      req.setTimeout(800, () => { req.destroy(); });
     };
 
     const retry = () => {
@@ -103,8 +238,8 @@ export function waitForBackend(port = 5000, maxWaitMs = 30000, intervalMs = 500)
       elapsed += intervalMs;
       if (elapsed >= maxWaitMs) {
         blog('HEALTH', `✗ Backend did NOT become healthy within ${maxWaitMs / 1000}s`);
-        blog('HEALTH', `  Last known backend process state: ${backendProcess ? `pid=${backendProcess.pid} killed=${backendProcess.killed}` : 'null (process exited)'}`);
-        reject(new Error(`Backend did not start within ${maxWaitMs / 1000}s`));
+        const diag = getLastBackendError();
+        reject(new Error(`Backend did not start within ${maxWaitMs / 1000}s.\n\nRecent backend logs:\n${diag}`));
         return;
       }
       setTimeout(check, intervalMs);
@@ -114,204 +249,197 @@ export function waitForBackend(port = 5000, maxWaitMs = 30000, intervalMs = 500)
   });
 }
 
-// ─── resolveNodeBin ───────────────────────────────────────────────────────────
+// ─── Node Binary Resolver ─────────────────────────────────────────────────────
 
-function resolveNodeBin() {
+function resolveNodeBin(isPackaged = false) {
   const envNode = process.env.NODE_EXE_PATH;
-  if (envNode) { blog('NODE', `Using NODE_EXE_PATH override: ${envNode}`); return envNode; }
+  if (envNode && fs.existsSync(envNode)) {
+    blog('NODE', `Using NODE_EXE_PATH override: ${envNode}`);
+    return { bin: envNode, useRunAsNode: false };
+  }
 
+  // In packaged mode (or when running standalone), use Electron's embedded binary with ELECTRON_RUN_AS_NODE=1
+  if (isPackaged && process.execPath && fs.existsSync(process.execPath)) {
+    blog('NODE', `Packaged mode: using embedded Electron binary (${process.execPath}) with ELECTRON_RUN_AS_NODE=1`);
+    return { bin: process.execPath, useRunAsNode: true };
+  }
+
+  // Development PATH resolution
   const pathDirs = (process.env.PATH || '').split(path.delimiter);
   const isWin    = process.platform === 'win32';
   const ext      = isWin ? 'node.exe' : 'node';
   const found    = pathDirs.map(d => path.join(d, ext)).find(p => { try { return fs.existsSync(p); } catch { return false; } });
-  if (found) { blog('NODE', `Resolved node from PATH: ${found}`); return found; }
-
-  if (isWin) {
-    const winLocations = [
-      path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'node.exe'),
-      path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'nodejs', 'node.exe'),
-      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'nodejs', 'node.exe'),
-      'C:\\Program Files\\nodejs\\node.exe',
-      'C:\\Program Files (x86)\\nodejs\\node.exe',
-    ];
-    for (const loc of winLocations) {
-      try { if (fs.existsSync(loc)) { blog('NODE', `Found node at known location: ${loc}`); return loc; } } catch {}
-    }
+  if (found) {
+    blog('NODE', `Resolved node from PATH: ${found}`);
+    return { bin: found, useRunAsNode: false };
   }
 
-  blog('NODE', 'WARNING: Could not locate node executable; falling back to bare "node"');
-  return isWin ? 'node.exe' : 'node';
-}
+  // Fallback to Electron execPath with ELECTRON_RUN_AS_NODE
+  if (process.execPath && fs.existsSync(process.execPath)) {
+    blog('NODE', `Fallback: using Electron binary (${process.execPath}) with ELECTRON_RUN_AS_NODE=1`);
+    return { bin: process.execPath, useRunAsNode: true };
+  }
 
-// ─── checkHealthOnce ────────────────────────────────────────────────────────────
-
-function checkHealthOnce(port = 5000, timeout = 1000) {
-  return new Promise((resolve) => {
-    // Use 127.0.0.1 (IPv4 literal) — see waitForBackend comment above.
-    const req = http.get(`http://127.0.0.1:${port}/api/health`, (res) => {
-      resolve(res.statusCode === 200);
-    });
-    req.on('error', () => resolve(false));
-    req.setTimeout(timeout, () => { req.destroy(); resolve(false); });
-  });
+  return { bin: isWin ? 'node.exe' : 'node', useRunAsNode: false };
 }
 
 // ─── launchBackend ────────────────────────────────────────────────────────────
 
 export async function launchBackend(appRoot) {
-  // Determine resources path for log init
+  const isPackaged = app && typeof app.isPackaged === 'boolean' ? app.isPackaged : (process.env.ELECTRON_IS_DEV !== '1' && !process.defaultApp);
   const resourcesPath = process.resourcesPath || appRoot;
-  initBackendLog(resourcesPath);
 
-  blogSection('BACKEND LAUNCHER STARTED');
+  initBackendLog(resourcesPath);
+  prematureExitError = null;
+
+  blogSection('HPMS EMBEDDED BACKEND LAUNCHER');
   blog('INIT', `appRoot          : ${appRoot}`);
   blog('INIT', `resourcesPath    : ${process.resourcesPath || '(not available)'}`);
-  blog('INIT', `isPackaged       : ${typeof app !== 'undefined' ? 'check main process' : process.env.ELECTRON_IS_DEV !== '1'}`);
+  blog('INIT', `isPackaged       : ${isPackaged}`);
   blog('INIT', `backend.log path : ${BLOG}`);
   blog('INIT', `Platform         : ${process.platform}`);
   blog('INIT', `Electron exe     : ${process.execPath}`);
 
-  if (backendProcess) {
-    blog('INIT', 'Backend already running — skipping relaunch');
+  if (backendProcess && backendProcess.pid && !backendProcess.killed) {
+    blog('INIT', `Backend process PID ${backendProcess.pid} is already active.`);
     return;
   }
 
-  // ── Check if another backend is already running ───────────────────────────
-  const isHealthy = await checkHealthOnce(5000, 1000);
-  if (isHealthy) {
-    blog('INIT', 'Existing backend detected on port 5000.');
+  // 1. Check Port 5000 & Handle Conflicts
+  const conflictResult = await inspectAndHandlePortConflict(5000);
+  if (conflictResult.canReuse) {
     return;
   }
 
-  // ── Locate server.js ────────────────────────────────────────────────────────
-  const backendDir  = path.join(appRoot, 'backend');
-  const backendPath = path.join(backendDir, 'server.js');
+  // 2. Locate backend/server.js
+  let backendDir = path.join(appRoot, 'backend');
+  let backendPath = path.join(backendDir, 'server.js');
+
+  if (!fs.existsSync(backendPath) && process.resourcesPath) {
+    const resBackendDir = path.join(process.resourcesPath, 'backend');
+    const resBackendPath = path.join(resBackendDir, 'server.js');
+    if (fs.existsSync(resBackendPath)) {
+      backendDir = resBackendDir;
+      backendPath = resBackendPath;
+    } else {
+      const unpackedDir = path.join(process.resourcesPath, 'app.asar.unpacked', 'backend');
+      const unpackedPath = path.join(unpackedDir, 'server.js');
+      if (fs.existsSync(unpackedPath)) {
+        backendDir = unpackedDir;
+        backendPath = unpackedPath;
+      }
+    }
+  }
 
   blog('FILES', `backendDir       : ${backendDir}`);
   blog('FILES', `server.js        : ${backendPath}`);
   blog('FILES', `server.js exists : ${fs.existsSync(backendPath)}`);
-  blog('FILES', `package.json     : ${path.join(backendDir, 'package.json')} exists=${fs.existsSync(path.join(backendDir, 'package.json'))}`);
-  blog('FILES', `.env             : ${path.join(backendDir, '.env')} exists=${fs.existsSync(path.join(backendDir, '.env'))}`);
-  blog('FILES', `node_modules     : ${path.join(backendDir, 'node_modules')} exists=${fs.existsSync(path.join(backendDir, 'node_modules'))}`);
-
-  // Log .env contents (redact passwords)
-  try {
-    const envPath = path.join(backendDir, '.env');
-    if (fs.existsSync(envPath)) {
-      const envLines = fs.readFileSync(envPath, 'utf8').split('\n')
-        .map(l => l.replace(/(PASSWORD|PASS|SECRET|KEY)\s*=.*/i, '$1=[REDACTED]'))
-        .join('\n');
-      blog('ENV', `.env contents:\n${envLines}`);
-    }
-  } catch (e) { blog('ENV', `Could not read .env: ${e.message}`); }
-
-  // Log backend package.json type field
-  try {
-    const pkgPath = path.join(backendDir, 'package.json');
-    if (fs.existsSync(pkgPath)) {
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-      blog('PKG', `backend package.json: name=${pkg.name} type=${pkg.type} main=${pkg.main}`);
-    }
-  } catch (e) { blog('PKG', `Could not read backend package.json: ${e.message}`); }
+  blog('FILES', `package.json     : ${fs.existsSync(path.join(backendDir, 'package.json'))}`);
+  blog('FILES', `.env exists      : ${fs.existsSync(path.join(backendDir, '.env'))}`);
+  blog('FILES', `node_modules     : ${fs.existsSync(path.join(backendDir, 'node_modules'))}`);
+  blog('FILES', `OCR traineddata  : ${fs.existsSync(path.join(backendDir, 'eng.traineddata'))}`);
 
   if (!fs.existsSync(backendPath)) {
-    blog('ERROR', `✗ server.js NOT FOUND at: ${backendPath}`);
-    blog('ERROR', 'extraResources may not have been copied. Cannot launch backend.');
-    return;
+    const errText = `Fatal: server.js not found at ${backendPath}`;
+    blog('ERROR', errText);
+    prematureExitError = errText;
+    throw new Error(errText);
   }
 
-  // ── Resolve node ─────────────────────────────────────────────────────────────
-  const nodeExe = resolveNodeBin();
+  // 3. Resolve Node Runtime Binary
+  const nodeConfig = resolveNodeBin(isPackaged);
+  const nodeExe = nodeConfig.bin;
 
-  // Verify node executable works
-  blog('NODE', `node exe         : ${nodeExe}`);
-  blog('NODE', `node exe exists  : ${fs.existsSync(nodeExe)}`);
+  blog('NODE', `node executable  : ${nodeExe}`);
+  blog('NODE', `useRunAsNode     : ${nodeConfig.useRunAsNode}`);
 
-  // ── Spawn environment ────────────────────────────────────────────────────────
+  // 4. Build Clean Production Environment
   const env = {
     ...process.env,
     NODE_ENV: 'production',
-    PORT:     '5000',
+    PORT: '5000',
   };
 
-  blog('SPAWN', `Command: "${nodeExe}" "${backendPath}"`);
-  blog('SPAWN', `CWD    : ${backendDir}`);
-  blog('SPAWN', `PORT   : ${env.PORT}`);
-  blog('SPAWN', 'Spawning backend process...');
+  if (nodeConfig.useRunAsNode) {
+    env.ELECTRON_RUN_AS_NODE = '1';
+  }
+
+  blog('SPAWN', `Executing: "${nodeExe}" "${backendPath}"`);
+  blog('SPAWN', `CWD: ${backendDir}`);
+  blog('SPAWN', `PORT: ${env.PORT}`);
 
   try {
     backendProcess = spawn(nodeExe, [backendPath], {
-      cwd:         backendDir,
+      cwd: backendDir,
       env,
-      stdio:       ['ignore', 'pipe', 'pipe'],
-      detached:    false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: false,
       windowsHide: true,
     });
   } catch (spawnErr) {
-    blog('ERROR', `✗ spawn() threw synchronously: ${spawnErr.message}`);
-    blog('ERROR', spawnErr.stack || String(spawnErr));
+    const msg = `Failed to spawn backend process: ${spawnErr.message}`;
+    blog('ERROR', msg);
+    prematureExitError = msg;
     backendProcess = null;
-    return;
+    throw spawnErr;
   }
 
   if (!backendProcess || !backendProcess.pid) {
-    blog('ERROR', '✗ spawn() returned no PID — process failed to start');
+    const msg = 'spawn() did not return a valid PID.';
+    blog('ERROR', msg);
+    prematureExitError = msg;
     backendProcess = null;
-    return;
+    throw new Error(msg);
   }
 
-  blog('SPAWN', `✓ Backend process spawned. PID: ${backendProcess.pid}`);
+  blog('SPAWN', `✓ Backend process spawned successfully (PID: ${backendProcess.pid})`);
 
-  // ── Pipe all stdout to log ───────────────────────────────────────────────────
+  // Pipe stdout and stderr
   backendProcess.stdout.on('data', (data) => {
     const text = data.toString().trim();
     if (text) {
-      text.split('\n').forEach(line => blog('STDOUT', line));
+      text.split('\n').forEach(l => blog('STDOUT', l));
     }
   });
 
-  // ── Pipe all stderr to log ───────────────────────────────────────────────────
   backendProcess.stderr.on('data', (data) => {
     const text = data.toString().trim();
     if (text) {
-      text.split('\n').forEach(line => blog('STDERR', line));
+      text.split('\n').forEach(l => blog('STDERR', l));
     }
   });
 
-  // ── Exit event ───────────────────────────────────────────────────────────────
   backendProcess.on('exit', async (code, signal) => {
-    blog('EXIT', `Backend process exited — code: ${code}  signal: ${signal}`);
-    
-    const healthyNow = await checkHealthOnce(5000, 1000);
-    if (healthyNow) {
-      blog('EXIT', 'Backend exited, but port 5000 is healthy. Assuming another backend is running. Continuing normally.');
-      backendProcess = null;
-      return;
-    }
-
+    blog('EXIT', `Backend process exited (code: ${code}, signal: ${signal})`);
     if (code !== 0 && code !== null) {
-      blog('EXIT', `✗ Backend exited with non-zero code ${code} — this is why health check fails`);
+      prematureExitError = `Backend exited prematurely with code ${code}.\n\nDiagnostics:\n${getLastBackendError()}`;
     }
     backendProcess = null;
   });
 
-  // ── Error event (spawn failure) ───────────────────────────────────────────────
   backendProcess.on('error', (err) => {
-    blog('ERROR', `✗ Backend spawn error: ${err.message}`);
-    blog('ERROR', `  code: ${err.code}  path: ${err.path}`);
-    blog('ERROR', err.stack || String(err));
+    blog('ERROR', `Backend process error: ${err.message}`);
+    prematureExitError = `Backend process error: ${err.message}`;
     backendProcess = null;
   });
-
-  blogSection('Backend process started — waiting for health check');
 }
 
 // ─── killBackend ──────────────────────────────────────────────────────────────
 
 export function killBackend() {
   if (backendProcess && !backendProcess.killed) {
-    blog('KILL', 'Killing backend process...');
-    backendProcess.kill('SIGTERM');
+    const pid = backendProcess.pid;
+    blog('KILL', `Terminating backend process PID: ${pid}...`);
+    try {
+      if (process.platform === 'win32' && pid) {
+        execSync(`taskkill /pid ${pid} /T /F`, { stdio: 'ignore' });
+      } else {
+        backendProcess.kill('SIGTERM');
+      }
+      blog('KILL', `✓ Backend process PID ${pid} terminated.`);
+    } catch (err) {
+      blog('KILL', `Note on terminate PID ${pid}: ${err.message}`);
+    }
     backendProcess = null;
   }
 }

@@ -399,6 +399,7 @@ export class FirestoreRoomStatusService {
         status: computedStatus,
         is_active: isActive,
         housekeeping_status: isHkDirty ? 'Dirty' : 'Clean',
+        cleaning_status: isHkDirty ? 'Dirty' : 'Clean',
         rate: Number(r.price || r.base_rate || r.rate || 0),
         guestName,
         phone,
@@ -457,6 +458,13 @@ export class FirestoreRoomStatusService {
     const statuses = await this.getRoomStatuses(businessDate, options);
     const targetStr = String(roomId).replace(/^room_/, '');
     return statuses.find(r => String(r.id) === String(roomId) || String(r.number) === targetStr || r.doc_id === `room_${targetStr}`);
+  }
+
+  /**
+   * Invalidates room status cache.
+   */
+  static invalidateCache() {
+    invalidateRoomStatusCache();
   }
 }
 

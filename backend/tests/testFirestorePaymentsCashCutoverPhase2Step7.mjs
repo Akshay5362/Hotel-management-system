@@ -406,18 +406,23 @@ async function main() {
   // ──────────────────────────────────────────────────────────────────────────
   console.log('\n--- GROUP 7: Payment Cutover Service ---');
 
-  await runTest('7.1 PaymentCutoverService serves from MySQL when flag is false', async () => {
+  await runTest('7.1 PaymentCutoverService serves from Firestore and does not call mysqlHandler in Firestore-only mode', async () => {
     process.env.USE_FIRESTORE_PAYMENTS = 'false';
     let calledMysql = false;
     const res = await PaymentCutoverService.finalizePayment(
-      { bookingId: testBkgDocId },
+      {
+        bookingId: testBkgDocId,
+        paymentMethod: 'Cash',
+        user: { id: `user_${ts}` }
+      },
       async () => {
         calledMysql = true;
         return { success: true, fromMysql: true };
       }
     );
-    assert.strictEqual(calledMysql, true);
-    assert.strictEqual(res.fromMysql, true);
+    assert.strictEqual(calledMysql, false);
+    assert.strictEqual(res.source, 'FIRESTORE');
+    process.env.USE_FIRESTORE_PAYMENTS = 'true';
   });
 
   await runTest('7.2 PaymentCutoverService serves from Firestore when flag is true', async () => {
@@ -480,23 +485,28 @@ async function main() {
     assert.strictEqual(calledMysql, false);
   });
 
-  await runTest('7.4 PaymentCutoverService safely falls back to MySQL on Firestore timeout', async () => {
+  await runTest('7.4 PaymentCutoverService safely fails closed on Firestore timeout without MySQL fallback', async () => {
     process.env.USE_FIRESTORE_PAYMENTS = 'true';
     let calledMysql = false;
-    const res = await PaymentCutoverService.finalizePayment(
-      {
-        bookingId: testBkgDocId,
-        paymentMethod: 'Cash',
-        timeoutMs: 0 // trigger timeout
-      },
-      async () => {
-        calledMysql = true;
-        return { success: true, fromMysql: true };
-      }
-    );
-    assert.strictEqual(calledMysql, true);
-    assert.strictEqual(res.source, 'MYSQL_FALLBACK');
-    assert.ok(res.fallbackReason.includes('FIRESTORE_TIMEOUT'));
+    let threw = false;
+    try {
+      await PaymentCutoverService.finalizePayment(
+        {
+          bookingId: testBkgDocId,
+          paymentMethod: 'Cash',
+          timeoutMs: 0 // trigger timeout
+        },
+        async () => {
+          calledMysql = true;
+          return { success: true, fromMysql: true };
+        }
+      );
+    } catch (err) {
+      threw = true;
+      assert.ok(err.message.includes('FIRESTORE_TIMEOUT'));
+    }
+    assert.strictEqual(threw, true);
+    assert.strictEqual(calledMysql, false);
   });
 
   await runTest('7.5 PaymentCutoverService reconciles previously committed transaction on timeout', async () => {
@@ -531,18 +541,19 @@ async function main() {
   // ──────────────────────────────────────────────────────────────────────────
   console.log('\n--- GROUP 8: Cash Cutover Service ---');
 
-  await runTest('8.1 CashCutoverService serves from MySQL when flag is false', async () => {
+  await runTest('8.1 CashCutoverService serves from Firestore and does not call mysqlHandler in Firestore-only mode', async () => {
     process.env.USE_FIRESTORE_CASH = 'false';
     let calledMysql = false;
     const res = await CashCutoverService.submitCash(
-      { amount: 100 },
+      { amount: 100, businessDate },
       async () => {
         calledMysql = true;
         return { success: true, fromMysql: true };
       }
     );
-    assert.strictEqual(calledMysql, true);
-    assert.strictEqual(res.fromMysql, true);
+    assert.strictEqual(calledMysql, false);
+    assert.strictEqual(res.source, 'FIRESTORE');
+    process.env.USE_FIRESTORE_CASH = 'true';
   });
 
   await runTest('8.2 CashCutoverService serves from Firestore when flag is true', async () => {
@@ -582,22 +593,28 @@ async function main() {
     assert.strictEqual(calledMysql, false);
   });
 
-  await runTest('8.4 CashCutoverService safely falls back to MySQL on timeout', async () => {
+  await runTest('8.4 CashCutoverService safely fails closed on timeout without MySQL fallback', async () => {
     process.env.USE_FIRESTORE_CASH = 'true';
     let calledMysql = false;
-    const res = await CashCutoverService.submitCash(
-      {
-        amount: 100,
-        businessDate,
-        timeoutMs: 0
-      },
-      async () => {
-        calledMysql = true;
-        return { success: true, fromMysql: true };
-      }
-    );
-    assert.strictEqual(calledMysql, true);
-    assert.strictEqual(res.source, 'MYSQL_FALLBACK');
+    let threw = false;
+    try {
+      await CashCutoverService.submitCash(
+        {
+          amount: 100,
+          businessDate,
+          timeoutMs: 0
+        },
+        async () => {
+          calledMysql = true;
+          return { success: true, fromMysql: true };
+        }
+      );
+    } catch (err) {
+      threw = true;
+      assert.ok(err.message.includes('FIRESTORE_TIMEOUT'));
+    }
+    assert.strictEqual(threw, true);
+    assert.strictEqual(calledMysql, false);
   });
 
   await runTest('8.5 CashCutoverService reconciles previously committed transaction on timeout', async () => {
@@ -733,18 +750,24 @@ async function main() {
     assert.strictEqual(res.amount, 2000);
   });
 
-  await runTest('9.6 PaymentCutoverService.confirmCashPayment safely falls back to MySQL on timeout', async () => {
+  await runTest('9.6 PaymentCutoverService.confirmCashPayment safely fails closed on timeout without MySQL fallback', async () => {
     process.env.USE_FIRESTORE_PAYMENTS = 'true';
     let calledMysql = false;
-    const res = await PaymentCutoverService.confirmCashPayment(
-      { bookingId: testBkgDocId, adminId: 'admin_1', timeoutMs: 0 },
-      async () => {
-        calledMysql = true;
-        return { success: true, fromMysql: true };
-      }
-    );
-    assert.strictEqual(calledMysql, true);
-    assert.strictEqual(res.source, 'MYSQL_FALLBACK');
+    let threw = false;
+    try {
+      await PaymentCutoverService.confirmCashPayment(
+        { bookingId: testBkgDocId, adminId: 'admin_1', timeoutMs: 0 },
+        async () => {
+          calledMysql = true;
+          return { success: true, fromMysql: true };
+        }
+      );
+    } catch (err) {
+      threw = true;
+      assert.ok(err.message.includes('FIRESTORE_TIMEOUT'));
+    }
+    assert.strictEqual(threw, true);
+    assert.strictEqual(calledMysql, false);
   });
 
   await runTest('9.7 PaymentCutoverService.confirmCashPayment reconciles previously committed transaction', async () => {

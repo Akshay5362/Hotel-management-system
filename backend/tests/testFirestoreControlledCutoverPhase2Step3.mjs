@@ -151,18 +151,21 @@ async function runControlledCutoverTestSuite() {
 
     // Dirty room test
     await db.collection('rooms').doc(roomDoc1).update({ status: 'dirty', housekeeping_status: 'Dirty' });
+    FirestoreRoomStatusService.invalidateCache();
     const dirtyRooms = await FirestoreRoomStatusService.getRoomStatuses('2026-08-19');
     const r1Dirty = dirtyRooms.find(r => r.number === roomNum1);
     assert(r1Dirty && r1Dirty.status === 'dirty', 'TEST 4: Firestore dirty room status served');
 
     // Inactive room test
     await db.collection('rooms').doc(roomDoc1).update({ is_active: false, status: 'vacant', housekeeping_status: 'Clean' });
+    FirestoreRoomStatusService.invalidateCache();
     const inactiveRooms = await FirestoreRoomStatusService.getRoomStatuses('2026-08-19');
     const r1Inactive = inactiveRooms.find(r => r.number === roomNum1);
     assert(r1Inactive && r1Inactive.status === 'inactive', 'TEST 5: Firestore inactive room status served');
 
     // Reset Room 1 to active vacant
     await db.collection('rooms').doc(roomDoc1).update({ is_active: true, status: 'vacant', housekeeping_status: 'Clean' });
+    FirestoreRoomStatusService.invalidateCache();
     const resetRooms = await FirestoreRoomStatusService.getRoomStatuses('2026-08-19');
     const r1Reset = resetRooms.find(r => r.number === roomNum1);
     assert(r1Reset && r1Reset.status === 'vacant', 'TEST 6: Firestore vacant room served');
@@ -289,67 +292,103 @@ async function runControlledCutoverTestSuite() {
     // ─────────────────────────────────────────────────────────────────────────
     console.log('\n--- Section 3: Emergency MySQL Fallback & Fault Injection (Scenarios 21-26) ---');
 
-    // 21. Room Status Firestore Network Failure Fallback
-    const fallbackRes21 = await SafeCutoverFallbackService.executeWithFallback({
-      domain: 'room_status',
-      servingEnabled: true,
-      firestoreOp: async () => { throw new Error('ECONNREFUSED: Firebase cluster unreachable'); },
-      mysqlOp: async () => [{ number: '101', status: 'vacant', source: 'MYSQL_FALLBACK' }],
-      validate: SafeCutoverFallbackService.validateRoomStatuses
-    });
-    assert(fallbackRes21[0].source === 'MYSQL_FALLBACK', 'TEST 21: Room status network failure safely falls back to MySQL');
+    // 21. Room Status Firestore Network Failure Fail-Closed
+    let threw21 = false;
+    let calledMysql21 = false;
+    try {
+      await SafeCutoverFallbackService.executeWithFallback({
+        domain: 'room_status',
+        servingEnabled: true,
+        firestoreOp: async () => { throw new Error('ECONNREFUSED: Firebase cluster unreachable'); },
+        mysqlOp: async () => { calledMysql21 = true; return [{ number: '101', status: 'vacant', source: 'MYSQL_FALLBACK' }]; },
+        validate: SafeCutoverFallbackService.validateRoomStatuses
+      });
+    } catch (err) {
+      if (err.message.includes('ECONNREFUSED')) threw21 = true;
+    }
+    assert(threw21 && !calledMysql21, 'TEST 21: Room status network failure safely fails closed without MySQL fallback');
 
-    // 22. Room Status Timeout Fallback
-    const fallbackRes22 = await SafeCutoverFallbackService.executeWithFallback({
-      domain: 'room_status',
-      servingEnabled: true,
-      firestoreOp: () => new Promise(resolve => setTimeout(() => resolve([{ number: '101' }]), 500)),
-      mysqlOp: async () => [{ number: '101', status: 'vacant', source: 'MYSQL_TIMEOUT_FALLBACK' }],
-      validate: SafeCutoverFallbackService.validateRoomStatuses,
-      timeoutMs: 50
-    });
-    assert(fallbackRes22[0].source === 'MYSQL_TIMEOUT_FALLBACK', 'TEST 22: Room status timeout safely falls back to MySQL');
+    // 22. Room Status Timeout Fail-Closed
+    let threw22 = false;
+    let calledMysql22 = false;
+    try {
+      await SafeCutoverFallbackService.executeWithFallback({
+        domain: 'room_status',
+        servingEnabled: true,
+        firestoreOp: () => new Promise(resolve => setTimeout(() => resolve([{ number: '101' }]), 500)),
+        mysqlOp: async () => { calledMysql22 = true; return [{ number: '101', status: 'vacant', source: 'MYSQL_TIMEOUT_FALLBACK' }]; },
+        validate: SafeCutoverFallbackService.validateRoomStatuses,
+        timeoutMs: 50
+      });
+    } catch (err) {
+      if (err.message.includes('FIRESTORE_TIMEOUT')) threw22 = true;
+    }
+    assert(threw22 && !calledMysql22, 'TEST 22: Room status timeout safely fails closed without MySQL fallback');
 
-    // 23. Room Status Malformed / Validation Failure Fallback
-    const fallbackRes23 = await SafeCutoverFallbackService.executeWithFallback({
-      domain: 'room_status',
-      servingEnabled: true,
-      firestoreOp: async () => [{ corrupt: true }], // Missing number/status
-      mysqlOp: async () => [{ number: '101', status: 'vacant', source: 'MYSQL_SCHEMA_FALLBACK' }],
-      validate: SafeCutoverFallbackService.validateRoomStatuses
-    });
-    assert(fallbackRes23[0].source === 'MYSQL_SCHEMA_FALLBACK', 'TEST 23: Room status validation failure safely falls back to MySQL');
+    // 23. Room Status Malformed / Validation Failure Fail-Closed
+    let threw23 = false;
+    let calledMysql23 = false;
+    try {
+      await SafeCutoverFallbackService.executeWithFallback({
+        domain: 'room_status',
+        servingEnabled: true,
+        firestoreOp: async () => [{ corrupt: true }], // Missing number/status
+        mysqlOp: async () => { calledMysql23 = true; return [{ number: '101', status: 'vacant', source: 'MYSQL_SCHEMA_FALLBACK' }]; },
+        validate: SafeCutoverFallbackService.validateRoomStatuses
+      });
+    } catch (err) {
+      if (err.message.includes('FIRESTORE_VALIDATION_FAILED')) threw23 = true;
+    }
+    assert(threw23 && !calledMysql23, 'TEST 23: Room status validation failure safely fails closed without MySQL fallback');
 
-    // 24. Availability Firestore Network Failure Fallback
-    const fallbackRes24 = await SafeCutoverFallbackService.executeWithFallback({
-      domain: 'availability',
-      servingEnabled: true,
-      firestoreOp: async () => { throw new Error('DEADLINE_EXCEEDED'); },
-      mysqlOp: async () => ({ available: true, source: 'MYSQL_FALLBACK' }),
-      validate: SafeCutoverFallbackService.validateAvailabilityResult
-    });
-    assert(fallbackRes24.source === 'MYSQL_FALLBACK', 'TEST 24: Availability network failure safely falls back to MySQL');
+    // 24. Availability Firestore Network Failure Fail-Closed
+    let threw24 = false;
+    let calledMysql24 = false;
+    try {
+      await SafeCutoverFallbackService.executeWithFallback({
+        domain: 'availability',
+        servingEnabled: true,
+        firestoreOp: async () => { throw new Error('DEADLINE_EXCEEDED'); },
+        mysqlOp: async () => { calledMysql24 = true; return { available: true, source: 'MYSQL_FALLBACK' }; },
+        validate: SafeCutoverFallbackService.validateAvailabilityResult
+      });
+    } catch (err) {
+      if (err.message.includes('DEADLINE_EXCEEDED')) threw24 = true;
+    }
+    assert(threw24 && !calledMysql24, 'TEST 24: Availability network failure safely fails closed without MySQL fallback');
 
-    // 25. Availability Timeout Fallback
-    const fallbackRes25 = await SafeCutoverFallbackService.executeWithFallback({
-      domain: 'availability',
-      servingEnabled: true,
-      firestoreOp: () => new Promise(resolve => setTimeout(() => resolve({ available: true }), 500)),
-      mysqlOp: async () => ({ available: true, source: 'MYSQL_TIMEOUT_FALLBACK' }),
-      validate: SafeCutoverFallbackService.validateAvailabilityResult,
-      timeoutMs: 50
-    });
-    assert(fallbackRes25.source === 'MYSQL_TIMEOUT_FALLBACK', 'TEST 25: Availability timeout safely falls back to MySQL');
+    // 25. Availability Timeout Fail-Closed
+    let threw25 = false;
+    let calledMysql25 = false;
+    try {
+      await SafeCutoverFallbackService.executeWithFallback({
+        domain: 'availability',
+        servingEnabled: true,
+        firestoreOp: () => new Promise(resolve => setTimeout(() => resolve({ available: true }), 500)),
+        mysqlOp: async () => { calledMysql25 = true; return { available: true, source: 'MYSQL_TIMEOUT_FALLBACK' }; },
+        validate: SafeCutoverFallbackService.validateAvailabilityResult,
+        timeoutMs: 50
+      });
+    } catch (err) {
+      if (err.message.includes('FIRESTORE_TIMEOUT')) threw25 = true;
+    }
+    assert(threw25 && !calledMysql25, 'TEST 25: Availability timeout safely fails closed without MySQL fallback');
 
-    // 26. Availability Malformed Validation Failure Fallback
-    const fallbackRes26 = await SafeCutoverFallbackService.executeWithFallback({
-      domain: 'availability',
-      servingEnabled: true,
-      firestoreOp: async () => ({ badPayload: true }), // Missing boolean available property
-      mysqlOp: async () => ({ available: true, source: 'MYSQL_SCHEMA_FALLBACK' }),
-      validate: SafeCutoverFallbackService.validateAvailabilityResult
-    });
-    assert(fallbackRes26.source === 'MYSQL_SCHEMA_FALLBACK', 'TEST 26: Availability validation failure safely falls back to MySQL');
+    // 26. Availability Malformed Validation Failure Fail-Closed
+    let threw26 = false;
+    let calledMysql26 = false;
+    try {
+      await SafeCutoverFallbackService.executeWithFallback({
+        domain: 'availability',
+        servingEnabled: true,
+        firestoreOp: async () => ({ badPayload: true }), // Missing boolean available property
+        mysqlOp: async () => { calledMysql26 = true; return { available: true, source: 'MYSQL_SCHEMA_FALLBACK' }; },
+        validate: SafeCutoverFallbackService.validateAvailabilityResult
+      });
+    } catch (err) {
+      if (err.message.includes('FIRESTORE_VALIDATION_FAILED')) threw26 = true;
+    }
+    assert(threw26 && !calledMysql26, 'TEST 26: Availability validation failure safely fails closed without MySQL fallback');
 
     // ─────────────────────────────────────────────────────────────────────────
     // SECTION 4: Live API Contract & Concurrency (Scenarios 27 to 30)

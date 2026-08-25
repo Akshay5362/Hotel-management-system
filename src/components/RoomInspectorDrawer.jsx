@@ -6,10 +6,23 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
   if (!selectedRoom) return null;
 
   const isActive = selectedRoom.is_active !== false && selectedRoom.is_active !== 0 && selectedRoom.is_active !== '0';
-  const isDirty = selectedRoom.housekeeping_status === 'Dirty' || selectedRoom.status === 'dirty';
-  const isOccupied = selectedRoom.status === 'occupied';
-  const isVacant = selectedRoom.status === 'vacant';
-  const isBooked = selectedRoom.status === 'booked';
+  
+  const rawStatus = String(selectedRoom.status || '').toLowerCase();
+  const rawHk = String(selectedRoom.housekeeping_status || '').toLowerCase();
+  const rawClean = String(selectedRoom.cleaning_status || '').toLowerCase();
+
+  const isOccupied = rawStatus === 'occupied';
+  const isBooked = rawStatus === 'booked';
+  const isDirty = rawHk === 'dirty' || rawClean === 'dirty' || rawStatus === 'dirty';
+  const isClean = !isDirty;
+  const isVacant = (rawStatus === 'vacant' || rawStatus === 'dirty') && !isOccupied && !isBooked;
+
+  // Check-in eligibility: ONLY when Active, NOT occupied, CLEAN, and Vacant (or Booked)
+  const canCheckIn = isActive && !isOccupied && isClean && (rawStatus === 'vacant' || isBooked);
+
+  // Derived occupancy display status
+  const occupancyBadgeText = isOccupied ? 'OCCUPIED' : (isBooked ? 'BOOKED' : (!isActive ? 'INACTIVE' : 'VACANT'));
+  const occupancyBadgeBg = isOccupied ? 'var(--color-occupied)' : (isBooked ? 'var(--color-booked)' : (!isActive ? '#6b7280' : 'var(--color-vacant)'));
 
   return (
     <>
@@ -24,15 +37,15 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
             <div style={{ display: 'flex', gap: '6px', marginTop: '4px', flexWrap: 'wrap' }}>
               <span style={{ 
                 display: 'inline-block',
-                background: `var(--color-${selectedRoom.status})`, 
-                color: '#fff', 
+                background: occupancyBadgeBg, 
+                color: isOccupied || isBooked || !isActive ? '#fff' : '#101827', 
                 padding: '2px 8px', 
                 borderRadius: '12px', 
                 fontSize: '0.65rem',
                 textTransform: 'uppercase',
                 fontWeight: '700'
               }}>
-                {selectedRoom.status}
+                {occupancyBadgeText}
               </span>
               <span style={{ 
                 display: 'inline-block',
@@ -137,7 +150,7 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
               </div>
             ) : (
               <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem', fontStyle: 'italic' }}>
-                No active guest currently assigned. Status: <strong style={{ textTransform: 'uppercase', color: '#4ade80' }}>{selectedRoom.status}</strong>
+                No active guest currently assigned. Status: <strong style={{ textTransform: 'uppercase', color: '#4ade80' }}>{occupancyBadgeText}</strong>
               </div>
             )}
           </div>
@@ -229,25 +242,7 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
               </div>
 
               {/* Check In / Check Out Action Buttons according to room operational state */}
-              {isActive ? (
-                isOccupied ? (
-                  <button 
-                    className="btn-action" 
-                    onClick={() => onCheckOutClick && onCheckOutClick(selectedRoom)} 
-                    style={{ width: '100%', height: '38px', background: 'var(--color-occupied)', color: '#fff', fontWeight: 'bold' }}
-                  >
-                    Check Out Guest
-                  </button>
-                ) : (isVacant || isBooked) ? (
-                  <button 
-                    className="btn-action" 
-                    onClick={() => onCheckInClick && onCheckInClick(selectedRoom)} 
-                    style={{ width: '100%', height: '38px', background: 'var(--color-vacant)', color: '#101827', fontWeight: 'bold' }}
-                  >
-                    Check In Guest
-                  </button>
-                ) : null
-              ) : (
+              {!isActive ? (
                 <div style={{
                   padding: '8px 12px',
                   borderRadius: '6px',
@@ -260,7 +255,36 @@ export default function RoomInspectorDrawer({ selectedRoom, onClose, onCheckInCl
                 }}>
                   Room is inactive and cannot be checked in.
                 </div>
-              )}
+              ) : isOccupied ? (
+                <button 
+                  className="btn-action" 
+                  onClick={() => onCheckOutClick && onCheckOutClick(selectedRoom)} 
+                  style={{ width: '100%', height: '38px', background: 'var(--color-occupied)', color: '#fff', fontWeight: 'bold' }}
+                >
+                  Check Out Guest
+                </button>
+              ) : isDirty ? (
+                <div style={{
+                  padding: '8px 12px',
+                  borderRadius: '6px',
+                  background: 'rgba(251, 191, 36, 0.1)',
+                  border: '1px solid rgba(251, 191, 36, 0.25)',
+                  color: '#fbbf24',
+                  fontSize: '0.8rem',
+                  fontWeight: '600',
+                  textAlign: 'center'
+                }}>
+                  🧹 Room is dirty and cannot be checked in.
+                </div>
+              ) : canCheckIn ? (
+                <button 
+                  className="btn-action" 
+                  onClick={() => onCheckInClick && onCheckInClick(selectedRoom)} 
+                  style={{ width: '100%', height: '38px', background: 'var(--color-vacant)', color: '#101827', fontWeight: 'bold' }}
+                >
+                  Check In Guest
+                </button>
+              ) : null}
             </div>
           </div>
         </div>

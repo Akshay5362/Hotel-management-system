@@ -272,34 +272,31 @@ async function runLedgerCutoverTestSuite() {
     }
     assert(threw404, 'TEST 17: Vacant room with no active booking throws HTTP 404 without invoking fallback');
 
-    // 18. Timeout Falls Back to MySQL
-    const fallbackTimeoutRoom = `984`;
-    let connection = await pool.getConnection();
+    // 18. Firestore Timeout Safely Fails Closed Without MySQL Fallback
+    let timeoutThrew = false;
     try {
-      await connection.query("INSERT INTO guests (id, full_name, phone) VALUES (1, 'TEST GUEST', '9999999999') ON DUPLICATE KEY UPDATE full_name = 'TEST GUEST'");
-      await connection.query("INSERT INTO rooms (number, room_type_id, status, housekeeping_status, is_active) VALUES (?, 1, 'occupied', 'Clean', 1) ON DUPLICATE KEY UPDATE status = 'occupied', housekeeping_status = 'Clean', is_active = 1", [fallbackTimeoutRoom]);
-      await connection.query("DELETE FROM bookings WHERE room_id = (SELECT id FROM rooms WHERE number = ?)", [fallbackTimeoutRoom]);
-      const [resBkg] = await connection.query(
-        "INSERT INTO bookings (booking_number, guest_id, room_id, check_in_date, booking_status, advance_amount, total_amount, payment_status) VALUES (?, 1, (SELECT id FROM rooms WHERE number = ?), '2026-08-19', 'Checked In', 1000, 3000, 'Partial')",
-        [`BKG-TIMEOUT-LEDGER-${rand}`, fallbackTimeoutRoom]
-      );
-      await connection.query(
-        "INSERT INTO ledger_items (booking_id, room_number, `desc`, amount, credit_amount, transaction_type, business_date) VALUES (?, ?, 'Room Tariff', 3000, 0, 'CHARGE', '2026-08-19'), (?, ?, 'Advance Deposit', 0, 1000, 'PAYMENT', '2026-08-19')",
-        [resBkg.insertId, fallbackTimeoutRoom, resBkg.insertId, fallbackTimeoutRoom]
-      );
-
-      const timeoutRes = await LedgerCutoverService.getLedgerWithFallback(fallbackTimeoutRoom, { timeoutMs: 1 });
-      assert(timeoutRes && timeoutRes.source === 'MYSQL_FALLBACK' && timeoutRes.summary.outstanding === 2000, 'TEST 18: Firestore timeout safely falls back to MySQL ledger with source = MYSQL_FALLBACK');
-    } finally {
-      connection.release();
+      await LedgerCutoverService.getLedgerWithFallback(roomNum1, { timeoutMs: 1 });
+    } catch (err) {
+      if (err.message && err.message.includes('FIRESTORE_TIMEOUT')) {
+        timeoutThrew = true;
+      }
     }
+    assert(timeoutThrew, 'TEST 18: Firestore timeout safely fails closed without invoking MySQL fallback');
 
-    // 19. Direct MySQL Serving Mode (Flag Disabled)
+    // 19. Disabling Firestore Ledger Serving Fails Closed under Decommission Guard
     const prevFlag = process.env.USE_FIRESTORE_LEDGER;
-    process.env.USE_FIRESTORE_LEDGER = 'false';
-    const directMysqlRes = await LedgerCutoverService.getLedgerWithFallback(fallbackTimeoutRoom);
-    process.env.USE_FIRESTORE_LEDGER = prevFlag;
-    assert(directMysqlRes && directMysqlRes.source === 'MYSQL', 'TEST 19: Direct MySQL ledger executes when USE_FIRESTORE_LEDGER is false');
+    let guardBlocked = false;
+    try {
+      process.env.USE_FIRESTORE_LEDGER = 'false';
+      await LedgerCutoverService.getLedgerWithFallback(roomNum1);
+    } catch (err) {
+      if (err.code === 'ER_MYSQL_DECOMMISSIONED' || (err.message && err.message.includes('MYSQL_DECOMMISSIONED_GUARD'))) {
+        guardBlocked = true;
+      }
+    } finally {
+      process.env.USE_FIRESTORE_LEDGER = prevFlag;
+    }
+    assert(guardBlocked, 'TEST 19: Disabling Firestore Ledger flag fails closed under MYSQL_DECOMMISSIONED_GUARD');
 
     // 20. Output Contract Shape Validation
     assert(servingRes.hasOwnProperty('booking') && servingRes.hasOwnProperty('ledger') && servingRes.hasOwnProperty('summary'), 'TEST 20: Output contract matches { booking, ledger, summary }');
@@ -307,8 +304,8 @@ async function runLedgerCutoverTestSuite() {
     // 21. Summary Mathematics Integrity
     assert(Math.abs(servingRes.summary.outstanding - (servingRes.summary.totalCharges - servingRes.summary.totalPayments)) < 0.01, 'TEST 21: Summary strictly satisfies outstanding = totalCharges - totalPayments');
 
-    // 22. Zero Decommission Invariant Assertion
-    assert(true, 'TEST 22: MySQL ledger database and connection pool remain 100% active and available as fallback');
+    // 22. Production Cutover Invariant Assertion
+    assert(process.env.DISABLE_MYSQL_CUTOVER_FALLBACKS === 'true', 'TEST 22: Production cutover invariant: DISABLE_MYSQL_CUTOVER_FALLBACKS is strictly TRUE with MySQL decommissioned');
 
   } catch (err) {
     console.error('Unhandled cutover test suite error:', err);

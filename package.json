@@ -1,6 +1,6 @@
 {
   "name": "webline-pms",
-  "productName": "Webline PMS Plus",
+  "productName": "HPMS",
   "author": {
     "name": "Webline",
     "email": "info@webline.com"
@@ -23,9 +23,9 @@
     "electron:build:mac": "npm run build && electron-builder --mac --x64"
   },
   "build": {
-    "appId": "com.webline.pms",
-    "productName": "Webline PMS Plus",
-    "copyright": "Copyright © 2026 Webline",
+    "appId": "com.hotel.hpms",
+    "productName": "HPMS",
+    "copyright": "Copyright © 2026 Hotel Sky-5",
     "directories": {
       "output": "release"
     },
@@ -41,20 +41,36 @@
       "electron/**/*",
       "package.json"
     ],
+    "extraResources": [
+      {
+        "from": "backend",
+        "to": "backend",
+        "filter": [
+          "**/*",
+          "!db_data/**",
+          "!tests/**",
+          "!scratch/**",
+          "!*.md",
+          "!test-data-cleanup-backup/**"
+        ]
+      },
+      {
+        "from": "backend/node_modules",
+        "to": "backend/node_modules"
+      }
+    ],
     "win": {
       "target": "nsis",
-      "artifactName": "${productName} Setup ${version}.${ext}",
-      "signtoolOptions": {
-        "publisherName": "Webline"
-      }
+      "artifactName": "HPMS Setup ${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Webline PMS Plus",
-      "deleteAppDataOnUninstall": false
+      "shortcutName": "HPMS",
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": false
     },
     "mac": {
       "target": [

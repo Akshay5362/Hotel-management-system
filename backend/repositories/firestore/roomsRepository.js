@@ -111,6 +111,12 @@ export async function updateRoomFirestore(roomId, roomData, options = {}) {
     updated_at: roomData.updated_at || new Date().toISOString()
   };
 
+  if (updatePayload.housekeeping_status && !updatePayload.cleaning_status) {
+    updatePayload.cleaning_status = updatePayload.housekeeping_status;
+  } else if (updatePayload.cleaning_status && !updatePayload.housekeeping_status) {
+    updatePayload.housekeeping_status = updatePayload.cleaning_status;
+  }
+
   const result = await updateDoc(COLLECTION, docId, updatePayload, options);
   invalidateRoomStatusCache();
   return result;
@@ -122,6 +128,8 @@ export async function updateRoomStatusFirestore(roomId, statusData, options = {}
 
   if (payload.housekeeping_status && !payload.cleaning_status) {
     payload.cleaning_status = payload.housekeeping_status;
+  } else if (payload.cleaning_status && !payload.housekeeping_status) {
+    payload.housekeeping_status = payload.cleaning_status;
   }
 
   payload.updated_at = payload.updated_at || new Date().toISOString();

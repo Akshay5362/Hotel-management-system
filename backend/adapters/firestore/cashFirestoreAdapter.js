@@ -44,11 +44,29 @@ export class CashFirestoreAdapter {
       if (!log) return;
       const logDate = parseToComparableDate(log.business_date) || log.business_date;
       if (logDate === compDate || logDate === businessDate) {
-        const type = String(log.type || '');
+        const type = String(log.type || '').trim();
         const amt = Number(log.amount || 0);
-        if (type === 'Advance Deposit' || type === 'IN') advances += amt;
-        else if (type === 'Checkout Settlement') settlements += amt;
-        else if (type.toLowerCase().includes('refund') || type === 'OUT') refunds += amt;
+        if (amt <= 0) return;
+
+        if (
+          type === 'Advance Deposit' ||
+          type === 'Partial Payment' ||
+          type === 'Full Settlement' ||
+          type === 'IN'
+        ) {
+          advances += amt;
+        } else if (
+          type === 'Checkout Settlement' ||
+          type === 'Settlement'
+        ) {
+          settlements += amt;
+        } else if (
+          type.toLowerCase().includes('refund') ||
+          type.toUpperCase() === 'OUT' ||
+          type.toLowerCase().includes('payout')
+        ) {
+          refunds += amt;
+        }
       }
     });
 

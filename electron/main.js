@@ -29,16 +29,16 @@ const __dirname  = path.dirname(__filename);
 
 // ─── Synchronous file logger ──────────────────────────────────────────────────
 // Uses appendFileSync — every line is on disk before the next line runs.
-// Three candidate paths tried in order; whichever is writable wins.
+// Prioritizes app.getPath('userData')/logs/ which is 100% user-writable on Windows.
 
 let LOG_FILE = null;
 
 function initLogger() {
   const dirs = [
-    // 1. Primary: next to backend in resources/ (visible after build)
-    app.isPackaged ? path.join(process.resourcesPath, 'logs') : null,
-    // 2. userData — always writable for the current user
+    // 1. userData — always writable for the current user in all Windows environments
     (() => { try { return path.join(app.getPath('userData'), 'logs'); } catch { return null; } })(),
+    // 2. Fallback in resources if packaged & writable
+    app.isPackaged ? path.join(process.resourcesPath, 'logs') : null,
     // 3. Absolute fallback — Desktop
     path.join(os.homedir(), 'Desktop'),
     // 4. Temp
@@ -48,7 +48,7 @@ function initLogger() {
   for (const dir of dirs) {
     try {
       fs.mkdirSync(dir, { recursive: true });
-      const candidate = path.join(dir, dir === os.tmpdir() ? 'webline-startup.log' : 'startup.log');
+      const candidate = path.join(dir, 'startup.log');
       fs.writeFileSync(candidate, ''); // truncate / create
       LOG_FILE = candidate;
       break;
@@ -123,11 +123,11 @@ L('ENV', `isDev = ${isDev}  (based on app.isPackaged)`);
 //  production   installer (app.isPackaged)  → dist/ + spawns packaged backend
 const ELECTRON_MODE  = process.env.ELECTRON_MODE || (app.isPackaged ? 'production' : 'local');
 const USES_VITE      = ELECTRON_MODE === 'local' || ELECTRON_MODE === 'docker-dev';
-const SPAWNS_BACKEND = false;
+const SPAWNS_BACKEND = ELECTRON_MODE === 'production' || process.env.SPAWNS_BACKEND === 'true';
 
 L('ENV', `ELECTRON_MODE  = ${ELECTRON_MODE}`);
 L('ENV', `USES_VITE      = ${USES_VITE}   (true → load http://localhost:5173)`);
-L('ENV', `SPAWNS_BACKEND = ${SPAWNS_BACKEND}  (Backend runs via Docker/External service)`);
+L('ENV', `SPAWNS_BACKEND = ${SPAWNS_BACKEND}  (true → Electron automatically spawns backend)`);
 
 // ─── Path placeholders ────────────────────────────────────────────────────────
 const DEV_URL = 'http://localhost:5173';
@@ -291,7 +291,7 @@ function createWindow() {
     x: validBounds?.x,
     y: validBounds?.y,
     minWidth: 1280, minHeight: 720,
-    title: 'Webline PMS Plus',
+    title: 'HPMS',
     backgroundColor: '#0d1117',
     show: false,
     resizable: true, maximizable: true, minimizable: true,
@@ -525,7 +525,7 @@ L('READY', 'Registering app.whenReady() handler');
 app.whenReady().then(async () => {
   L('READY', 'app.whenReady() fired ✓');
 
-  app.setName('Webline PMS Plus');
+  app.setName('HPMS');
 
   // Resolve all paths
   let APP_ROOT;
@@ -567,13 +567,22 @@ app.whenReady().then(async () => {
   }
 
   // ── Universal Backend Health Verification ──────────────────────────────────
-  // Electron connects to the Docker/External backend running at http://localhost:5000
+  if (SPAWNS_BACKEND && launchBackend) {
+    L('BACKEND', `[${ELECTRON_MODE}] Spawning background backend process from ${APP_ROOT}...`);
+    try {
+      await launchBackend(APP_ROOT);
+      L('BACKEND', 'launchBackend completed.');
+    } catch (launchErr) {
+      LERR('BACKEND', 'launchBackend failed to spawn process', launchErr);
+    }
+  }
+
   let backendReady = false;
   while (!backendReady) {
     L('BACKEND', `[${ELECTRON_MODE}] Verifying backend health on :5000...`);
     try {
       if (waitForBackend) {
-        await waitForBackend(5000, 15000);
+        await waitForBackend(5000, 30000);
       }
       L('BACKEND', 'Backend :5000 health confirmed ✓');
       backendReady = true;
@@ -581,16 +590,19 @@ app.whenReady().then(async () => {
       LERR('BACKEND', 'Backend health check failed', err);
       closeSplash();
 
-      const hint = USES_VITE && ELECTRON_MODE === 'local'
-        ? 'Please run "npm run backend:dev" in a separate terminal.'
-        : 'Please ensure Docker Desktop is running and start the HPMS services:\n\n  docker compose up -d';
+      const backendLogPath = path.join(app.getPath('userData'), 'logs', 'backend.log');
+      const hint = SPAWNS_BACKEND
+        ? `The HPMS backend service could not be started automatically.\n\nBackend log:\n${backendLogPath}`
+        : (USES_VITE && ELECTRON_MODE === 'local'
+            ? 'Please run "npm run backend:dev" in a separate terminal.'
+            : 'Please ensure the HPMS backend service is running at http://localhost:5000.');
 
       try {
         const { response } = await dialog.showMessageBox({
           type: 'error',
           title: 'HPMS Backend Unavailable',
           message: 'Could not connect to the HPMS backend service on port 5000.',
-          detail: `${hint}\n\nClick "Retry" once services are running, or "Exit" to close.\n\nError: ${err.message}`,
+          detail: `${hint}\n\nError details:\n${err.message}\n\nClick "Retry" once services are running, or "Exit" to close.`,
           buttons: ['Retry', 'Exit'],
           defaultId: 0,
           cancelId: 1
@@ -622,6 +634,30 @@ app.whenReady().then(async () => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       try { createSplashWindow(); createWindow(); } catch {}
+    }
+  });
+
+  app.on('window-all-closed', () => {
+    L('APP', 'All windows closed — initiating shutdown');
+    if (killBackend) {
+      try { killBackend(); } catch (ke) { LERR('APP', 'killBackend on window-all-closed threw', ke); }
+    }
+    if (process.platform !== 'darwin') {
+      app.quit();
+    }
+  });
+
+  app.on('before-quit', () => {
+    L('APP', 'before-quit received — terminating backend child process');
+    if (killBackend) {
+      try { killBackend(); } catch (ke) { LERR('APP', 'killBackend on before-quit threw', ke); }
+    }
+  });
+
+  app.on('will-quit', () => {
+    L('APP', 'will-quit received — finalizing backend process cleanup');
+    if (killBackend) {
+      try { killBackend(); } catch (ke) { LERR('APP', 'killBackend on will-quit threw', ke); }
     }
   });
 

@@ -221,15 +221,48 @@ export async function getConflictingReservationsFirestore({
  *
  * @returns {Promise<{ available: boolean, reason: string|null, code: string|null, room: object|null }>}
  */
-export async function checkRoomAvailabilityFirestore({
-  roomId,
-  roomNumber = null,
-  arrivalDate,
-  departureDate,
-  excludeReservationId = null,
-  excludeBookingId = null,
-  transaction = null
-}) {
+export async function checkRoomAvailabilityFirestore(param1, param2, param3, param4, param5) {
+  let roomId, roomNumber = null, arrivalDate, departureDate, excludeReservationId = null, excludeBookingId = null, transaction = null;
+
+  // Case 1: param1 is connection/pool and param2 is options object
+  if (param1 && typeof param1 === 'object' && !param1.arrivalDate && param2 && typeof param2 === 'object') {
+    ({
+      roomId,
+      roomNumber = null,
+      arrivalDate,
+      departureDate,
+      excludeReservationId = null,
+      excludeBookingId = null,
+      transaction = null
+    } = param2);
+  }
+  // Case 2: param1 is options object
+  else if (param1 && typeof param1 === 'object' && (param1.arrivalDate || param1.roomId || param1.roomNumber)) {
+    ({
+      roomId,
+      roomNumber = null,
+      arrivalDate,
+      departureDate,
+      excludeReservationId = null,
+      excludeBookingId = null,
+      transaction = null
+    } = param1);
+  }
+  // Case 3: Positional with connection: (pool, roomId, arrivalDate, departureDate, excludeReservationId)
+  else if (param1 && typeof param1 === 'object' && (typeof param2 === 'string' || typeof param2 === 'number')) {
+    roomId = param2;
+    arrivalDate = param3;
+    departureDate = param4;
+    excludeReservationId = param5 || null;
+  }
+  // Case 4: Positional without connection: (roomId, arrivalDate, departureDate, excludeReservationId)
+  else {
+    roomId = param1;
+    arrivalDate = param2;
+    departureDate = param3;
+    excludeReservationId = param4 || null;
+  }
+
   const sArr = parseToComparableDate(arrivalDate);
   const sDep = parseToComparableDate(departureDate);
 
@@ -348,10 +381,23 @@ export async function isRoomAvailableFirestore(params) {
  *
  * @returns {Promise<Array<object>>} Available room objects in natural numeric order
  */
-export async function findAvailableRoomsFirestore(param1, param2, param3, param4) {
-  let arrivalDate, departureDate, roomType, roomTypeId, excludeReservationId, excludeBookingId, transaction;
+export async function findAvailableRoomsFirestore(param1, param2, param3, param4, param5) {
+  let arrivalDate, departureDate, roomType = 'ALL', roomTypeId = null, excludeReservationId = null, excludeBookingId = null, transaction = null;
 
-  if (param1 && typeof param1 === 'object' && !param2) {
+  // Case 1: param1 is connection/pool and param2 is options object
+  if (param1 && typeof param1 === 'object' && !param1.arrivalDate && param2 && typeof param2 === 'object') {
+    ({
+      arrivalDate,
+      departureDate,
+      roomType = 'ALL',
+      roomTypeId = null,
+      excludeReservationId = null,
+      excludeBookingId = null,
+      transaction = null
+    } = param2);
+  }
+  // Case 2: param1 is options object
+  else if (param1 && typeof param1 === 'object' && param1.arrivalDate) {
     ({
       arrivalDate,
       departureDate,
@@ -361,7 +407,16 @@ export async function findAvailableRoomsFirestore(param1, param2, param3, param4
       excludeBookingId = null,
       transaction = null
     } = param1);
-  } else {
+  }
+  // Case 3: param1 is connection/pool followed by positional arguments: (pool, '2026-09-10', '2026-09-15', 'ALL', excludeReservationId)
+  else if (param1 && typeof param1 === 'object' && typeof param2 === 'string') {
+    arrivalDate = param2;
+    departureDate = param3;
+    roomType = param4 || 'ALL';
+    excludeReservationId = param5 || null;
+  }
+  // Case 4: Positional arguments without connection: ('2026-09-10', '2026-09-15', 'ALL', excludeReservationId)
+  else {
     arrivalDate = param1;
     departureDate = param2;
     roomType = param3 || 'ALL';

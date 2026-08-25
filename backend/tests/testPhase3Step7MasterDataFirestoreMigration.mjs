@@ -43,6 +43,8 @@ async function runTests() {
   const origInventoryFlag = process.env.USE_FIRESTORE_INVENTORY;
   const origHkFlag = process.env.USE_FIRESTORE_HOUSEKEEPING;
 
+  const fixturesToClean = [];
+
   try {
     // ─────────────────────────────────────────────────────────────────────────
     // Section A: Feature Flag Defaults
@@ -82,6 +84,10 @@ async function runTests() {
     // Flag ON: Firestore
     process.env.USE_FIRESTORE_ROOM_TYPES = 'true';
     const testTypeCode = `RT_${Math.floor(Math.random() * 8999 + 1000)}`;
+    fixturesToClean.push({ collection: 'room_types', docId: `type_${testTypeCode}` });
+    fixturesToClean.push({ collection: 'room_types', docId: testTypeCode });
+    fixturesToClean.push({ collection: 'room_types', docId: `type_${testTypeCode.toUpperCase()}` });
+
     const createdRt = await RoomTypeCutoverService.createRoomType({
       code: testTypeCode,
       name: 'Test Room Type',
@@ -119,6 +125,8 @@ async function runTests() {
     process.env.USE_FIRESTORE_STAFF = 'true';
     const testUsername = `staff_${Date.now()}`;
     const testEmail = `${testUsername}@hotel.com`;
+    fixturesToClean.push({ collection: 'staff', docId: `staff_${testUsername}` });
+    fixturesToClean.push({ collection: 'staff', docId: testUsername });
 
     const createdStaff = await StaffCutoverService.createStaff({
       full_name: 'Test Staff Member',
@@ -164,11 +172,18 @@ async function runTests() {
     // Flag ON: Firestore
     process.env.USE_FIRESTORE_INVENTORY = 'true';
     const testCatName = `Test Category ${Date.now()}`;
+    const catCleanId = `cat_${testCatName.toLowerCase().replace(/[^a-z0-9]+/g, '_')}`;
+    fixturesToClean.push({ collection: 'inventory_categories', docId: catCleanId });
+
     const createdCat = await InventoryCutoverService.createCategory({
       name: testCatName,
       department: 'Housekeeping'
     });
     report('G.1: Flag ON - createCategory creates category in Firestore', createdCat && createdCat.name === testCatName);
+    if (createdCat?.id) {
+      fixturesToClean.push({ collection: 'inventory_categories', docId: String(createdCat.id) });
+      fixturesToClean.push({ collection: 'inventory_categories', docId: `cat_${createdCat.id}` });
+    }
 
     const updatedCat = await InventoryCutoverService.updateCategory(createdCat.id, {
       name: `${testCatName} Updated`,
@@ -192,6 +207,10 @@ async function runTests() {
     // Flag ON: Firestore
     process.env.USE_FIRESTORE_INVENTORY = 'true';
     const testSku = `SK_${Math.floor(Math.random() * 8999 + 1000)}`;
+    fixturesToClean.push({ collection: 'inventory_products', docId: `prod_${testSku}` });
+    fixturesToClean.push({ collection: 'inventory_products', docId: testSku });
+    fixturesToClean.push({ collection: 'inventory_products', docId: `prod_${testSku.toUpperCase()}` });
+
     const createdProd = await InventoryCutoverService.createProduct({
       sku: testSku,
       name: 'Test Inventory Item',
@@ -287,6 +306,32 @@ async function runTests() {
     report('O.4: Rollback Housekeeping - Flag OFF seamlessly uses MySQL', Array.isArray(rollbackHk));
 
   } finally {
+    console.log('\n--- EXECUTING GUARANTEED FIXTURE CLEANUP ---');
+    let cleanupAttempts = 0;
+    let cleanupSuccess = 0;
+    let cleanupFailures = 0;
+
+    if (firestoreDb) {
+      for (const item of fixturesToClean) {
+        cleanupAttempts++;
+        try {
+          await firestoreDb.collection(item.collection).doc(item.docId).delete();
+          cleanupSuccess++;
+        } catch (cleanErr) {
+          cleanupFailures++;
+          console.warn(`[Cleanup Warning] Failed to delete ${item.collection}/${item.docId}:`, cleanErr.message);
+        }
+      }
+    }
+
+    console.log('\n===============================================================');
+    console.log('CLEANUP SUMMARY:');
+    console.log(`  CREATED FIXTURES : ${fixturesToClean.length}`);
+    console.log(`  CLEANUP ATTEMPTS : ${cleanupAttempts}`);
+    console.log(`  CLEANUP SUCCESS  : ${cleanupSuccess}`);
+    console.log(`  CLEANUP FAILURES : ${cleanupFailures}`);
+    console.log('===============================================================');
+
     // Restore original env variables (KEEP FLAGS OFF)
     if (origRoomTypesFlag !== undefined) process.env.USE_FIRESTORE_ROOM_TYPES = origRoomTypesFlag;
     else delete process.env.USE_FIRESTORE_ROOM_TYPES;

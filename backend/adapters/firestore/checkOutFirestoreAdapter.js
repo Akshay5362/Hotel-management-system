@@ -51,6 +51,7 @@ export const processCheckOutFirestoreTransaction = async ({
     // 2. RESOLVE ACTIVE BOOKING FOR THIS ROOM
     let activeBookingDocId = roomData.current_booking_id;
     let activeBookingData = null;
+    let candidateCheckedOutBooking = null;
     const roomNumStr = String(number).trim();
 
     // Primary Path: Check if room.current_booking_id points to an active Checked In booking for this room
@@ -62,8 +63,12 @@ export const processCheckOutFirestoreTransaction = async ({
         const candidateRoomId = String(candidate.room_id || '').trim();
         const isMatchRoom = candidateRoomNum === roomNumStr || candidateRoomId === roomDocId || candidateRoomId === roomNumStr;
 
-        if (isMatchRoom && candidate.booking_status === 'Checked In') {
-          activeBookingData = candidate;
+        if (isMatchRoom) {
+          if (candidate.booking_status === 'Checked In') {
+            activeBookingData = candidate;
+          } else if (candidate.booking_status === 'Checked Out') {
+            candidateCheckedOutBooking = candidate;
+          }
         }
       }
     }
@@ -109,6 +114,12 @@ export const processCheckOutFirestoreTransaction = async ({
 
     // If zero active bookings exist anywhere:
     if (!activeBookingData) {
+      if (candidateCheckedOutBooking) {
+        const err = new Error(`Booking for Room ${number} is already checked out`);
+        err.status = 400;
+        err.code = 'ALREADY_CHECKED_OUT';
+        throw err;
+      }
       const err = new Error(`Room ${number} is not occupied`);
       err.status = 400;
       err.code = 'ROOM_NOT_OCCUPIED';
@@ -141,31 +152,120 @@ export const processCheckOutFirestoreTransaction = async ({
 
     const financials = LedgerFirestoreAdapter.calculateAuthoritativeBalance(existingLedgers, existingPayments);
 
-    if (financials.outstandingBalance > 0.01) {
-      const err = new Error(`Checkout cannot be completed. Outstanding balance is ₹${financials.outstandingBalance.toLocaleString('en-IN')}. Please record the guest's payment before checking out.`);
+    let grossCharges = financials.grossCharges;
+    if (grossCharges === 0) {
+      grossCharges = Number(activeBookingData.total_amount || activeBookingData.room_tariff || roomData.price || roomData.rate || 0);
+    }
+    const validCredits = financials.validCredits;
+    const netCharges = Math.max(0, Number((grossCharges - validCredits).toFixed(2)));
+
+    let existingTotalPayments = financials.totalPayments;
+    if (existingTotalPayments === 0 && Number(activeBookingData.advance_amount || 0) > 0) {
+      existingTotalPayments = Number(activeBookingData.advance_amount || 0);
+    }
+
+    const settlementAmount = Number(parsedBalancePaid || 0);
+    const outstandingBeforeSettlement = Number((netCharges - existingTotalPayments).toFixed(2));
+    const finalOutstanding = Number((outstandingBeforeSettlement - settlementAmount).toFixed(2));
+
+    if (finalOutstanding > 0.01) {
+      const err = new Error(`Checkout cannot be completed. Outstanding balance is ₹${finalOutstanding.toLocaleString('en-IN')}. Please record the guest's payment before checking out.`);
       err.status = 400;
       err.code = 'BALANCE_DUE';
       err.bookingId = activeBookingDocId;
-      err.totalCharges = financials.grossCharges;
-      err.totalCredits = financials.validCredits;
-      err.totalPayments = financials.totalPayments;
-      err.balanceDue = financials.outstandingBalance;
+      err.totalCharges = grossCharges;
+      err.totalCredits = validCredits;
+      err.totalPayments = existingTotalPayments + settlementAmount;
+      err.balanceDue = finalOutstanding;
       throw err;
     }
 
-    const totalCollected = financials.totalPayments;
-    const finalCharges = financials.netCharges;
+    const totalCollected = Number((existingTotalPayments + settlementAmount).toFixed(2));
+    const finalCharges = netCharges;
 
-    // 4. UPDATE BOOKING DOCUMENT
+    // 4. WRITE SETTLEMENT PAYMENT, CASH LOG, AND LEDGER IF SETTLEMENT AMOUNT != 0
+    if (settlementAmount !== 0) {
+      const isRefund = settlementAmount < 0;
+      const paymentDocId = `payment_${activeBookingDocId}_checkout`;
+      const paymentRef = db.collection('payments').doc(paymentDocId);
+
+      transaction.set(paymentRef, {
+        payment_id: paymentDocId,
+        payment_number: 'PAY-OUT-' + Math.floor(100000 + Math.random() * 900000),
+        booking_id: activeBookingDocId,
+        booking_number: activeBookingData.booking_number || activeBookingDocId,
+        guest_id: activeBookingData.guest_id || null,
+        guest_name: activeBookingData.guest_name || 'GUEST',
+        room_number: String(number),
+        amount: isRefund ? Math.abs(settlementAmount) : settlementAmount,
+        payment_method: paymentMethod || 'Cash',
+        payment_type: isRefund ? 'Checkout Refund' : 'Checkout Settlement',
+        type: isRefund ? 'Checkout Refund' : 'Checkout Settlement',
+        payment_status: isRefund ? 'Refunded' : 'Completed',
+        business_date: businessDate,
+        payment_date: nowIso,
+        created_by: String(resolvedUserId || 'admin'),
+        recorded_by: String(resolvedUserId || 'admin'),
+        created_at: nowIso,
+        updated_at: nowIso
+      });
+
+      if ((paymentMethod || 'Cash') === 'Cash') {
+        const cashLogDocId = `cash_${activeBookingDocId}_checkout`;
+        const cashLogRef = db.collection('cash_logs').doc(cashLogDocId);
+        transaction.set(cashLogRef, {
+          log_id: cashLogDocId,
+          room: String(number),
+          room_number: String(number),
+          guest: activeBookingData.guest_name || 'GUEST',
+          type: isRefund ? 'Checkout Refund' : 'Checkout Settlement',
+          amount: isRefund ? Math.abs(settlementAmount) : settlementAmount,
+          payment_mode: 'Cash',
+          business_date: businessDate,
+          booking_id: activeBookingDocId,
+          time: formatTime(new Date()),
+          created_by: String(resolvedUserId || 'admin'),
+          recorded_by: String(resolvedUserId || 'admin'),
+          created_at: nowIso
+        });
+      }
+
+      const ledgerDocId = `ledger_${activeBookingDocId}_checkout`;
+      const ledgerRef = db.collection('ledger_items').doc(ledgerDocId);
+      transaction.set(ledgerRef, {
+        item_id: ledgerDocId,
+        room_number: String(number),
+        desc: `Checkout ${isRefund ? 'Refund' : 'Settlement'} (${paymentMethod || 'Cash'})`,
+        description: `Checkout ${isRefund ? 'Refund' : 'Settlement'} (${paymentMethod || 'Cash'})`,
+        qty: 1,
+        quantity: 1,
+        amount: isRefund ? Math.abs(settlementAmount) : 0,
+        credit_amount: isRefund ? 0 : settlementAmount,
+        debit_amount: isRefund ? Math.abs(settlementAmount) : 0,
+        transaction_type: isRefund ? 'REFUND' : 'PAYMENT',
+        type: isRefund ? 'REFUND' : 'PAYMENT',
+        payment_mode: paymentMethod || 'Cash',
+        business_date: businessDate,
+        booking_id: activeBookingDocId,
+        booking_number: activeBookingData.booking_number || null,
+        created_by: String(resolvedUserId || 'admin'),
+        status: 'active',
+        created_at: nowIso,
+        updated_at: nowIso
+      });
+    }
+
+    // 5. UPDATE BOOKING DOCUMENT
     transaction.set(bookingRef, {
       booking_status: 'Checked Out',
       payment_status: 'Paid',
       total_amount: finalCharges,
+      advance_amount: totalCollected,
       check_out_date: businessDate,
       updated_at: nowIso
     }, { merge: true });
 
-    // 5. CREATE / UPDATE INVOICE DOCUMENT
+    // 6. CREATE / UPDATE INVOICE DOCUMENT
     const numPart = activeBookingData.booking_number 
       ? activeBookingData.booking_number.replace(/^BKG-/, '') 
       : activeBookingDocId.replace('booking_', '').slice(-4);
@@ -188,7 +288,7 @@ export const processCheckOutFirestoreTransaction = async ({
       updated_at: nowIso
     }, { merge: true });
 
-    // 6. UPDATE ROOM STATUS TO DIRTY (HIGH PRIORITY)
+    // 7. UPDATE ROOM STATUS TO DIRTY (HIGH PRIORITY)
     transaction.set(roomRef, {
       status: 'dirty',
       housekeeping_status: 'Dirty',
@@ -197,7 +297,7 @@ export const processCheckOutFirestoreTransaction = async ({
       updated_at: nowIso
     }, { merge: true });
 
-    // 7. CREATE CHECKOUT SNAPSHOT DOCUMENT
+    // 8. CREATE CHECKOUT SNAPSHOT DOCUMENT
     const bkgCleanId = bookingRef.id.startsWith('bkg_') ? bookingRef.id : `bkg_${bookingRef.id}`;
     const snapshotRef = db.collection('checkout_snapshots').doc(`snap_${bkgCleanId}`);
     transaction.set(snapshotRef, {
@@ -219,7 +319,7 @@ export const processCheckOutFirestoreTransaction = async ({
       created_at: nowIso
     });
 
-    // 8. ROOM STATUS HISTORY AUDIT DOCUMENT
+    // 9. ROOM STATUS HISTORY AUDIT DOCUMENT
     const rshRef = db.collection('room_status_history').doc(`rsh_${bookingRef.id}_checkout`);
     transaction.set(rshRef, {
       room_id: roomRef.id,
@@ -240,7 +340,7 @@ export const processCheckOutFirestoreTransaction = async ({
       invoiceNumber
     };
 
-    // 9. IDEMPOTENCY RECORD WRITE
+    // 10. IDEMPOTENCY RECORD WRITE
     if (idempotencyKey) {
       const idemRef = db.collection('idempotency_keys').doc(String(idempotencyKey));
       transaction.set(idemRef, {

@@ -68,9 +68,29 @@ export const submitCash = async (req, res) => {
 
       let advances = 0, settlements = 0, refunds = 0;
       for (const row of cashLogRows) {
-        if (row.type === 'Advance Deposit') advances += Number(row.amount);
-        else if (row.type === 'Checkout Settlement') settlements += Number(row.amount);
-        else if (row.type.toLowerCase().includes('refund')) refunds += Number(row.amount);
+        const type = String(row.type || '').trim();
+        const amt = Number(row.amount || 0);
+        if (amt <= 0) continue;
+
+        if (
+          type === 'Advance Deposit' ||
+          type === 'Partial Payment' ||
+          type === 'Full Settlement' ||
+          type === 'IN'
+        ) {
+          advances += amt;
+        } else if (
+          type === 'Checkout Settlement' ||
+          type === 'Settlement'
+        ) {
+          settlements += amt;
+        } else if (
+          type.toLowerCase().includes('refund') ||
+          type.toUpperCase() === 'OUT' ||
+          type.toLowerCase().includes('payout')
+        ) {
+          refunds += amt;
+        }
       }
       const alreadySubmitted = Number(submittedRows[0].total);
       const cashInHand       = advances + settlements - refunds - alreadySubmitted;

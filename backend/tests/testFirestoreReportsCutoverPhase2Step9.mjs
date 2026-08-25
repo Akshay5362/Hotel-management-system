@@ -36,19 +36,36 @@ async function main() {
   const testRoom1 = `901_${ts.toString().slice(-4)}`;
   const testRoom2 = `902_${ts.toString().slice(-4)}`;
 
-  // ──────────────────────────────────────────────────────────────────────────
-  // 0. Seed Test Fixtures in Firestore
-  // ──────────────────────────────────────────────────────────────────────────
+  const fixturesToClean = [
+    { collection: 'rooms', docId: `room_${testRoom1}` },
+    { collection: 'rooms', docId: testRoom1 },
+    { collection: 'rooms', docId: `room_${testRoom2}` },
+    { collection: 'rooms', docId: testRoom2 },
+    { collection: 'payments', docId: `pay_test_${ts}_1` },
+    { collection: 'payments', docId: `pay_test_${ts}_2` },
+    { collection: 'payments', docId: `pay_test_${ts}_3` },
+    { collection: 'bookings', docId: `bkg_test_${ts}_1` },
+    { collection: 'bookings', docId: `bkg_test_${ts}_2` },
+    { collection: 'bookings', docId: `bkg_test_${ts}_3` },
+    { collection: 'bookings', docId: `bkg_test_${ts}_4` },
+    { collection: 'guests', docId: `guest_test_${ts}_1` },
+    { collection: 'guests', docId: `guest_test_${ts}_2` }
+  ];
+
   try {
-    await db.collection('rooms').doc(`room_${testRoom1}`).set({
-      number: testRoom1,
-      type: 'DELUXE',
-      room_type_id: 1,
-      is_active: true,
-      status: 'occupied',
-      housekeeping_status: 'Clean',
-      created_at: new Date().toISOString()
-    });
+    // ──────────────────────────────────────────────────────────────────────────
+    // 0. Seed Test Fixtures in Firestore
+    // ──────────────────────────────────────────────────────────────────────────
+    try {
+      await db.collection('rooms').doc(`room_${testRoom1}`).set({
+        number: testRoom1,
+        type: 'DELUXE',
+        room_type_id: 1,
+        is_active: true,
+        status: 'occupied',
+        housekeeping_status: 'Clean',
+        created_at: new Date().toISOString()
+      });
 
     await db.collection('rooms').doc(`room_${testRoom2}`).set({
       number: testRoom2,
@@ -419,71 +436,111 @@ async function main() {
   // ──────────────────────────────────────────────────────────────────────────
   console.log('\n--- GROUP 7: Firestore Safety & Fallback ---');
 
-  await runTest('7.1 ReportsCutoverService serves from MySQL when flag is false', async () => {
+  await runTest('7.1 ReportsCutoverService remains Firestore-primary when Reports flag is false under Audit History authority', async () => {
+    const prevFlag = process.env.USE_FIRESTORE_REPORTS;
     process.env.USE_FIRESTORE_REPORTS = 'false';
     let calledMysql = false;
-    const res = await ReportsCutoverService.getDashboardOverview({}, async () => {
-      calledMysql = true;
-      return { totalRevenue: 10000, occupancyRate: 50, fromMysql: true };
-    });
-    assert.strictEqual(calledMysql, true);
-    assert.strictEqual(res.fromMysql, true);
-  });
-
-  await runTest('7.2 ReportsCutoverService serves from Firestore when flag is true or falls back safely', async () => {
-    process.env.USE_FIRESTORE_REPORTS = 'true';
-    let calledMysql = false;
-    const res = await ReportsCutoverService.getDashboardOverview({}, async () => {
-      calledMysql = true;
-      return { totalRevenue: 10000, occupancyRate: 50, fromMysql: true };
-    });
-    assert.ok(res.source === 'FIRESTORE' || res.source === 'MYSQL_FALLBACK');
-  });
-
-  await runTest('7.3 Firestore timeout triggers automatic safe MySQL fallback', async () => {
-    process.env.USE_FIRESTORE_REPORTS = 'true';
-    let calledMysql = false;
-    const res = await ReportsCutoverService.getDashboardOverview(
-      { timeoutMs: 0 },
-      async () => {
+    try {
+      const res = await ReportsCutoverService.getDashboardOverview({}, async () => {
         calledMysql = true;
         return { totalRevenue: 10000, occupancyRate: 50, fromMysql: true };
-      }
-    );
-    assert.strictEqual(calledMysql, true);
-    assert.strictEqual(res.source, 'MYSQL_FALLBACK');
+      });
+      assert.strictEqual(calledMysql, false);
+      assert.strictEqual(res.source, 'FIRESTORE');
+    } finally {
+      process.env.USE_FIRESTORE_REPORTS = prevFlag;
+    }
   });
 
-  await runTest('7.4 Firestore malformed response triggers safe MySQL fallback', async () => {
+  await runTest('7.2 ReportsCutoverService serves strictly from Firestore when Reports serving flag is true', async () => {
+    const prevFlag = process.env.USE_FIRESTORE_REPORTS;
     process.env.USE_FIRESTORE_REPORTS = 'true';
     let calledMysql = false;
-    const res = await ReportsCutoverService.executeReport({
-      domain: 'test_malformed',
-      params: {},
-      firestoreFn: async () => ({ invalidField: true }), // fails validateFn
-      mysqlFallbackFn: async () => {
+    try {
+      const res = await ReportsCutoverService.getDashboardOverview({}, async () => {
         calledMysql = true;
-        return { validField: true, fromMysql: true };
-      },
-      validateFn: r => r && r.validField === true
-    });
-    assert.strictEqual(calledMysql, true);
-    assert.strictEqual(res.source, 'MYSQL_FALLBACK');
+        return { totalRevenue: 10000, occupancyRate: 50, fromMysql: true };
+      });
+      assert.strictEqual(calledMysql, false);
+      assert.strictEqual(res.source, 'FIRESTORE');
+    } finally {
+      process.env.USE_FIRESTORE_REPORTS = prevFlag;
+    }
   });
 
-  await runTest('7.5 MySQL fallback failure throws formatted error', async () => {
+  await runTest('7.3 Firestore timeout fails closed without invoking MySQL fallback', async () => {
+    const prevFlag = process.env.USE_FIRESTORE_REPORTS;
+    process.env.USE_FIRESTORE_REPORTS = 'true';
+    let calledMysql = false;
+    let timeoutThrew = false;
+    try {
+      await ReportsCutoverService.getDashboardOverview(
+        { timeoutMs: 0, businessDate: '2099-01-01' },
+        async () => {
+          calledMysql = true;
+          return { totalRevenue: 10000, occupancyRate: 50, fromMysql: true };
+        }
+      );
+    } catch (err) {
+      if (err.code === 'FIRESTORE_TIMEOUT' || (err.message && err.message.includes('FIRESTORE_TIMEOUT'))) {
+        timeoutThrew = true;
+      }
+    } finally {
+      process.env.USE_FIRESTORE_REPORTS = prevFlag;
+    }
+    assert.strictEqual(calledMysql, false);
+    assert.strictEqual(timeoutThrew, true);
+  });
+
+  await runTest('7.4 Malformed Firestore report response fails closed without invoking MySQL fallback', async () => {
+    const prevFlag = process.env.USE_FIRESTORE_REPORTS;
+    process.env.USE_FIRESTORE_REPORTS = 'true';
+    let calledMysql = false;
+    let malformedThrew = false;
+    try {
+      await ReportsCutoverService.executeReport({
+        domain: 'test_malformed',
+        params: {},
+        firestoreFn: async () => ({ invalidField: true }), // fails validateFn
+        mysqlFallbackFn: async () => {
+          calledMysql = true;
+          return { validField: true, fromMysql: true };
+        },
+        validateFn: r => r && r.validField === true
+      });
+    } catch (err) {
+      if (err.message && err.message.includes('MALFORMED_FIRESTORE_RESPONSE')) {
+        malformedThrew = true;
+      }
+    } finally {
+      process.env.USE_FIRESTORE_REPORTS = prevFlag;
+    }
+    assert.strictEqual(calledMysql, false);
+    assert.strictEqual(malformedThrew, true);
+  });
+
+  await runTest('7.5 Firestore infrastructure failure fails closed without invoking MySQL', async () => {
+    const prevFlag = process.env.USE_FIRESTORE_REPORTS;
+    process.env.USE_FIRESTORE_REPORTS = 'true';
+    let calledMysql = false;
     let threw = false;
     try {
       await ReportsCutoverService.executeReport({
         domain: 'test_fatal',
         params: {},
         firestoreFn: async () => { throw new Error('FS_FAILED'); },
-        mysqlFallbackFn: async () => { throw new Error('MYSQL_DOWN'); }
+        mysqlFallbackFn: async () => {
+          calledMysql = true;
+          throw new Error('MYSQL_DOWN');
+        }
       });
     } catch (err) {
       threw = true;
-      assert.strictEqual(err.message, 'MYSQL_DOWN');
+      assert.strictEqual(err.message, 'FS_FAILED');
+    } finally {
+      process.env.USE_FIRESTORE_REPORTS = prevFlag;
     }
+    assert.strictEqual(calledMysql, false);
     assert.strictEqual(threw, true);
   });
 
@@ -616,21 +673,33 @@ async function main() {
     assert.strictEqual(cancel.lostAmount, 2500);
   });
 
-  // Cleanup test documents
-  try {
-    await db.collection('rooms').doc(`room_${testRoom1}`).delete();
-    await db.collection('rooms').doc(`room_${testRoom2}`).delete();
-    await db.collection('payments').doc(`pay_test_${ts}_1`).delete();
-    await db.collection('payments').doc(`pay_test_${ts}_2`).delete();
-    await db.collection('payments').doc(`pay_test_${ts}_3`).delete();
-    await db.collection('bookings').doc(`bkg_test_${ts}_1`).delete();
-    await db.collection('bookings').doc(`bkg_test_${ts}_2`).delete();
-    await db.collection('bookings').doc(`bkg_test_${ts}_3`).delete();
-    await db.collection('bookings').doc(`bkg_test_${ts}_4`).delete();
-    await db.collection('guests').doc(`guest_test_${ts}_1`).delete();
-    await db.collection('guests').doc(`guest_test_${ts}_2`).delete();
-  } catch (cleanErr) {
-    // Ignore cleanup error if quota is low
+  } finally {
+    // Guaranteed cleanup of all tracked test fixtures
+    console.log('\n--- EXECUTING GUARANTEED FIXTURE CLEANUP ---');
+    let cleanupAttempts = 0;
+    let cleanupSuccess = 0;
+    let cleanupFailures = 0;
+
+    if (db) {
+      for (const item of fixturesToClean) {
+        cleanupAttempts++;
+        try {
+          await db.collection(item.collection).doc(item.docId).delete();
+          cleanupSuccess++;
+        } catch (cleanErr) {
+          cleanupFailures++;
+          console.warn(`[Cleanup Warning] Failed to delete ${item.collection}/${item.docId}:`, cleanErr.message);
+        }
+      }
+    }
+
+    console.log('\n===============================================================');
+    console.log('CLEANUP SUMMARY:');
+    console.log(`  CREATED FIXTURES : ${fixturesToClean.length}`);
+    console.log(`  CLEANUP ATTEMPTS : ${cleanupAttempts}`);
+    console.log(`  CLEANUP SUCCESS  : ${cleanupSuccess}`);
+    console.log(`  CLEANUP FAILURES : ${cleanupFailures}`);
+    console.log('===============================================================');
   }
 
   console.log('\n===============================================================');

@@ -1,187 +1,277 @@
-import pool from '../db.js';
-import { isFirebaseConfigured } from '../config/firebaseAdmin.js';
-import { createRoomType, updateRoomType, deleteRoomType } from '../controllers/roomTypeController.js';
-import { processOutboxBatch } from '../services/outboxWorker.js';
-import { enqueue, claimNextBatch, markProcessed } from '../services/outboxService.js';
-import { dispatchEvent } from '../services/outboxDispatcher.js';
-import { getRoomTypeByIdFirestore, deleteRoomTypeFirestore } from '../repositories/firestore/roomTypesRepository.js';
+/**
+ * backend/tests/testRoomTypeDualWritePilot.mjs
+ * ─────────────────────────────────────────────────────────────────────────────
+ * HPMS Native Firestore Room Types Master Data Regression Test Suite.
+ *
+ * Fully modernized for current production architecture:
+ * - Direct Firestore cutover authority (USE_FIRESTORE_ROOM_TYPES=true)
+ * - Decommissioned MySQL outbox and dual-write infrastructure
+ * - Fail-closed error handling (DISABLE_MYSQL_CUTOVER_FALLBACKS=true)
+ * - Guaranteed scoped fixture tracking and cleanup
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
 
-async function runRoomTypePilotTests() {
+import assert from 'assert';
+import { db as firestoreDb } from '../config/firebaseAdmin.js';
+import {
+  isFirestoreRoomTypesEnabled,
+  isMysqlCutoverFallbacksDisabled,
+  isFirestoreOutboxWorkerEnabled
+} from '../config/featureFlags.js';
+import { RoomTypeCutoverService } from '../services/roomTypeCutoverService.js';
+import {
+  getRoomTypeByIdFirestore,
+  getRoomTypeByCodeFirestore,
+  getAllRoomTypesFirestore,
+  createRoomTypeFirestore,
+  updateRoomTypeFirestore,
+  deleteRoomTypeFirestore
+} from '../repositories/firestore/roomTypesRepository.js';
+
+let passed = 0;
+let failed = 0;
+let total = 0;
+
+function report(name, ok, msg = '') {
+  total++;
+  if (ok) {
+    passed++;
+    console.log(`  ✓ [TEST ${total}] ${name}`);
+  } else {
+    failed++;
+    console.error(`  ✗ [TEST ${total}] ${name} — ${msg}`);
+  }
+}
+
+async function runRoomTypeRegressionTests() {
   console.log('========================================================================');
-  console.log('  HPMS-Sky5 Phase 3B Room Types Dual-Write Pilot Test Suite');
+  console.log('  HPMS Room Types Master Data: Native Firestore Regression Suite');
   console.log('========================================================================\n');
 
-  let passed = 0;
-  let failed = 0;
-
-  function assert(condition, message) {
-    if (condition) {
-      console.log(`  ✓ PASSED: ${message}`);
-      passed++;
-    } else {
-      console.error(`  ✕ FAILED: ${message}`);
-      failed++;
-    }
-  }
-
-  const timestamp = Date.now();
-  const rand = Math.random().toString(36).substring(2, 7);
-  const testCode = `P3B_${rand.toUpperCase()}`;
-  const testName = `Phase 3B Pilot Suite ${rand}`;
-  let conn;
-
-  // Mock res object
-  function createMockRes() {
-    return {
-      statusCode: 200,
-      jsonData: null,
-      status(code) {
-        this.statusCode = code;
-        return this;
-      },
-      json(data) {
-        this.jsonData = data;
-        return this;
-      }
-    };
-  }
+  const rand = Math.random().toString(36).substring(2, 7).toUpperCase();
+  const testCode = `RT_P3B_${rand}`;
+  const testName = `Phase 3B Suite Room ${rand}`;
+  const fixturesToClean = [];
 
   try {
-    conn = await pool.getConnection();
-
-    // Enable feature flag dynamically for test suite context
-    process.env.ENABLE_FIRESTORE_DUAL_WRITE = 'true';
-
-    // Scenario A: MySQL Write Succeeds + Outbox Event Enqueued
-    console.log('--- Scenario A: Room Type Creation + Outbox Staging ---');
-    const reqCreate = {
-      body: { code: testCode, title: testName, description: 'Pilot room type', base_rate: 7500 }
-    };
-    const resCreate = createMockRes();
-
-    await createRoomType(reqCreate, resCreate);
-    assert(resCreate.statusCode === 201 && resCreate.jsonData.id, 'createRoomType returned 201 with insertId');
-    const createdId = resCreate.jsonData.id;
-
-    const [outboxRowsA] = await conn.query(
-      `SELECT * FROM dual_write_outbox WHERE aggregate_type = 'ROOM_TYPE' AND aggregate_id = ?`,
-      [testCode]
+    // ─────────────────────────────────────────────────────────────────────────
+    // 1. Production Architecture & Feature Flag Invariants
+    // ─────────────────────────────────────────────────────────────────────────
+    console.log('--- SECTION 1: Production Architecture & Feature Flags ---');
+    report(
+      '1.1 Firestore room types serving is enabled',
+      isFirestoreRoomTypesEnabled() === true,
+      'USE_FIRESTORE_ROOM_TYPES must be enabled'
     );
-    assert(outboxRowsA.length > 0 && outboxRowsA[0].event_type === 'ROOM_TYPE_CREATED', 'Outbox event ROOM_TYPE_CREATED staged in MySQL transaction');
+    report(
+      '1.2 MySQL cutover fallbacks are strictly disabled (Fail-Closed)',
+      isMysqlCutoverFallbacksDisabled() === true,
+      'DISABLE_MYSQL_CUTOVER_FALLBACKS must be true'
+    );
+    report(
+      '1.3 MySQL outbox worker daemon is decommissioned/disabled',
+      isFirestoreOutboxWorkerEnabled() === false,
+      'ENABLE_FIRESTORE_OUTBOX_WORKER must be false'
+    );
 
-    // Scenario B: MySQL Rollback (Simulated failure)
-    console.log('\n--- Scenario B: MySQL Transaction Rollback ---');
+    // ─────────────────────────────────────────────────────────────────────────
+    // 2. Direct Firestore Room Type Creation
+    // ─────────────────────────────────────────────────────────────────────────
+    console.log('\n--- SECTION 2: Room Type Creation & Shape Validation ---');
+    
+    // Pre-register all expected fixture ID variants for guaranteed cleanup
+    fixturesToClean.push({ collection: 'room_types', docId: `type_${testCode}` });
+    fixturesToClean.push({ collection: 'room_types', docId: testCode });
+    fixturesToClean.push({ collection: 'room_types', docId: `type_${testCode.toLowerCase()}` });
+
+    const createPayload = {
+      code: testCode,
+      name: testName,
+      title: testName,
+      description: 'Native Firestore regression test room type',
+      base_rate: 4500.00
+    };
+
+    const createResult = await RoomTypeCutoverService.createRoomType(createPayload);
+    report(
+      '2.1 createRoomType succeeds and returns expected schema',
+      createResult && createResult.success === true && createResult.code === testCode && createResult.base_rate === 4500,
+      `Received: ${JSON.stringify(createResult)}`
+    );
+
+    if (createResult?.id) {
+      fixturesToClean.push({ collection: 'room_types', docId: String(createResult.id) });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 3. Retrieval via Service & Repository Layers
+    // ─────────────────────────────────────────────────────────────────────────
+    console.log('\n--- SECTION 3: Room Type Retrieval ---');
+    const fetchedById = await RoomTypeCutoverService.getRoomTypeById(testCode);
+    report(
+      '3.1 getRoomTypeById retrieves document by code',
+      fetchedById !== null && fetchedById.code === testCode && fetchedById.name === testName && fetchedById.base_rate === 4500,
+      `Fetched: ${JSON.stringify(fetchedById)}`
+    );
+
+    const directRepoDoc = await getRoomTypeByIdFirestore(`type_${testCode}`);
+    report(
+      '3.2 Direct repository lookup returns exact persisted document',
+      directRepoDoc !== null && directRepoDoc.code === testCode,
+      `Direct Doc: ${JSON.stringify(directRepoDoc)}`
+    );
+
+    const allRoomTypes = await RoomTypeCutoverService.getRoomTypes();
+    const foundInList = Array.isArray(allRoomTypes) && allRoomTypes.some(r => r.code === testCode);
+    report(
+      '3.3 getRoomTypes includes newly created test fixture',
+      foundInList === true,
+      `Total returned room types: ${Array.isArray(allRoomTypes) ? allRoomTypes.length : 'none'}`
+    );
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 4. Duplicate Handling
+    // ─────────────────────────────────────────────────────────────────────────
+    console.log('\n--- SECTION 4: Duplicate Code & Conflict Handling ---');
+    let duplicateRejected = false;
+    let duplicateErrorCode = null;
     try {
-      await conn.beginTransaction();
-      await conn.query('INSERT INTO room_types (code, title, base_rate) VALUES (?, ?, ?)', ['FAIL_CODE', 'Fail Title', 1000]);
-      await enqueue(conn, {
-        event_type: 'ROOM_TYPE_CREATED',
-        aggregate_type: 'ROOM_TYPE',
-        aggregate_id: 'FAIL_CODE',
-        payload: { code: 'FAIL_CODE', title: 'Fail Title', base_rate: 1000 }
+      await RoomTypeCutoverService.createRoomType({
+        code: testCode,
+        name: `${testName} Duplicate`,
+        base_rate: 5000.00
       });
-      await conn.rollback(); // Rollback simulation
-      assert(true, 'Rolled back MySQL transaction');
-    } catch (e) {
-      if (conn) await conn.rollback();
+    } catch (dupErr) {
+      duplicateRejected = true;
+      duplicateErrorCode = dupErr.code || dupErr.status;
     }
+    report(
+      '4.1 Duplicate room type code is rejected with DUPLICATE_KEY / 400',
+      duplicateRejected === true && (duplicateErrorCode === 'DUPLICATE_KEY' || duplicateErrorCode === 400 || duplicateErrorCode === 409),
+      `ErrorCode: ${duplicateErrorCode}`
+    );
 
-    const [failRows] = await conn.query(`SELECT * FROM dual_write_outbox WHERE aggregate_id = 'FAIL_CODE'`);
-    assert(failRows.length === 0, 'Zero outbox rows exist for rolled back transaction');
-
-    // Scenario C & D: Outbox Dispatch to Firestore
-    console.log('\n--- Scenario C & D: Asynchronous Worker Processing to Firestore ---');
-    if (isFirebaseConfigured) {
-      const batchResult = await processOutboxBatch(10, 5);
-      assert(batchResult.processed > 0, 'Outbox worker processed pending ROOM_TYPE_CREATED event');
-
-      const firestoreDoc = await getRoomTypeByIdFirestore(`type_${testCode}`);
-      assert(firestoreDoc && firestoreDoc.code === testCode && firestoreDoc.base_rate === 7500, 'Firestore room_types document synchronized successfully');
-    } else {
-      console.log('  ~ Firebase not configured, skipped live Firestore dispatch assertion.');
+    // ─────────────────────────────────────────────────────────────────────────
+    // 5. Invalid Input / Validation
+    // ─────────────────────────────────────────────────────────────────────────
+    console.log('\n--- SECTION 5: Business Validation on Invalid Input ---');
+    let invalidInputRejected = false;
+    try {
+      await createRoomTypeFirestore({
+        code: `INVALID_${rand}`,
+        // Missing required 'name' and 'base_rate'
+        description: 'Missing required fields'
+      });
+    } catch (valErr) {
+      invalidInputRejected = true;
     }
+    report(
+      '5.1 Missing required fields rejected by repository schema validation',
+      invalidInputRejected === true
+    );
 
-    // Scenario E: Idempotency Replay Test
-    console.log('\n--- Scenario E: Idempotency Replay ---');
-    if (isFirebaseConfigured) {
-      const mockEvent = {
-        event_type: 'ROOM_TYPE_CREATED',
-        payload: { code: testCode, title: testName, base_rate: 7500, mysql_room_type_id: createdId }
-      };
-      // Re-dispatching exact same event should not throw or duplicate
-      await dispatchEvent(mockEvent);
-      const firestoreDocReplay = await getRoomTypeByIdFirestore(`type_${testCode}`);
-      assert(firestoreDocReplay && firestoreDocReplay.code === testCode, 'Idempotent re-dispatch preserved document without duplicates');
-    }
+    // ─────────────────────────────────────────────────────────────────────────
+    // 6. Sequential Updates
+    // ─────────────────────────────────────────────────────────────────────────
+    console.log('\n--- SECTION 6: Sequential Updates & State Convergence ---');
+    const update1 = await RoomTypeCutoverService.updateRoomType(testCode, {
+      name: `${testName} V2`,
+      description: 'Updated Description V2',
+      base_rate: 5200.00
+    });
+    report(
+      '6.1 Update V1 modifies name, description, and base_rate',
+      update1 && update1.success === true && update1.base_rate === 5200
+    );
 
-    // Scenario G: Sequential Updates (Created -> Updated -> Updated Again)
-    console.log('\n--- Scenario G: Room Type Sequential Updates ---');
-    const reqUpdate1 = { params: { id: createdId }, body: { title: `${testName} V2`, base_rate: 8000 } };
-    const resUpdate1 = createMockRes();
-    await updateRoomType(reqUpdate1, resUpdate1);
-    assert(resUpdate1.statusCode === 200, 'updateRoomType V1 returned 200');
+    const update2 = await RoomTypeCutoverService.updateRoomType(testCode, {
+      name: `${testName} V3`,
+      description: 'Updated Description V3',
+      base_rate: 5800.00
+    });
+    report(
+      '6.2 Update V2 modifies state again to final authoritative values',
+      update2 && update2.success === true && update2.base_rate === 5800
+    );
 
-    const reqUpdate2 = { params: { id: createdId }, body: { title: `${testName} V3`, base_rate: 8500 } };
-    const resUpdate2 = createMockRes();
-    await updateRoomType(reqUpdate2, resUpdate2);
-    assert(resUpdate2.statusCode === 200, 'updateRoomType V2 returned 200');
+    const fetchedAfterUpdates = await RoomTypeCutoverService.getRoomTypeById(testCode);
+    report(
+      '6.3 getRoomTypeById reflects latest authoritative values (V3 / 5800)',
+      fetchedAfterUpdates !== null && fetchedAfterUpdates.name === `${testName} V3` && fetchedAfterUpdates.base_rate === 5800
+    );
 
-    if (isFirebaseConfigured) {
-      await processOutboxBatch(10, 5);
-      const updatedDoc = await getRoomTypeByIdFirestore(`type_${testCode}`);
-      assert(updatedDoc && updatedDoc.name === `${testName} V3` && updatedDoc.base_rate === 8500, 'Sequential updates synchronized final state to Firestore');
-    }
+    // ─────────────────────────────────────────────────────────────────────────
+    // 7. Deletion & 404 Lifecycle
+    // ─────────────────────────────────────────────────────────────────────────
+    console.log('\n--- SECTION 7: Deletion Lifecycle ---');
+    const deleteRes = await RoomTypeCutoverService.deleteRoomType(testCode);
+    report(
+      '7.1 deleteRoomType removes document cleanly',
+      deleteRes && deleteRes.success === true
+    );
 
-    // Scenario H: Room Type Deletion
-    console.log('\n--- Scenario H: Room Type Deletion ---');
-    const reqDelete = { params: { id: createdId } };
-    const resDelete = createMockRes();
-    await deleteRoomType(reqDelete, resDelete);
-    assert(resDelete.statusCode === 200, 'deleteRoomType returned 200');
+    const fetchedAfterDelete = await RoomTypeCutoverService.getRoomTypeById(testCode);
+    report(
+      '7.2 getRoomTypeById returns null for deleted document',
+      fetchedAfterDelete === null
+    );
 
-    if (isFirebaseConfigured) {
-      await processOutboxBatch(10, 5);
-      const deletedDoc = await getRoomTypeByIdFirestore(`type_${testCode}`);
-      assert(deletedDoc === null, 'Firestore room_types document deleted cleanly');
-    }
-
-    // Scenario I: Read-Only Reconciliation Audit
-    console.log('\n--- Scenario I: Read-Only Reconciliation Audit ---');
-    const [mysqlTypes] = await conn.query('SELECT COUNT(*) as cnt FROM room_types');
-    assert(typeof mysqlTypes[0].cnt === 'number', `MySQL room_types total records: ${mysqlTypes[0].cnt}`);
-
-    // CLEANUP
-    console.log('\n--- CLEANUP PHASE ---');
-    await conn.query(`DELETE FROM room_types WHERE code = ?`, [testCode]);
-    await conn.query(`DELETE FROM dual_write_outbox WHERE aggregate_id = ?`, [testCode]);
-    assert(true, 'Cleaned up MySQL test room type and outbox events');
-
-    if (isFirebaseConfigured) {
-      await deleteRoomTypeFirestore(`type_${testCode}`).catch(() => {});
-      console.log('  ✓ Cleaned up test Firestore room_type document.');
-    }
-
-  } catch (err) {
-    console.error('Unhandled Error during Room Type Pilot test:', err);
-    failed++;
-  } finally {
-    process.env.ENABLE_FIRESTORE_DUAL_WRITE = 'false';
-    if (testCode) {
-      try {
-        const cleanupConn = await pool.getConnection();
-        await cleanupConn.query(`DELETE FROM room_types WHERE code = ?`, [testCode]);
-        await cleanupConn.query(`DELETE FROM dual_write_outbox WHERE aggregate_id = ?`, [testCode]);
-        cleanupConn.release();
-      } catch (e) {}
-      if (isFirebaseConfigured) {
-        await deleteRoomTypeFirestore(`type_${testCode}`).catch(() => {});
+    let secondDeleteThrew404 = false;
+    try {
+      await RoomTypeCutoverService.deleteRoomType(testCode);
+    } catch (delErr) {
+      if (delErr.status === 404 || delErr.message.includes('not found') || delErr.message.includes('Room type not found')) {
+        secondDeleteThrew404 = true;
       }
     }
-    if (conn) conn.release();
+    report(
+      '7.3 Second deletion attempt throws 404 Not Found',
+      secondDeleteThrew404 === true
+    );
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 8. Fail-Closed & Non-Existent Lookups
+    // ─────────────────────────────────────────────────────────────────────────
+    console.log('\n--- SECTION 8: Fail-Closed & Non-Existent Entity Safety ---');
+    const nonExistentLookup = await RoomTypeCutoverService.getRoomTypeById(`NON_EXISTENT_RT_${rand}`);
+    report(
+      '8.1 Non-existent room type lookup returns null safely without throwing',
+      nonExistentLookup === null
+    );
+
+  } catch (err) {
+    console.error('Unhandled Error during Room Type regression test:', err);
+    failed++;
+  } finally {
+    console.log('\n--- EXECUTING GUARANTEED FIXTURE CLEANUP ---');
+    let cleanupAttempts = 0;
+    let cleanupSuccess = 0;
+    let cleanupFailures = 0;
+
+    if (firestoreDb) {
+      for (const item of fixturesToClean) {
+        cleanupAttempts++;
+        try {
+          await firestoreDb.collection(item.collection).doc(item.docId).delete();
+          cleanupSuccess++;
+        } catch (cleanErr) {
+          cleanupFailures++;
+          console.warn(`[Cleanup Warning] Failed to delete ${item.collection}/${item.docId}:`, cleanErr.message);
+        }
+      }
+    }
+
+    console.log('\n===============================================================');
+    console.log('CLEANUP SUMMARY:');
+    console.log(`  CREATED FIXTURES : ${fixturesToClean.length}`);
+    console.log(`  CLEANUP ATTEMPTS : ${cleanupAttempts}`);
+    console.log(`  CLEANUP SUCCESS  : ${cleanupSuccess}`);
+    console.log(`  CLEANUP FAILURES : ${cleanupFailures}`);
+    console.log('===============================================================');
   }
 
   console.log('\n========================================================================');
-  console.log(`  Phase 3B Room Type Pilot Test Results: ${passed} PASSED, ${failed} FAILED`);
+  console.log(`  Room Types Regression Test Results: ${passed} PASSED, ${failed} FAILED (Total: ${total})`);
   console.log('========================================================================\n');
 
   if (failed > 0) {
@@ -189,4 +279,7 @@ async function runRoomTypePilotTests() {
   }
 }
 
-runRoomTypePilotTests();
+runRoomTypeRegressionTests().catch(err => {
+  console.error('Fatal room type regression test error:', err);
+  process.exit(1);
+});

@@ -122,7 +122,7 @@ export default function AuthCard({ isAdmin = false, initialIsSignUp = false, onA
         }
         // Phase 3 Step 3C: When Firebase-only staff login is enabled, do NOT fall through
         // to the legacy MySQL /api/auth/signin endpoint for staff. Show the Firebase error directly.
-        const isFirebaseStaffLoginEnabled = import.meta.env?.VITE_ENABLE_FIREBASE_STAFF_LOGIN === 'true';
+        const isFirebaseStaffLoginEnabled = import.meta.env?.VITE_ENABLE_FIREBASE_STAFF_LOGIN !== 'false';
         if (isFirebaseStaffLoginEnabled) {
           const friendlyError = mapFirebaseAuthError(fbErr);
           showAlert(friendlyError, 'Authentication Error');

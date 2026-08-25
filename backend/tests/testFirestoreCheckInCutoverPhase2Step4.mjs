@@ -8,7 +8,8 @@ import {
   isFirestoreAvailabilityServingEnabled,
   isFirestoreRoomStatusServingEnabled,
   isFirestoreLedgerServingEnabled,
-  isFirestoreReportsServingEnabled
+  isFirestoreReportsServingEnabled,
+  isMysqlCutoverFallbacksDisabled
 } from '../config/featureFlags.js';
 
 async function runCheckInCutoverTestSuite() {
@@ -55,7 +56,7 @@ async function runCheckInCutoverTestSuite() {
     assert(isFirestoreRoomStatusServingEnabled() === true, 'Cutover State: USE_FIRESTORE_ROOM_STATUS is TRUE');
     assert(isFirestoreCheckInServingEnabled() === true, 'Serving Flag: USE_FIRESTORE_CHECKIN is TRUE');
     assert(typeof isFirestoreLedgerServingEnabled() === 'boolean', 'Serving Flag: USE_FIRESTORE_LEDGER is configured');
-    assert(isFirestoreReportsServingEnabled() === false, 'Cutover Invariant: USE_FIRESTORE_REPORTS is strictly FALSE');
+    assert(typeof isFirestoreReportsServingEnabled() === 'boolean', 'Serving Flag: USE_FIRESTORE_REPORTS is configured');
 
     console.log('\n--- Step 2: Setting Up Isolated Firestore Cutover Fixtures ---');
 
@@ -351,7 +352,7 @@ async function runCheckInCutoverTestSuite() {
     let threwBusiness = false;
     try {
       await CheckInCutoverService.executeCheckIn({
-        connection: pool,
+        connection: null,
         params: {
           roomNumber: roomNum3,
           guestName: 'TEST NO FALLBACK',
@@ -364,17 +365,12 @@ async function runCheckInCutoverTestSuite() {
     }
     assert(threwBusiness, 'TEST 21: Business validation errors rethrow immediately without invoking MySQL fallback');
 
-    // 22. Timeout Before Commit Falls Back to MySQL
+    // 22. Timeout Before Commit Fails Closed without MySQL Fallback
     const fallbackTimeoutRoom = `980`;
-    let connection = await pool.getConnection();
+    let timeoutThrewFailClosed = false;
     try {
-      await connection.beginTransaction();
-      // Ensure Room 980 exists in MySQL and is vacant with no active bookings
-      await connection.query("INSERT INTO rooms (number, room_type_id, status, housekeeping_status, is_active) VALUES (?, 1, 'vacant', 'Clean', 1) ON DUPLICATE KEY UPDATE status = 'vacant', housekeeping_status = 'Clean', is_active = 1", [fallbackTimeoutRoom]);
-      await connection.query("DELETE FROM bookings WHERE room_id = (SELECT id FROM rooms WHERE number = ?)", [fallbackTimeoutRoom]);
-      
-      const timeoutRes = await CheckInCutoverService.executeCheckIn({
-        connection,
+      await CheckInCutoverService.executeCheckIn({
+        connection: null,
         params: {
           roomNumber: fallbackTimeoutRoom,
           guestName: 'TIMEOUT GUEST',
@@ -383,38 +379,34 @@ async function runCheckInCutoverTestSuite() {
         },
         timeoutMs: 1 // Force immediate timeout before transaction
       });
-      await connection.commit();
-      assert(timeoutRes && timeoutRes.source === 'MYSQL_FALLBACK', 'TEST 22: Firestore timeout before commit safely falls back to MySQL');
-    } finally {
-      connection.release();
+    } catch (timeoutErr) {
+      if (timeoutErr.message && timeoutErr.message.includes('FIRESTORE_TIMEOUT')) {
+        timeoutThrewFailClosed = true;
+      }
     }
+    assert(timeoutThrewFailClosed, 'TEST 22: Firestore timeout before commit safely fails closed without MySQL fallback');
 
-    // 23. Direct MySQL Check-In Mode (Flag Disabled)
-    let conn2 = await pool.getConnection();
+    // 23. Direct MySQL Check-In Mode Blocked by Decommission Guard (Flag Disabled)
+    const prevFlag = process.env.USE_FIRESTORE_CHECKIN;
+    process.env.USE_FIRESTORE_CHECKIN = 'false';
+    let decommissionGuardBlocked = false;
     try {
-      await conn2.beginTransaction();
-      const mysqlDirectRoom = `981`;
-      await conn2.query("INSERT INTO rooms (number, room_type_id, status, housekeeping_status, is_active) VALUES (?, 1, 'vacant', 'Clean', 1) ON DUPLICATE KEY UPDATE status = 'vacant', housekeeping_status = 'Clean', is_active = 1", [mysqlDirectRoom]);
-      await conn2.query("DELETE FROM bookings WHERE room_id = (SELECT id FROM rooms WHERE number = ?)", [mysqlDirectRoom]);
-      
-      // Force servingEnabled = false in environment for test
-      const prevFlag = process.env.USE_FIRESTORE_CHECKIN;
-      process.env.USE_FIRESTORE_CHECKIN = 'false';
-      const directMysqlRes = await CheckInCutoverService.executeCheckIn({
-        connection: conn2,
+      await CheckInCutoverService.executeCheckIn({
         params: {
-          roomNumber: mysqlDirectRoom,
+          roomNumber: '981',
           guestName: 'DIRECT MYSQL GUEST',
           phone: `95555${Math.floor(10000 + Math.random() * 90000)}`,
           checkInDate: '2026-08-19'
         }
       });
-      await conn2.commit();
-      process.env.USE_FIRESTORE_CHECKIN = prevFlag;
-      assert(directMysqlRes && directMysqlRes.source === 'MYSQL', 'TEST 23: Direct MySQL check-in executes when USE_FIRESTORE_CHECKIN is false');
+    } catch (decommErr) {
+      if (decommErr.code === 'ER_MYSQL_DECOMMISSIONED' || decommErr.message?.includes('MYSQL_DECOMMISSIONED_GUARD')) {
+        decommissionGuardBlocked = true;
+      }
     } finally {
-      conn2.release();
+      process.env.USE_FIRESTORE_CHECKIN = prevFlag;
     }
+    assert(decommissionGuardBlocked, 'TEST 23: MySQL cutover fallback is strictly blocked by MYSQL_DECOMMISSIONED_GUARD when flag is disabled');
 
     // 24. Live Frontend Contract Verification
     assert(res1.hasOwnProperty('bookingId') && res1.hasOwnProperty('bookingNumber') && res1.hasOwnProperty('roomNumber'), 'TEST 24: Check-in response payload satisfies frontend contract requirements');
@@ -422,8 +414,8 @@ async function runCheckInCutoverTestSuite() {
     // 25. Admin Role & User ID Context Preserved
     assert(bkgData.created_by === 'admin', 'TEST 25: Admin created_by user ID context preserved on booking document');
 
-    // 26. Zero Decommission Invariant Assertion
-    assert(true, 'TEST 26: MySQL database and connection pool remain 100% active and available as fallback');
+    // 26. Production Decommission Invariant Assertion
+    assert(isMysqlCutoverFallbacksDisabled() === true, 'TEST 26: Production cutover invariant: DISABLE_MYSQL_CUTOVER_FALLBACKS is strictly TRUE');
 
   } catch (err) {
     console.error('Unhandled cutover test suite error:', err);

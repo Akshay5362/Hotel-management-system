@@ -12,7 +12,7 @@ import pool from '../db.js';
 import { db, auth, isFirebaseConfigured } from '../config/firebaseAdmin.js';
 import bcrypt from 'bcryptjs';
 import { generateToken } from './authController.js';
-import { isStaffReadCanaryEnabled, isFirebaseOnlyStaffResolutionEnabled, isFirebaseStaffLoginEnabled } from '../config/featureFlags.js';
+import { isStaffReadCanaryEnabled, isFirebaseOnlyStaffResolutionEnabled, isFirebaseStaffLoginEnabled, isMysqlCutoverFallbacksDisabled } from '../config/featureFlags.js';
 import { StaffCutoverService } from '../services/staffCutoverService.js';
 
 export async function syncStaffFirebaseClaims(staff) {
@@ -116,7 +116,7 @@ function sanitize(staff) {
  */
 export const staffLogin = async (req, res) => {
   // ── Phase 3 Step 3C: Firebase-Only Staff Login Guard ────────────────────────
-  if (isFirebaseStaffLoginEnabled()) {
+  if (isFirebaseStaffLoginEnabled() || isMysqlCutoverFallbacksDisabled()) {
     return res.status(401).json({
       error: 'Staff login via email/password is disabled. Please use Firebase Authentication to obtain an ID token.',
       code: 'FIREBASE_LOGIN_REQUIRED',

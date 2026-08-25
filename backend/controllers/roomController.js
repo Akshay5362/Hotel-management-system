@@ -2576,6 +2576,10 @@ export const getPublicRooms = async (req, res) => {
     console.warn('[getPublicRooms] Firestore error, attempting fallback:', fsErr.message);
   }
 
+  if (process.env.DISABLE_MYSQL_CUTOVER_FALLBACKS === 'true') {
+    return res.status(500).json({ error: 'Failed to load public rooms from database.' });
+  }
+
   // Fallback MySQL read path
   let connection;
   try {
@@ -2674,6 +2678,7 @@ export const updateRoomStatus = async (req, res) => {
       is_active: newIsActive,
       status: newStatus,
       housekeeping_status: newHkStatus,
+      cleaning_status: newHkStatus,
       updated_at: new Date().toISOString()
     });
 
@@ -2713,7 +2718,15 @@ export const updateRoomStatus = async (req, res) => {
       }
     }
 
-    return res.json({ message: logDetail });
+    const { invalidateRoomStatusCache } = await import('../services/firestoreRoomStatusService.js');
+    invalidateRoomStatusCache();
+
+    const updatedRoomData = await getRoomByNumberFirestore(number);
+    return res.json({
+      success: true,
+      message: logDetail,
+      room: updatedRoomData
+    });
   } catch (err) {
     if (err.status === 400 || err.status === 404) {
       return res.status(err.status).json({ error: err.message });

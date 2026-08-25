@@ -237,7 +237,7 @@ export const isFirestoreReservationsServingEnabled = () => {
 };
 
 export const isFirestoreReportsServingEnabled = () => {
-  return process.env.USE_FIRESTORE_REPORTS !== 'false';
+  return process.env.USE_FIRESTORE_REPORTS === 'true';
 };
 
 // ── Phase 3 Step 10 — Audit Logs, Reports & History (Default: FALSE) ──────

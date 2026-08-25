@@ -1,3 +1,13 @@
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Ensure backend .env is loaded immediately
+dotenv.config({ path: path.join(__dirname, '.env') });
+
 import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
@@ -68,10 +78,6 @@ app.use(express.json());
 app.use('/api', apiRouter);
 
 // Serve uploaded documents statically (Admin verification UI needs this)
-import path from 'path';
-import { fileURLToPath } from 'url';
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 app.use('/guest-documents', express.static(path.join(__dirname, 'guest-documents')));
 app.use('/inventory-photos', express.static(path.join(__dirname, 'inventory-photos')));
 
@@ -122,6 +128,15 @@ app.get('/api/diagnostics/read-budget', (req, res) => {
 app.use((err, req, res, next) => {
   console.error('Global Error Handler:', err);
   res.status(500).json({ error: 'Internal Server Error' });
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[Server Fatal] Port ${PORT} is already in use by another process.`);
+  } else {
+    console.error('[Server Fatal] Server listen error:', err);
+  }
+  process.exit(1);
 });
 
 server.listen(PORT, '0.0.0.0', () => {

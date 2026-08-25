@@ -157,7 +157,24 @@ function AppContent() {
   
   // Modal controllers
   const [activeModal, setActiveModal] = useState(null); // 'checkin' | 'checkout' | 'shifting' | 'cash' | 'reports' | null
-  const [selectedRoom, setSelectedRoom] = useState(null);
+  const [selectedRoomNumber, setSelectedRoomNumber] = useState(null);
+
+  // Authoritative live selected room derived continuously from rooms array (Single Source of Truth)
+  const liveSelectedRoom = React.useMemo(() => {
+    if (!selectedRoomNumber) return null;
+    const found = rooms.find(r => String(r.number) === String(selectedRoomNumber) || String(r.id) === String(selectedRoomNumber) || String(r.doc_id) === String(selectedRoomNumber));
+    return found || null;
+  }, [rooms, selectedRoomNumber]);
+
+  const setSelectedRoom = React.useCallback((roomOrNum) => {
+    if (!roomOrNum) {
+      setSelectedRoomNumber(null);
+    } else if (typeof roomOrNum === 'object') {
+      setSelectedRoomNumber(String(roomOrNum.number || roomOrNum.id || ''));
+    } else {
+      setSelectedRoomNumber(String(roomOrNum));
+    }
+  }, []);
 
   // Business context
   const [systemDate, setSystemDate] = useState('11-Jul-2026');
@@ -956,15 +973,15 @@ function AppContent() {
         return;
       }
 
+      const data = await res.json();
+      const updatedRoom = data.room;
+
+      if (updatedRoom) {
+        setRooms(prev => prev.map(r => (String(r.number) === String(roomNumber) || String(r.id) === String(roomNumber)) ? { ...r, ...updatedRoom } : r));
+      }
+
       await fetchStatus();
-      setSelectedRoom(prev => {
-        if (prev && prev.number === roomNumber) {
-          const isAct = action === 'mark_active' ? true : (action === 'mark_inactive' ? false : prev.is_active);
-          const isHk = action === 'mark_clean' ? 'Clean' : (action === 'mark_dirty' ? 'Dirty' : prev.housekeeping_status);
-          return { ...prev, is_active: isAct, housekeeping_status: isHk };
-        }
-        return prev;
-      });
+
       showAlert(`Room ${roomNumber} updated successfully.`, 'Status Updated');
     } catch (err) {
       console.error('Error in handleRoomStatusChange:', err);
@@ -1295,12 +1312,11 @@ function AppContent() {
             staleReason={staleReason}
           />
 
-
           {/* Modals & Dialog Portals */}
           <CheckInModal 
             isOpen={activeModal === 'checkin'}
             onClose={() => { setActiveModal(null); setSelectedRoom(null); }}
-            room={selectedRoom}
+            room={liveSelectedRoom}
             onCheckIn={checkInGuest}
             showAlert={showAlert}
           />
@@ -1308,7 +1324,7 @@ function AppContent() {
           <CheckOutModal 
             isOpen={activeModal === 'checkout'}
             onClose={() => { setActiveModal(null); setSelectedRoom(null); }}
-            room={selectedRoom}
+            room={liveSelectedRoom}
             token={adminToken}
             onCheckOut={checkOutGuest}
             onAddLedgerItem={addLedgerItem}
@@ -1321,7 +1337,7 @@ function AppContent() {
           <ModifyCheckInModal
             isOpen={activeModal === 'modify_checkin'}
             onClose={() => { setActiveModal(null); setSelectedRoom(null); }}
-            room={selectedRoom}
+            room={liveSelectedRoom}
             onModify={modifyCheckInGuest}
             showAlert={showAlert}
           />
@@ -1343,7 +1359,7 @@ function AppContent() {
           <RoomShiftingModal 
             isOpen={activeModal === 'shifting'}
             onClose={() => { setActiveModal(null); setSelectedRoom(null); }}
-            room={selectedRoom}
+            room={liveSelectedRoom}
             vacantRooms={vacantRoomsList}
             onShiftRoom={shiftGuest}
             showAlert={showAlert}
@@ -1365,7 +1381,7 @@ function AppContent() {
 
           <ReportsModal 
             isOpen={activeModal === 'reports'}
-            onClose={() => setActiveModal(null)}
+            onClose={() => setActiveModal(null)} 
             rooms={rooms}
             cashLog={cashLog}
             currentDate={systemDate}
@@ -1382,7 +1398,7 @@ function AppContent() {
           <RefundCheckoutModal
             isOpen={activeModal === 'refund_checkout'}
             onClose={() => setActiveModal('checkout')}
-            room={selectedRoom}
+            room={liveSelectedRoom}
             token={adminToken}
             onRefundComplete={processRefundCheckout}
             showAlert={showAlert}
@@ -1395,7 +1411,7 @@ function AppContent() {
           />
         </div>
         <RoomInspectorDrawer 
-          selectedRoom={selectedRoom} 
+          selectedRoom={liveSelectedRoom} 
           onClose={() => setSelectedRoom(null)}
           onCheckInClick={(room) => { setSelectedRoom(room); setActiveModal('checkin'); }}
           onCheckOutClick={(room) => { setSelectedRoom(room); setActiveModal('checkout'); }}
