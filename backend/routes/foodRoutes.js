@@ -8,6 +8,7 @@
  * Phase 2B — Order Lifecycle, Atomic Billing, Tables & Complimentary.
  * Phase 2C — Kitchen Display System.
  * Phase 2D-B — Order History back-office API.
+ * Phase 2D-C — Reports summary API.
  *
  * Mounted at: /api/food
  * ─────────────────────────────────────────────────────────────────────────────
@@ -42,8 +43,8 @@ import {
   getFoodOrderById
 } from '../controllers/foodOrderController.js';
 
-// ── Phase 2D-B: Order History ─────────────────────────────────────────────────
-import { getOrderHistory } from '../controllers/foodReportsController.js';
+// ── Phase 2D-B: Order History / Phase 2D-C: Reports ───────────────────────────
+import { getOrderHistory, getFoodReportsSummary } from '../controllers/foodReportsController.js';
 
 import {
   placeFoodOrder,
@@ -115,6 +116,9 @@ router.get('/orders/kds',     requireRole('admin', 'receptionist', 'kitchen', 'c
 // Phase 2D-B: must be registered BEFORE /orders/:id to prevent 'history' being
 // matched as an order document ID by Express's wildcard route.
 router.get('/orders/history', requireRole('admin', 'receptionist', 'manager'),         getOrderHistory);
+
+// ── Phase 2D-C: Reports ────────────────────────────────────────────────────────
+router.get('/reports/summary', requireRole('admin', 'receptionist', 'manager'),        getFoodReportsSummary);
 
 router.get('/orders',         requireRole('admin', 'receptionist', 'kitchen', 'chef'), listFoodOrders);
 router.get('/orders/:id',     requireRole('admin', 'receptionist', 'kitchen', 'chef'), getFoodOrderById);

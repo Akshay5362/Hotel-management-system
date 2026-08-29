@@ -14,12 +14,14 @@
  */
 
 import React, { useState } from 'react';
-import { UtensilsCrossed, BookOpen, ShoppingCart, ClipboardList, Layers, Gift, ChefHat } from 'lucide-react';
+import { UtensilsCrossed, BookOpen, ShoppingCart, ClipboardList, Layers, Gift, ChefHat, BarChart3 } from 'lucide-react';
 import FoodMenuManager from './FoodMenuManager';
 import FoodNewOrder from './FoodNewOrder';
 import FoodKitchenDisplay from './FoodKitchenDisplay';
 import FoodTableManager from './FoodTableManager';
 import FoodComplimentaryApproval from './FoodComplimentaryApproval';
+import FoodOrderHistory from './FoodOrderHistory';
+import FoodReports from './FoodReports';
 
 // ── Tab configuration ─────────────────────────────────────────────────────────
 const TABS = [
@@ -68,8 +70,16 @@ const TABS = [
     label: 'Order History',
     icon:  ClipboardList,
     phase: 2,
-    ready: false,
+    ready: true,
     desc:  'Browse past orders and billing records'
+  },
+  {
+    key:   'reports',
+    label: 'Reports',
+    icon:  BarChart3,
+    phase: 2,
+    ready: true,
+    desc:  'Sales, tax, and operational breakdowns'
   }
 ];
 
@@ -154,7 +164,7 @@ export default function FoodPOS({ token, user }) {
           color:        '#38bdf8',
           fontWeight:   '600'
         }}>
-          Phase 1 + 2B + 2C — Active
+          Phase 1 + 2B + 2C + 2D-B + 2D-C — Active
         </div>
       </div>
 
@@ -227,24 +237,11 @@ export default function FoodPOS({ token, user }) {
         )}
 
         {activeTab === 'history' && (
-          <div style={{
-            display:        'flex',
-            flexDirection:  'column',
-            alignItems:     'center',
-            justifyContent: 'center',
-            padding:        '80px 20px',
-            color:          'rgba(255,255,255,0.25)',
-            gap:            '16px',
-            textAlign:      'center'
-          }}>
-            <ClipboardList size={52} style={{ opacity: 0.2 }} />
-            <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: '700', color: 'rgba(255,255,255,0.4)' }}>
-              Order History — Phase 2D
-            </h3>
-            <p style={{ margin: 0, maxWidth: '400px', lineHeight: '1.6', fontSize: '0.86rem' }}>
-              Browse all food orders by date, status, table, guest, or billing type.
-            </p>
-          </div>
+          <FoodOrderHistory token={token} user={user} />
+        )}
+
+        {activeTab === 'reports' && (
+          <FoodReports token={token} user={user} />
         )}
       </div>
     </div>

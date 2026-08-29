@@ -563,7 +563,51 @@ export default function ReservationModule({ token, user, onNavigate, showAlert, 
       {/* ─────────────────────────────────────────────────────────────────────────────
           SUB-VIEW 2 & 3: NEW / MODIFY RESERVATION FORM (Requirement 4 & 5)
          ───────────────────────────────────────────────────────────────────────────── */}
-      {(activeSubTab === 'new' || activeSubTab === 'modify') && (
+      {/* ─────────────────────────────────────────────────────────────────────────────
+          SUB-VIEW 2b: MODIFY RESERVATION — SELECTION GATE
+          Reuses the Cancel Reservation picker pattern. The edit form below must
+          never render for 'modify' until a real reservation is bound to formData.id
+          (via startModify), regardless of how the 'modify' tab was reached.
+         ───────────────────────────────────────────────────────────────────────────── */}
+      {activeSubTab === 'modify' && !formData.id && (
+        <div style={{ maxWidth: '600px', margin: '0 auto', background: 'rgba(15,23,42,0.8)', padding: '24px', borderRadius: '12px', border: '1px solid rgba(250,204,21,0.2)' }}>
+          <h3 style={{ fontSize: '1.2rem', fontWeight: 700, color: '#facc15', marginBottom: '16px' }}>
+            ✏️ Modify Reservation
+          </h3>
+
+          <div style={formGroupStyle}>
+            <label style={labelStyle}>Select Reservation to Modify</label>
+            <select
+              value=""
+              onChange={(e) => {
+                const found = reservations.find(r => String(r.id) === String(e.target.value));
+                if (found) startModify(found);
+              }}
+              style={selectStyle}
+            >
+              <option value="">-- Select Reservation --</option>
+              {reservations.filter(r => r.status !== 'Cancelled' && r.status !== 'Checked-In').map(r => (
+                <option key={r.id} value={r.id}>
+                  #{r.reservation_number} - {r.guest_name} (Room {r.room_number})
+                </option>
+              ))}
+            </select>
+            {reservations.length === 0 && (
+              <p style={{ color: '#94a3b8', fontSize: '0.75rem', marginTop: '8px' }}>
+                No reservations available to modify.
+              </p>
+            )}
+          </div>
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '20px' }}>
+            <button type="button" className="btn-secondary" onClick={() => setActiveSubTab('dashboard')}>
+              Back
+            </button>
+          </div>
+        </div>
+      )}
+
+      {(activeSubTab === 'new' || (activeSubTab === 'modify' && formData.id)) && (
         <form onSubmit={activeSubTab === 'new' ? handleCreateReservation : handleUpdateReservation}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
             <h3 style={{ fontSize: '1.2rem', fontWeight: 700, margin: 0, color: '#fff' }}>
@@ -824,12 +868,12 @@ export default function ReservationModule({ token, user, onNavigate, showAlert, 
 
           <div style={formGroupStyle}>
             <label style={labelStyle}>Select Reservation to Cancel</label>
-            <select 
-              value={selectedRes ? selectedRes.id : ''} 
+            <select
+              value={selectedRes ? selectedRes.id : ''}
               onChange={(e) => {
-                const found = reservations.find(r => r.id === parseInt(e.target.value, 10));
+                const found = reservations.find(r => String(r.id) === String(e.target.value));
                 setSelectedRes(found || null);
-              }} 
+              }}
               style={selectStyle}
             >
               <option value="">-- Select Reservation --</option>
@@ -1123,12 +1167,12 @@ function PrintReservationVoucher({ reservations, selectedRes, setSelectedRes }) 
 
       <div style={formGroupStyle}>
         <label style={labelStyle}>Select Reservation to Print</label>
-        <select 
-          value={selectedRes ? selectedRes.id : ''} 
+        <select
+          value={selectedRes ? selectedRes.id : ''}
           onChange={(e) => {
-            const found = reservations.find(r => r.id === parseInt(e.target.value, 10));
+            const found = reservations.find(r => String(r.id) === String(e.target.value));
             setSelectedRes(found || null);
-          }} 
+          }}
           style={{ ...selectStyle, maxWidth: '400px' }}
         >
           <option value="">-- Select Reservation Voucher --</option>

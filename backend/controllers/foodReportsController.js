@@ -47,6 +47,7 @@
  */
 
 import { db } from '../config/firebaseAdmin.js';
+import { getSystemDateFirestore } from '../repositories/firestore/systemSettingsRepository.js';
 
 const FOOD_ORDERS_COLLECTION = 'food_orders';
 
@@ -525,6 +526,411 @@ export async function getOrderHistory(req, res) {
 
     return res.status(500).json({
       error: 'Failed to retrieve order history. Please try again.',
+      code:  'INTERNAL_ERROR',
+    });
+  }
+}
+
+// ===========================================================================
+// GET /api/food/reports/summary  -- Phase 2D-C
+// ===========================================================================
+//
+// SAFETY CONTRACT (identical to getOrderHistory above):
+//   - READ ONLY. No Firestore writes, no MySQL reads/writes, no Firebase Auth writes.
+//   - Reads ONLY from: food_orders collection.
+//   - Historical snapshot data (items, unit_price, category) returned/aggregated
+//     exactly as stored at order time -- current menu prices are NOT consulted.
+//
+// QUERY STRATEGY:
+//   Exactly ONE Firestore query per request: a business_date range filter using
+//   the existing composite index (business_date ASC + created_at ASC), identical
+//   to the date_range branch already used by getOrderHistory. No new index is
+//   required. All 9 report breakdowns below are computed from that single fetch
+//   in one in-memory pass -- switching "report type" on the frontend never
+//   triggers a second Firestore read.
+//
+// FETCH CAP: 2000 documents. If exceeded, `truncated: true` is returned with an
+//   explicit warning -- truncated data is never silently presented as complete.
+//
+// SCOPE NOTE (explicit product decisions, do not "fix" these later without
+// re-confirming with product/ops):
+//   - No "discount" field exists anywhere in the food order data model.
+//     Discounts are NOT shown, NOT inferred, and NOT defaulted to 0.
+//   - No refund-amount/refund-reason field exists. `payment_status==='REFUNDED'`
+//     is counted, but no rupee figure is ever labeled as a "refund amount".
+//     The `cancellation` block below sums grand_total of CANCELLED orders --
+//     labeled explicitly as that, never as "lost revenue" or "refund amount".
+// ===========================================================================
+
+const REPORTS_FETCH_CAP = 2000;
+
+function emptyStatusMap(keys) {
+  const map = {};
+  keys.forEach(k => { map[k] = { count: 0, sales: 0 }; });
+  return map;
+}
+
+/**
+ * Returns a paginated-free, filterable Sales/Ops summary for Food POS back-office.
+ *
+ * Permitted roles: admin, receptionist, manager (identical guard to getOrderHistory).
+ * Kitchen, chef, staff, and guest roles are blocked at route middleware.
+ *
+ * READ-ONLY. No writes of any kind.
+ */
+export async function getFoodReportsSummary(req, res) {
+  try {
+    // ------------------------------------------------------------------
+    // 1. Extract query parameters
+    // ------------------------------------------------------------------
+    const {
+      business_date:    rawBD,
+      from_date:        rawFrom,
+      to_date:          rawTo,
+      order_status:     rawOrderStatus,
+      payment_status:   rawPaymentStatus,
+      destination_type: rawDestType,
+      waiter_uid:       rawWaiterUid,
+      room_number:      rawRoomNum,
+      table_id:         rawTableId,
+      category_id:      rawCategoryId,
+    } = req.query;
+
+    // ------------------------------------------------------------------
+    // 2. Validate enum filters (identical enums to getOrderHistory)
+    // ------------------------------------------------------------------
+    if (rawOrderStatus && !VALID_ORDER_STATUSES.includes(rawOrderStatus)) {
+      return res.status(400).json({
+        error: `Invalid order_status "${rawOrderStatus}". Valid: ${VALID_ORDER_STATUSES.join(', ')}`,
+        code:  'VALIDATION_ERROR',
+      });
+    }
+    if (rawPaymentStatus && !VALID_PAYMENT_STATUSES.includes(rawPaymentStatus)) {
+      return res.status(400).json({
+        error: `Invalid payment_status "${rawPaymentStatus}". Valid: ${VALID_PAYMENT_STATUSES.join(', ')}`,
+        code:  'VALIDATION_ERROR',
+      });
+    }
+    if (rawDestType && !VALID_DESTINATION_TYPES.includes(rawDestType)) {
+      return res.status(400).json({
+        error: `Invalid destination_type "${rawDestType}". Valid: ${VALID_DESTINATION_TYPES.join(', ')}`,
+        code:  'VALIDATION_ERROR',
+      });
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Validate and parse dates
+    // ------------------------------------------------------------------
+    let businessDate, fromDate, toDate;
+    try {
+      businessDate = validateDateParam(rawBD,   'business_date');
+      fromDate     = validateDateParam(rawFrom, 'from_date');
+      toDate       = validateDateParam(rawTo,   'to_date');
+    } catch (err) {
+      return res.status(err.statusCode || 400).json({
+        error: err.message,
+        code:  err.code || 'VALIDATION_ERROR',
+      });
+    }
+
+    if (fromDate && toDate && fromDate > toDate) {
+      return res.status(400).json({
+        error: 'from_date cannot be after to_date',
+        code:  'VALIDATION_ERROR',
+      });
+    }
+
+    // ------------------------------------------------------------------
+    // 4. Resolve effective date range.
+    //    Priority: business_date exact > from_date/to_date > today's
+    //    hotel Business Date (never the OS/browser clock).
+    // ------------------------------------------------------------------
+    let effectiveFrom, effectiveTo;
+    if (businessDate) {
+      effectiveFrom = businessDate;
+      effectiveTo   = businessDate;
+    } else if (fromDate || toDate) {
+      effectiveFrom = fromDate || toDate;
+      effectiveTo   = toDate || fromDate;
+    } else {
+      const today = await getSystemDateFirestore().catch(() => new Date().toISOString().split('T')[0]);
+      effectiveFrom = today;
+      effectiveTo   = today;
+    }
+
+    // ------------------------------------------------------------------
+    // 5. Single Firestore query: business_date range, existing index.
+    // ------------------------------------------------------------------
+    const snapshot = await db.collection(FOOD_ORDERS_COLLECTION)
+      .where('business_date', '>=', effectiveFrom)
+      .where('business_date', '<=', effectiveTo)
+      .orderBy('business_date', 'asc')
+      .orderBy('created_at', 'asc')
+      .limit(REPORTS_FETCH_CAP + 1)
+      .get();
+
+    let docs = snapshot.docs.map(d => d.data());
+    const truncated = docs.length > REPORTS_FETCH_CAP;
+    if (truncated) docs = docs.slice(0, REPORTS_FETCH_CAP);
+
+    // ------------------------------------------------------------------
+    // 6. In-memory secondary filters (order-level granularity, same
+    //    approach as getOrderHistory's secondary filters).
+    // ------------------------------------------------------------------
+    if (rawOrderStatus)   docs = docs.filter(d => d.order_status === rawOrderStatus);
+    if (rawPaymentStatus) docs = docs.filter(d => d.payment_status === rawPaymentStatus);
+    if (rawDestType)      docs = docs.filter(d => d.destination_type === rawDestType);
+    if (rawWaiterUid)     docs = docs.filter(d => d.waiter_uid === rawWaiterUid);
+    if (rawTableId)       docs = docs.filter(d => d.table_id === rawTableId);
+    if (rawRoomNum) {
+      const rn = String(rawRoomNum).trim();
+      docs = docs.filter(d => String(d.room_number || '').trim() === rn);
+    }
+    if (rawCategoryId) {
+      docs = docs.filter(d => Array.isArray(d.items) && d.items.some(it => it.category_id === rawCategoryId));
+    }
+
+    // ------------------------------------------------------------------
+    // 7. Single in-memory aggregation pass -- every breakdown below is
+    //    computed from the SAME filtered document set. No further reads.
+    // ------------------------------------------------------------------
+    let grossSales = 0, taxTotal = 0, grandTotal = 0;
+    let paidOrders = 0, unpaidOrders = 0, roomBillOrders = 0, complimentaryOrders = 0, voidedOrders = 0, refundedOrders = 0, cancelledOrders = 0;
+
+    // Category-scoped monetary accumulators. Only populated from items whose
+    // category_id matches rawCategoryId (see item loop below). Used INSTEAD of
+    // the whole-order grossSales/taxTotal/grandTotal above when a category
+    // filter is active, so the summary never attributes another category's
+    // revenue (from the same order) to the selected category. See "Category
+    // Filter Semantics Fix" -- category_id must scope money to matching items,
+    // while order-level breakdowns (byDate, byOrderStatus, etc.) intentionally
+    // stay order-scoped ("orders containing this category").
+    const categoryActive = Boolean(rawCategoryId);
+    let categoryGrossSales = 0, categoryTaxTotal = 0, categoryGrandTotal = 0;
+
+    const byDateMap        = {};
+    const byOrderStatusMap = emptyStatusMap(VALID_ORDER_STATUSES);
+    const byPaymentStatusMap = emptyStatusMap(VALID_PAYMENT_STATUSES);
+    const byDestinationMap = emptyStatusMap(VALID_DESTINATION_TYPES);
+    const byWaiterMap      = {};
+    const byItemMap        = {};
+    const byCategoryMap    = {};
+    const byRoomMap        = {};
+    const byTaxTypeMap     = {};
+
+    docs.forEach(d => {
+      const orderSubtotal = Number(d.subtotal) || 0;
+      const orderTax      = Number(d.tax_total) || 0;
+      const orderGrand    = Number(d.grand_total) || 0;
+
+      grossSales += orderSubtotal;
+      taxTotal   += orderTax;
+      grandTotal += orderGrand;
+
+      if (d.payment_status === 'PAID')          paidOrders++;
+      if (d.payment_status === 'PENDING')       unpaidOrders++;
+      if (d.payment_status === 'ROOM_BILL')     roomBillOrders++;
+      if (d.payment_status === 'COMPLIMENTARY') complimentaryOrders++;
+      if (d.payment_status === 'VOIDED')        voidedOrders++;
+      if (d.payment_status === 'REFUNDED')      refundedOrders++;
+      if (d.order_status === 'CANCELLED')       cancelledOrders++;
+
+      // By Date
+      const dateKey = d.business_date || 'unknown';
+      if (!byDateMap[dateKey]) byDateMap[dateKey] = { date: dateKey, orders: 0, sales: 0 };
+      byDateMap[dateKey].orders++;
+      byDateMap[dateKey].sales += orderGrand;
+
+      // By Order Status / Payment Status / Destination
+      if (byOrderStatusMap[d.order_status]) {
+        byOrderStatusMap[d.order_status].count++;
+        byOrderStatusMap[d.order_status].sales += orderGrand;
+      }
+      if (byPaymentStatusMap[d.payment_status]) {
+        byPaymentStatusMap[d.payment_status].count++;
+        byPaymentStatusMap[d.payment_status].sales += orderGrand;
+      }
+      if (byDestinationMap[d.destination_type]) {
+        byDestinationMap[d.destination_type].count++;
+        byDestinationMap[d.destination_type].sales += orderGrand;
+      }
+
+      // By Waiter
+      if (d.waiter_uid) {
+        if (!byWaiterMap[d.waiter_uid]) {
+          byWaiterMap[d.waiter_uid] = { waiter_uid: d.waiter_uid, waiter_name: d.waiter_name || d.waiter_uid, orders: 0, sales: 0 };
+        }
+        byWaiterMap[d.waiter_uid].orders++;
+        byWaiterMap[d.waiter_uid].sales += orderGrand;
+      }
+
+      // By Room (ROOM destination only)
+      if (d.destination_type === 'ROOM' && d.room_number) {
+        const rk = String(d.room_number);
+        if (!byRoomMap[rk]) byRoomMap[rk] = { room_number: rk, orders: 0, sales: 0 };
+        byRoomMap[rk].orders++;
+        byRoomMap[rk].sales += orderGrand;
+      }
+
+      // By Item / By Category / By Tax Type (item-level, within this order).
+      // When category_id is active, items from OTHER categories in the same
+      // order are skipped here -- they still counted toward the order-level
+      // metrics above (byDate/byOrderStatus/.../grossSales), but must not be
+      // attributed to the selected category's item/category/tax breakdowns.
+      (Array.isArray(d.items) ? d.items : []).forEach(it => {
+        if (categoryActive && it.category_id !== rawCategoryId) return;
+
+        const qty       = Number(it.quantity) || 0;
+        const lineTotal = Number(it.line_total) || 0;
+        const taxAmount = Number(it.tax_amount) || 0;
+        const taxableAmount = Number(it.line_subtotal) || 0;
+
+        if (categoryActive) {
+          categoryGrossSales += taxableAmount;
+          categoryTaxTotal   += taxAmount;
+          categoryGrandTotal += lineTotal;
+        }
+
+        if (it.item_id) {
+          if (!byItemMap[it.item_id]) {
+            byItemMap[it.item_id] = { item_id: it.item_id, item_name: it.item_name || it.item_id, qty: 0, sales: 0, orderIds: new Set() };
+          }
+          byItemMap[it.item_id].qty += qty;
+          byItemMap[it.item_id].sales += lineTotal;
+          byItemMap[it.item_id].orderIds.add(d.order_id);
+        }
+
+        if (it.category_id) {
+          if (!byCategoryMap[it.category_id]) {
+            byCategoryMap[it.category_id] = { category_id: it.category_id, category_name: it.category_name || it.category_id, qty: 0, sales: 0 };
+          }
+          byCategoryMap[it.category_id].qty += qty;
+          byCategoryMap[it.category_id].sales += lineTotal;
+        }
+
+        const taxKey = `${it.tax_type || 'EXEMPT'}_${it.tax_rate || 0}`;
+        if (!byTaxTypeMap[taxKey]) {
+          byTaxTypeMap[taxKey] = { tax_type: it.tax_type || 'EXEMPT', tax_rate: Number(it.tax_rate) || 0, taxableAmount: 0, taxAmount: 0 };
+        }
+        byTaxTypeMap[taxKey].taxableAmount += taxableAmount;
+        byTaxTypeMap[taxKey].taxAmount += taxAmount;
+      });
+    });
+
+    const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+    const byDate = Object.values(byDateMap)
+      .map(r => ({ date: r.date, orders: r.orders, sales: round2(r.sales), avgOrderValue: r.orders > 0 ? round2(r.sales / r.orders) : 0 }))
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+
+    const byOrderStatus = VALID_ORDER_STATUSES.map(status => ({
+      status, count: byOrderStatusMap[status].count, sales: round2(byOrderStatusMap[status].sales)
+    }));
+
+    const byPaymentStatus = VALID_PAYMENT_STATUSES.map(status => ({
+      status, count: byPaymentStatusMap[status].count, sales: round2(byPaymentStatusMap[status].sales)
+    }));
+
+    const byDestination = VALID_DESTINATION_TYPES.map(destination => ({
+      destination, count: byDestinationMap[destination].count, sales: round2(byDestinationMap[destination].sales)
+    }));
+
+    const byWaiter = Object.values(byWaiterMap)
+      .map(r => ({ waiter_uid: r.waiter_uid, waiter_name: r.waiter_name, orders: r.orders, sales: round2(r.sales), avgOrderValue: r.orders > 0 ? round2(r.sales / r.orders) : 0 }))
+      .sort((a, b) => b.sales - a.sales);
+
+    const byItem = Object.values(byItemMap)
+      .map(r => ({ item_id: r.item_id, item_name: r.item_name, qty: r.qty, sales: round2(r.sales), orders: r.orderIds.size }))
+      .sort((a, b) => b.sales - a.sales);
+
+    const byCategory = Object.values(byCategoryMap)
+      .map(r => ({ category_id: r.category_id, category_name: r.category_name, qty: r.qty, sales: round2(r.sales) }))
+      .sort((a, b) => b.sales - a.sales);
+
+    const byRoom = Object.values(byRoomMap)
+      .map(r => ({ room_number: r.room_number, orders: r.orders, sales: round2(r.sales) }))
+      .sort((a, b) => b.sales - a.sales);
+
+    const byTaxType = Object.values(byTaxTypeMap)
+      .map(r => ({ tax_type: r.tax_type, tax_rate: r.tax_rate, taxableAmount: round2(r.taxableAmount), taxAmount: round2(r.taxAmount) }))
+      .sort((a, b) => b.taxAmount - a.taxAmount);
+
+    const cancelledDocs = docs.filter(d => d.order_status === 'CANCELLED');
+
+    // Money figures for the response: whole-order totals when no category
+    // filter is active (unchanged, existing behavior); category-scoped totals
+    // (matching items only) when category_id is active. Order-level breakdowns
+    // above (byDate, byOrderStatus, byPaymentStatus, byDestination, byWaiter,
+    // byRoom, cancellation, totalOrders) are NEVER affected by this -- they
+    // continue to represent "orders containing at least one item from the
+    // selected category" regardless of this substitution.
+    const effectiveGrossSales = categoryActive ? categoryGrossSales : grossSales;
+    const effectiveTaxTotal   = categoryActive ? categoryTaxTotal   : taxTotal;
+    const effectiveGrandTotal = categoryActive ? categoryGrandTotal : grandTotal;
+
+    const warnings = [];
+    if (truncated) {
+      warnings.push(
+        `Results truncated at ${REPORTS_FETCH_CAP} orders for the selected date range (${effectiveFrom} to ${effectiveTo}). ` +
+        `Totals below reflect only the first ${REPORTS_FETCH_CAP} orders fetched -- narrow the date range for complete, accurate totals.`
+      );
+    }
+
+    return res.json({
+      range: { from_date: effectiveFrom, to_date: effectiveTo, business_date: businessDate || null },
+      summary: {
+        totalOrders: docs.length,
+        grossSales: round2(effectiveGrossSales),
+        taxTotal: round2(effectiveTaxTotal),
+        grandTotal: round2(effectiveGrandTotal),
+        paidOrders,
+        unpaidOrders,
+        roomBillOrders,
+        complimentaryOrders,
+        voidedOrders,
+        refundedOrders,
+        cancelledOrders,
+      },
+      byDate,
+      byOrderStatus,
+      byPaymentStatus,
+      byDestination,
+      byWaiter,
+      byItem,
+      byCategory,
+      byRoom,
+      cancellation: {
+        count: cancelledDocs.length,
+        // Explicitly the SUM of grand_total on cancelled orders -- NOT a certified
+        // refund/loss figure. No refund-amount field exists in the data model.
+        grandTotalOfCancelledOrders: round2(cancelledDocs.reduce((s, d) => s + (Number(d.grand_total) || 0), 0)),
+      },
+      tax: {
+        taxTotal: round2(effectiveTaxTotal),
+        byTaxType,
+      },
+      fetchedOrders: docs.length,
+      truncated,
+      warnings,
+    });
+
+  } catch (err) {
+    console.error('[FoodReportsController] getFoodReportsSummary unexpected error:', err);
+
+    if (err.code === 9 || (err.message && err.message.includes('FAILED_PRECONDITION'))) {
+      console.error(
+        '[FoodReportsController] Firestore FAILED_PRECONDITION detected in getFoodReportsSummary.\n' +
+        'A composite index may be missing. Identify the query above and add the required\n' +
+        'index to firestore.indexes.json before redeploying.'
+      );
+      return res.status(500).json({
+        error: 'A required Firestore index is missing. Contact the system administrator.',
+        code:  'INDEX_MISSING',
+      });
+    }
+
+    return res.status(500).json({
+      error: 'Failed to generate the food reports summary. Please try again.',
       code:  'INTERNAL_ERROR',
     });
   }

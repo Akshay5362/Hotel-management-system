@@ -609,23 +609,35 @@ export const cancelReservation = async (req, res) => {
  * POST /api/reservations/:id/checkin
  */
 export const checkInReservation = async (req, res) => {
+  const { id } = req.params;
   let connection;
   try {
-    connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    const { id } = req.params;
     let roomNumber = null;
     let reservationNumber = null;
 
-    // Check MySQL first if connection available
-    const [resRows] = await connection.query('SELECT * FROM reservations WHERE id = ?', [id]);
-    if (resRows.length > 0) {
-      roomNumber = resRows[0].room_number;
-      reservationNumber = resRows[0].reservation_number;
+    if (isFirestoreReservationsServingEnabled()) {
+      // Firestore-primary: resolve the reservation via the same Firestore-first
+      // path already used by getReservationById/updateReservation, instead of
+      // an unconditional MySQL connection (which throws ER_MYSQL_DECOMMISSIONED
+      // when DISABLE_MYSQL_CUTOVER_FALLBACKS=true).
+      const resResult = await ReservationCutoverService.getReservationById(id);
+      roomNumber = resResult?.reservation?.room_number || null;
+      reservationNumber = resResult?.reservation?.reservation_number || null;
+    } else {
+      // Legacy MySQL path — only reached when Firestore reservations serving
+      // is explicitly disabled (not the case in this production configuration).
+      connection = await pool.getConnection();
+      await connection.beginTransaction();
+
+      const [resRows] = await connection.query('SELECT * FROM reservations WHERE id = ?', [id]);
+      if (resRows.length > 0) {
+        roomNumber = resRows[0].room_number;
+        reservationNumber = resRows[0].reservation_number;
+      }
     }
 
-    // Delegate to CheckInCutoverService
+    // Delegate to CheckInCutoverService (already Firestore-primary internally;
+    // `connection` is undefined here in the Firestore path and is simply unused).
     const result = await CheckInCutoverService.executeCheckIn({
       connection,
       params: {
@@ -635,7 +647,7 @@ export const checkInReservation = async (req, res) => {
       }
     });
 
-    await connection.commit();
+    if (connection) await connection.commit();
 
     res.json({
       success: true,

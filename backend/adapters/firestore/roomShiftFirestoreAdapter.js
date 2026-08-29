@@ -147,16 +147,38 @@ export const processRoomShiftFirestoreTransaction = async ({
 
     // 3. READ EXISTING LEDGER ITEMS AND PAYMENTS FOR THIS BOOKING
     const existingLedgers = [];
+    // Existing ledger items still tagged with the room being vacated -- these
+    // need their room_number field synced to the destination room (Write 4b
+    // below). Only the room_number field is touched; amount/type/description
+    // are never modified here.
+    const staleRoomLedgerRefs = [];
     const ledgerSnap = await transaction.get(
       db.collection('ledger_items').where('booking_id', '==', activeBookingDocId)
     );
-    ledgerSnap.forEach(d => existingLedgers.push({ id: d.id, ...d.data() }));
+    ledgerSnap.forEach(d => {
+      const data = d.data();
+      existingLedgers.push({ id: d.id, ...data });
+      if (data.room_number === fromStr) {
+        staleRoomLedgerRefs.push(d.ref);
+      }
+    });
 
     const existingPayments = [];
     const paymentSnap = await transaction.get(
       db.collection('payments').where('booking_id', '==', activeBookingDocId)
     );
     paymentSnap.forEach(d => existingPayments.push({ id: d.id, ...d.data() }));
+
+    // 3b. FIND THE RESERVATION LINKED TO THIS BOOKING (if any).
+    // Room Shift is booking-centric and has no reservationId input; a booking
+    // created via Check-In from a reservation is the only way to find it, via
+    // the same booking_id equality query pattern already used above for
+    // ledger_items/payments. Walk-in bookings (no originating reservation)
+    // simply produce zero results here, which is expected and not an error.
+    const reservationSnap = await transaction.get(
+      db.collection('reservations').where('booking_id', '==', activeBookingDocId)
+    );
+    const linkedReservationRefs = reservationSnap.docs.map(d => d.ref);
 
     // 4. CALCULATE SOURCE TARIFF, DESTINATION TARIFF, AND DIFFERENTIALS
     const sourceTariff = Number(sourceData.price || sourceData.rate || sourceData.base_rate || activeBookingData.room_tariff || 0);
@@ -248,6 +270,17 @@ export const processRoomShiftFirestoreTransaction = async ({
       updated_at: nowIso
     }, { merge: true });
 
+    // Write 1b: Sync room_number/room_id on the reservation that originated
+    // this booking (if any). Only these two cross-reference fields are
+    // touched -- status, dates, and guest fields are never modified here.
+    linkedReservationRefs.forEach(reservationRef => {
+      transaction.set(reservationRef, {
+        room_number: toStr,
+        room_id: targetRoomRef.id,
+        updated_at: nowIso
+      }, { merge: true });
+    });
+
     // Write 2: Release Source Room (Vacant)
     transaction.set(sourceRoomRef, {
       status: 'vacant',
@@ -266,6 +299,17 @@ export const processRoomShiftFirestoreTransaction = async ({
     if (shiftLedgerRef && shiftLedgerData) {
       transaction.set(shiftLedgerRef, shiftLedgerData);
     }
+
+    // Write 4b: Sync room_number on existing ledger items still pointing at
+    // the vacated room (e.g. the original room-tariff charge from Check-In).
+    // Amount, transaction_type, description, and totals are never touched --
+    // only the room_number cross-reference field.
+    staleRoomLedgerRefs.forEach(ledgerItemRef => {
+      transaction.set(ledgerItemRef, {
+        room_number: toStr,
+        updated_at: nowIso
+      }, { merge: true });
+    });
 
     // Write 5: Room Status History for Source Room
     const rshSourceRef = db.collection('room_status_history').doc(`rsh_${fromStr}_shift_${Date.now()}`);
