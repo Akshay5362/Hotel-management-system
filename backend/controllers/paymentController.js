@@ -18,10 +18,19 @@
  * Future hooks (UPI / Card / Razorpay):
  *   - Add initiateGatewayPayment() and confirmGatewayPayment() here.
  *   - No changes required to this file's existing handlers.
+ *
+ * Phase 4G-A additions:
+ *   - finalizePayment() wrapped in MySQL transaction + COMPOUND_PAYMENT_FINALIZED
+ *   - confirmCashPayment() wrapped in MySQL transaction + COMPOUND_CASH_PAYMENT_CONFIRMED
+ *   - All Outbox enqueue() calls use the same acquired connection, run before commit,
+ *     and are fully gated by isFirestoreDualWriteEnabled().
  */
 
 import pool from '../db.js';
+import { db } from '../config/firebaseAdmin.js';
 import crypto from 'crypto';
+import { isMyPaymentsReadCanaryEnabled, isFirestorePaymentsServingEnabled } from '../config/featureFlags.js';
+import { PaymentCutoverService } from '../services/paymentCutoverService.js';
 
 // ---------------------------------------------------------------------------
 // Helper: Generate a unique internal transaction ID
@@ -43,9 +52,13 @@ function generateTransactionId() {
  * NOTE: Only 'Cash' is functional in Phase 2. Other methods are accepted
  *       by this endpoint so they can be persisted for future processing.
  *       The actual gateway call (for non-cash) is NOT made here yet.
+ *
+ * Phase 4G-A: Wrapped in a MySQL transaction. Enqueues COMPOUND_PAYMENT_FINALIZED
+ * when isFirestoreDualWriteEnabled() === true.
  */
 export const finalizePayment = async (req, res) => {
   const { bookingId, paymentMethod } = req.body;
+  const idempotencyKey = req.body?.idempotencyKey || req.headers['idempotency-key'] || null;
 
   if (!bookingId) {
     return res.status(400).json({ success: false, message: 'bookingId is required' });
@@ -53,90 +66,97 @@ export const finalizePayment = async (req, res) => {
 
   const allowedMethods = ['Cash', 'UPI', 'Debit Card', 'Credit Card', 'QR Code', 'Net Banking', 'Wallet'];
   const method = allowedMethods.includes(paymentMethod) ? paymentMethod : 'Cash';
-
-  // Cash payment stays 'Pending' until admin physically confirms receipt at reception.
-  // All other gateway methods also stay 'Pending' until gateway callback confirms.
-  // Payment is NEVER auto-marked Paid — admin confirmation is required for Cash.
-  const finalStatus = 'Pending';
-
-  // Record which method was chosen so admin knows how to collect it
   const gateway = method === 'Cash' ? 'Internal' : 'Gateway';
   const remarks = method === 'Cash'
     ? 'Cash to be collected at reception during check-in'
     : `${method} — awaiting gateway confirmation`;
-
   const userId = req.user?.id || null;
+  const eventOccurredAt = new Date().toISOString();
+
+  const mysqlHandler = async () => {
+    let connection;
+    try {
+      connection = await pool.getConnection();
+      await connection.beginTransaction();
+
+      const [rows] = await connection.query(
+        `SELECT id, amount, payment_method, payment_type, payment_source,
+                payment_gateway, business_date, created_at
+         FROM payments
+         WHERE booking_id = ?
+           AND payment_status = 'Pending'
+         ORDER BY id DESC
+         LIMIT 1`,
+        [bookingId]
+      );
+
+      if (rows.length === 0) {
+        await connection.rollback();
+        return {
+          success: true,
+          message: 'No pending payment found — booking may already be finalised.',
+          alreadyFinalised: true
+        };
+      }
+
+      const payment = rows[0];
+      const transactionId = generateTransactionId();
+
+      await connection.query(
+        `UPDATE payments
+         SET payment_method   = ?,
+             payment_status   = 'Pending',
+             payment_gateway  = ?,
+             payment_source   = 'guest_portal',
+             transaction_id   = ?,
+             created_by       = ?,
+             received_by      = NULL,
+             remarks          = ?,
+             payment_date     = NULL,
+             updated_at       = NOW()
+         WHERE id = ?`,
+        [method, gateway, transactionId, userId, remarks, payment.id]
+      );
+
+      await connection.query(
+        `UPDATE invoices
+         SET status    = CASE
+               WHEN balance_due <= 0 THEN 'Paid'
+               WHEN paid_amount > 0  THEN 'Partially Paid'
+               ELSE 'Issued'
+             END,
+             issued_at = COALESCE(issued_at, NOW())
+         WHERE booking_id = ?`,
+        [bookingId]
+      );
+
+      await connection.commit();
+
+      return {
+        success: true,
+        message: method === 'Cash'
+          ? 'Booking confirmed. Cash payment of ₹' + payment.amount + ' is pending — please pay at the reception desk during check-in.'
+          : `Payment recorded. ${method} processing pending gateway integration.`,
+        paymentId: payment.id,
+        transactionId,
+        method,
+        status: 'Pending',
+        cashPending: method === 'Cash'
+      };
+    } finally {
+      if (connection) connection.release();
+    }
+  };
 
   try {
-    // Find the most recent Pending payment for this booking
-    const [rows] = await pool.query(
-      `SELECT id, amount FROM payments
-       WHERE booking_id = ?
-         AND payment_status = 'Pending'
-       ORDER BY id DESC
-       LIMIT 1`,
-      [bookingId]
+    const result = await PaymentCutoverService.finalizePayment(
+      { bookingId, paymentMethod, user: req.user, idempotencyKey },
+      mysqlHandler
     );
-
-    if (rows.length === 0) {
-      // Booking may have no pending payment (edge case or already finalised).
-      return res.status(200).json({
-        success: true,
-        message: 'No pending payment found — booking may already be finalised.',
-        alreadyFinalised: true
-      });
-    }
-
-    const payment = rows[0];
-
-    // Generate a transaction ID for this payment
-    const transactionId = generateTransactionId();
-
-    // Update the payment record
-    await pool.query(
-      `UPDATE payments
-       SET payment_method   = ?,
-           payment_status   = 'Pending',
-           payment_gateway  = ?,
-           payment_source   = 'guest_portal',
-           transaction_id   = ?,
-           created_by       = ?,
-           received_by      = NULL,
-           remarks          = ?,
-           payment_date     = NULL,
-           updated_at       = NOW()
-       WHERE id = ?`,
-      [method, gateway, transactionId, userId, remarks, payment.id]
-    );
-
-    // Keep invoice as 'Issued' / 'Partially Paid' until admin confirms
-    await pool.query(
-      `UPDATE invoices
-       SET status    = CASE
-             WHEN balance_due <= 0 THEN 'Paid'
-             WHEN paid_amount > 0  THEN 'Partially Paid'
-             ELSE 'Issued'
-           END,
-           issued_at = COALESCE(issued_at, NOW())
-       WHERE booking_id = ?`,
-      [bookingId]
-    );
-
-    return res.status(200).json({
-      success: true,
-      message: method === 'Cash'
-        ? 'Booking confirmed. Cash payment of ₹' + payment.amount + ' is pending — please pay at the reception desk during check-in.'
-        : `Payment recorded. ${method} processing pending gateway integration.`,
-      paymentId: payment.id,
-      transactionId,
-      method,
-      status: 'Pending',
-      cashPending: method === 'Cash'
-    });
-
+    return res.status(200).json(result);
   } catch (err) {
     console.error('finalizePayment error:', err);
-    return res.status(500).json({ success: false, message: 'Payment finalisation failed.' });
+    return res.status(err.status || 500).json({ success: false, message: err.message || 'Payment finalisation failed.' });
   }
 };
 
@@ -152,7 +172,7 @@ export const getPaymentsByBooking = async (req, res) => {
   const userId = req.user?.id;
   const userRole = req.user?.role;
 
-  try {
+  const mysqlHandler = async () => {
     // Ownership check for guests
     if (userRole !== 'admin') {
       const [ownerCheck] = await pool.query(
@@ -162,7 +182,9 @@ export const getPaymentsByBooking = async (req, res) => {
         [bookingId, userId]
       );
       if (ownerCheck.length === 0) {
-        return res.status(403).json({ success: false, message: 'Access denied.' });
+        const err = new Error('Access denied.');
+        err.status = 403;
+        throw err;
       }
     }
 
@@ -191,7 +213,7 @@ export const getPaymentsByBooking = async (req, res) => {
       [bookingId]
     );
 
-    return res.status(200).json({
+    return {
       success: true,
       bookingId: parseInt(bookingId, 10),
       payments,
@@ -202,11 +224,15 @@ export const getPaymentsByBooking = async (req, res) => {
         totalRefunded:payments.filter(p => p.payment_status === 'Refunded').reduce((s, p) => s + p.amount, 0),
         count: payments.length
       }
-    });
+    };
+  };
 
+  try {
+    const result = await PaymentCutoverService.getPaymentsByBooking(bookingId, req.user, mysqlHandler);
+    return res.status(200).json(result);
   } catch (err) {
     console.error('getPaymentsByBooking error:', err);
-    return res.status(500).json({ success: false, message: 'Failed to load payment records.' });
+    return res.status(err.status || 500).json({ success: false, message: err.message || 'Failed to load payment records.' });
   }
 };
 
@@ -219,7 +245,7 @@ export const getPaymentsByBooking = async (req, res) => {
 export const getMyPayments = async (req, res) => {
   const userId = req.user?.id;
 
-  try {
+  const mysqlHandler = async () => {
     const [payments] = await pool.query(
       `SELECT
          p.id, p.booking_id, p.amount, p.currency,
@@ -237,15 +263,19 @@ export const getMyPayments = async (req, res) => {
       [userId]
     );
 
-    return res.status(200).json({
+    return {
       success: true,
       payments,
       count: payments.length
-    });
+    };
+  };
 
+  try {
+    const result = await PaymentCutoverService.getMyPayments(userId, mysqlHandler);
+    return res.status(200).json(result);
   } catch (err) {
     console.error('getMyPayments error:', err);
-    return res.status(500).json({ success: false, message: 'Failed to load payment history.' });
+    return res.status(err.status || 500).json({ success: false, message: err.message || 'Failed to load payment history.' });
   }
 };
 
@@ -254,93 +284,123 @@ export const getMyPayments = async (req, res) => {
 // ---------------------------------------------------------------------------
 /**
  * Admin calls this after physically receiving cash from the guest at reception.
- * Sets payment_status = 'Paid', payment_date = NOW(), received_by = admin user.
- * This unblocks the guest's "Check In Now" button.
  */
 export const confirmCashPayment = async (req, res) => {
   const { bookingId } = req.params;
   const adminId = req.user?.id;
+  const idempotencyKey = req.body?.idempotencyKey || req.headers['idempotency-key'] || null;
+
+  const eventOccurredAt = new Date().toISOString();
+
+  const mysqlHandler = async () => {
+    let connection;
+    let bookingForNotification = null;
+    let paymentAmountForNotification = 0;
+
+    try {
+      connection = await pool.getConnection();
+      await connection.beginTransaction();
+
+      const [rows] = await connection.query(
+        `SELECT id, amount, business_date, created_at FROM payments
+         WHERE booking_id    = ?
+           AND payment_method = 'Cash'
+           AND payment_status = 'Pending'
+         ORDER BY id DESC LIMIT 1`,
+        [bookingId]
+      );
+
+      if (rows.length === 0) {
+        await connection.rollback();
+        const err = new Error('No pending Cash payment found for this booking.');
+        err.status = 404;
+        err.code = 'BOOKING_PAYMENT_NOT_FOUND';
+        throw err;
+      }
+
+      const payment = rows[0];
+      paymentAmountForNotification = payment.amount;
+
+      await connection.query(
+        `UPDATE payments
+         SET payment_status = 'Paid',
+             payment_date   = NOW(),
+             received_by    = ?,
+             remarks        = 'Cash received at reception',
+             updated_at     = NOW()
+         WHERE id = ?`,
+        [adminId, payment.id]
+      );
+
+      await connection.query(
+        `UPDATE invoices i
+         INNER JOIN (
+           SELECT booking_id,
+                  SUM(CASE WHEN payment_status = 'Paid' AND payment_type NOT IN (
+                    'cancellation_refund','partial_refund','full_refund','security_deposit_refund')
+                    THEN amount ELSE 0 END) AS actual_paid
+           FROM payments WHERE booking_id = ? GROUP BY booking_id
+         ) AS p ON p.booking_id = i.booking_id
+         SET i.paid_amount = p.actual_paid,
+             i.balance_due = GREATEST(0, i.total_amount - p.actual_paid),
+             i.status      = CASE
+               WHEN GREATEST(0, i.total_amount - p.actual_paid) = 0 THEN 'Paid'
+               WHEN p.actual_paid > 0 THEN 'Partially Paid'
+               ELSE 'Issued' END`,
+        [bookingId]
+      );
+
+      bookingForNotification = { _payment_id: payment.id, _booking_id: bookingId };
+
+      await connection.commit();
+
+      if (bookingForNotification) {
+        try {
+          const [booking] = await pool.query(
+            `SELECT b.id, g.user_id, r.number as room_number, p.amount
+             FROM bookings b
+             JOIN guests g ON b.guest_id = g.id
+             JOIN rooms r ON b.room_id = r.id
+             JOIN payments p ON p.booking_id = b.id AND p.id = ?
+             WHERE b.id = ?`,
+            [bookingForNotification._payment_id, bookingForNotification._booking_id]
+          );
+
+          if (booking.length > 0) {
+            await pool.query(
+              `INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)`,
+              [
+                booking[0].user_id,
+                '✅ Cash Payment Confirmed!',
+                `Your advance cash payment of ₹${payment.amount} for Room ${booking[0].room_number} has been received at the reception. You can now check in via the Guest Portal.`
+              ]
+            );
+          }
+        } catch (notifErr) {
+          console.error('confirmCashPayment notification error (non-fatal):', notifErr);
+        }
+      }
+
+      return {
+        success: true,
+        message: `Cash payment of ₹${payment.amount} confirmed successfully.`,
+        paymentId: payment.id,
+        amount: payment.amount
+      };
+    } finally {
+      if (connection) connection.release();
+    }
+  };
 
   try {
-    // Find the pending Cash payment for this booking
-    const [rows] = await pool.query(
-      `SELECT id, amount FROM payments
-       WHERE booking_id    = ?
-         AND payment_method = 'Cash'
-         AND payment_status = 'Pending'
-       ORDER BY id DESC LIMIT 1`,
-      [bookingId]
+    const result = await PaymentCutoverService.confirmCashPayment(
+      { bookingId, adminId, idempotencyKey },
+      mysqlHandler
     );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'No pending Cash payment found for this booking.' });
-    }
-
-    const payment = rows[0];
-
-    // Mark as Paid
-    await pool.query(
-      `UPDATE payments
-       SET payment_status = 'Paid',
-           payment_date   = NOW(),
-           received_by    = ?,
-           remarks        = 'Cash received at reception',
-           updated_at     = NOW()
-       WHERE id = ?`,
-      [adminId, payment.id]
-    );
-
-    // Sync invoice
-    await pool.query(
-      `UPDATE invoices i
-       INNER JOIN (
-         SELECT booking_id,
-                SUM(CASE WHEN payment_status = 'Paid' AND payment_type NOT IN (
-                  'cancellation_refund','partial_refund','full_refund','security_deposit_refund')
-                  THEN amount ELSE 0 END) AS actual_paid
-         FROM payments WHERE booking_id = ? GROUP BY booking_id
-       ) AS p ON p.booking_id = i.booking_id
-       SET i.paid_amount = p.actual_paid,
-           i.balance_due = GREATEST(0, i.total_amount - p.actual_paid),
-           i.status      = CASE
-             WHEN GREATEST(0, i.total_amount - p.actual_paid) = 0 THEN 'Paid'
-             WHEN p.actual_paid > 0 THEN 'Partially Paid'
-             ELSE 'Issued' END`,
-      [bookingId]
-    );
-
-    // Create notification for guest that payment is confirmed
-    const [booking] = await pool.query(
-      `SELECT b.id, g.user_id, r.number as room_number, p.amount
-       FROM bookings b
-       JOIN guests g ON b.guest_id = g.id
-       JOIN rooms r ON b.room_id = r.id
-       JOIN payments p ON p.booking_id = b.id AND p.id = ?
-       WHERE b.id = ?`,
-      [payment.id, bookingId]
-    );
-
-    if (booking.length > 0) {
-      await pool.query(
-        `INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)`,
-        [
-          booking[0].user_id,
-          '✅ Cash Payment Confirmed!',
-          `Your advance cash payment of ₹${payment.amount} for Room ${booking[0].room_number} has been received at the reception. You can now check in via the Guest Portal.`
-        ]
-      );
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: `Cash payment of ₹${payment.amount} confirmed successfully.`,
-      paymentId: payment.id,
-      amount: payment.amount
-    });
-
+    return res.status(200).json(result);
   } catch (err) {
     console.error('confirmCashPayment error:', err);
-    return res.status(500).json({ success: false, message: 'Failed to confirm cash payment.' });
+    return res.status(err.status || 500).json({ success: false, message: err.message || 'Failed to confirm cash payment.' });
   }
 };
 
@@ -349,12 +409,11 @@ export const confirmCashPayment = async (req, res) => {
 // ---------------------------------------------------------------------------
 /**
  * Returns the payment status of the guest's active (Reserved) booking.
- * Used by the guest portal to decide whether to show or lock the Check In Now button.
  */
 export const getGuestPaymentStatus = async (req, res) => {
   const userId = req.user?.id;
 
-  try {
+  const mysqlHandler = async () => {
     const [rows] = await pool.query(
       `SELECT
          p.id, p.amount, p.payment_method, p.payment_status,
@@ -370,25 +429,29 @@ export const getGuestPaymentStatus = async (req, res) => {
     );
 
     if (rows.length === 0) {
-      return res.status(200).json({ success: true, hasActivePayment: false });
+      return { success: true, hasActivePayment: false };
     }
 
     const p = rows[0];
-    return res.status(200).json({
+    return {
       success: true,
       hasActivePayment: true,
-      paymentStatus: p.payment_status,           // 'Pending' | 'Paid'
-      paymentMethod: p.payment_method,           // 'Cash' | 'UPI' | ...
+      paymentStatus: p.payment_status,
+      paymentMethod: p.payment_method,
       amount: p.amount,
       paymentConfirmed: p.payment_status === 'Paid',
       cashPendingConfirmation: p.payment_method === 'Cash' && p.payment_status === 'Pending',
       bookingId: p.booking_id,
       bookingNumber: p.booking_number,
       remarks: p.remarks
-    });
+    };
+  };
 
+  try {
+    const result = await PaymentCutoverService.getGuestPaymentStatus(userId, mysqlHandler);
+    return res.status(200).json(result);
   } catch (err) {
     console.error('getGuestPaymentStatus error:', err);
-    return res.status(500).json({ success: false, message: 'Failed to load payment status.' });
+    return res.status(err.status || 500).json({ success: false, message: err.message || 'Failed to load payment status.' });
   }
 };

@@ -29,16 +29,16 @@ const __dirname  = path.dirname(__filename);
 
 // ─── Synchronous file logger ──────────────────────────────────────────────────
 // Uses appendFileSync — every line is on disk before the next line runs.
-// Three candidate paths tried in order; whichever is writable wins.
+// Prioritizes app.getPath('userData')/logs/ which is 100% user-writable on Windows.
 
 let LOG_FILE = null;
 
 function initLogger() {
   const dirs = [
-    // 1. Primary: next to backend in resources/ (visible after build)
-    app.isPackaged ? path.join(process.resourcesPath, 'logs') : null,
-    // 2. userData — always writable for the current user
+    // 1. userData — always writable for the current user in all Windows environments
     (() => { try { return path.join(app.getPath('userData'), 'logs'); } catch { return null; } })(),
+    // 2. Fallback in resources if packaged & writable
+    app.isPackaged ? path.join(process.resourcesPath, 'logs') : null,
     // 3. Absolute fallback — Desktop
     path.join(os.homedir(), 'Desktop'),
     // 4. Temp
@@ -48,7 +48,7 @@ function initLogger() {
   for (const dir of dirs) {
     try {
       fs.mkdirSync(dir, { recursive: true });
-      const candidate = path.join(dir, dir === os.tmpdir() ? 'webline-startup.log' : 'startup.log');
+      const candidate = path.join(dir, 'startup.log');
       fs.writeFileSync(candidate, ''); // truncate / create
       LOG_FILE = candidate;
       break;
@@ -123,11 +123,11 @@ L('ENV', `isDev = ${isDev}  (based on app.isPackaged)`);
 //  production   installer (app.isPackaged)  → dist/ + spawns packaged backend
 const ELECTRON_MODE  = process.env.ELECTRON_MODE || (app.isPackaged ? 'production' : 'local');
 const USES_VITE      = ELECTRON_MODE === 'local' || ELECTRON_MODE === 'docker-dev';
-const SPAWNS_BACKEND = ELECTRON_MODE === 'production' || app.isPackaged;
+const SPAWNS_BACKEND = ELECTRON_MODE === 'production' || process.env.SPAWNS_BACKEND === 'true';
 
 L('ENV', `ELECTRON_MODE  = ${ELECTRON_MODE}`);
 L('ENV', `USES_VITE      = ${USES_VITE}   (true → load http://localhost:5173)`);
-L('ENV', `SPAWNS_BACKEND = ${SPAWNS_BACKEND}  (true → spawn packaged backend/server.js)`);
+L('ENV', `SPAWNS_BACKEND = ${SPAWNS_BACKEND}  (true → Electron automatically spawns backend)`);
 
 // ─── Path placeholders ────────────────────────────────────────────────────────
 const DEV_URL = 'http://localhost:5173';
@@ -201,7 +201,7 @@ let mainWindow = null, splashWindow = null;
 
 // ─── SINGLE INSTANCE LOCK — DISABLED FOR DIAGNOSTIC ──────────────────────────
 // Set ENABLE_LOCK = true to re-enable after debugging is complete.
-const ENABLE_LOCK = false;
+const ENABLE_LOCK = true;
 if (ENABLE_LOCK) {
   const gotLock = app.requestSingleInstanceLock();
   L('LOCK', `requestSingleInstanceLock() = ${gotLock}`);
@@ -291,7 +291,7 @@ function createWindow() {
     x: validBounds?.x,
     y: validBounds?.y,
     minWidth: 1280, minHeight: 720,
-    title: 'Webline PMS Plus',
+    title: 'HPMS',
     backgroundColor: '#0d1117',
     show: false,
     resizable: true, maximizable: true, minimizable: true,
@@ -333,7 +333,9 @@ function createWindow() {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.show();
         L('SHOW', 'mainWindow.show() completed');
-        if (isDev) mainWindow.webContents.openDevTools({ mode: 'detach' });
+        if (isDev && process.env.ELECTRON_MODE !== 'production') {
+          mainWindow.webContents.openDevTools({ mode: 'detach' });
+        }
       }
     } catch (e) { LERR('SHOW', 'mainWindow.show() threw', e); }
   };
@@ -386,10 +388,13 @@ function createWindow() {
     });
   }
 
-  const targetApiBase = (process.env.VITE_API_BASE_URL || 'http://localhost:5000').replace(/\/+$/, '');
+  const targetApiBase = (process.env.VITE_API_BASE_URL || 'http://127.0.0.1:5000').replace(/\/+$/, '');
   const isAllowedOrigin = (testUrl) => {
     if (!testUrl) return false;
-    if (testUrl.startsWith('http://localhost:5000') || testUrl.startsWith('http://localhost:5173') || testUrl.startsWith(targetApiBase)) return true;
+    // Allow both localhost and 127.0.0.1 variants — macOS may resolve one or the other
+    if (testUrl.startsWith('http://localhost:5000') || testUrl.startsWith('http://127.0.0.1:5000')) return true;
+    if (testUrl.startsWith('http://localhost:5173') || testUrl.startsWith('http://127.0.0.1:5173')) return true;
+    if (testUrl.startsWith(targetApiBase)) return true;
     try {
       const hostname = new URL(testUrl).hostname;
       if (hostname.endsWith('.ngrok-free.dev') || hostname.endsWith('.ngrok.io')) return true;
@@ -520,7 +525,7 @@ L('READY', 'Registering app.whenReady() handler');
 app.whenReady().then(async () => {
   L('READY', 'app.whenReady() fired ✓');
 
-  app.setName('Webline PMS Plus');
+  app.setName('HPMS');
 
   // Resolve all paths
   let APP_ROOT;
@@ -548,52 +553,10 @@ app.whenReady().then(async () => {
   try { createSplashWindow(); } catch (e) { LERR('SPLASH', 'createSplashWindow threw', e); }
 
   // ── Mode-specific startup — reads ELECTRON_MODE constants set at top of file ─
-  L('MODE', `Startup mode: ${ELECTRON_MODE}  USES_VITE=${USES_VITE}  SPAWNS_BACKEND=${SPAWNS_BACKEND}`);
+  L('MODE', `Startup mode: ${ELECTRON_MODE}  USES_VITE=${USES_VITE}`);
 
-  if (SPAWNS_BACKEND) {
-    // ── PRODUCTION INSTALLER: spawn packaged backend, wait for health ─────────
-    // ONLY executes when app.isPackaged=true or ELECTRON_MODE=production.
-    // Development modes (local/docker-dev/docker) NEVER reach this branch.
-    L('BACKEND', 'Production mode — launching packaged backend from extraResources');
-    try {
-      const backendRoot = app.isPackaged ? process.resourcesPath : path.join(APP_ROOT, '..');
-      const serverPath  = path.join(backendRoot, 'backend', 'server.js');
-      L('BACKEND', `backendRoot  : ${backendRoot}`);
-      L('BACKEND', `server.js    : ${serverPath}`);
-      L('BACKEND', `server exists: ${fs.existsSync(serverPath)}`);
-
-      if (launchBackend) {
-        launchBackend(backendRoot);
-        L('BACKEND', 'launchBackend() called — waiting for health check...');
-      } else {
-        L('BACKEND', 'launchBackend not available (import failed) — assuming backend already running');
-      }
-
-      if (waitForBackend) {
-        await waitForBackend(5000, 30000);
-        L('BACKEND', 'Backend health check PASSED ✓');
-      } else {
-        L('BACKEND', 'waitForBackend not available — skipping health check');
-      }
-    } catch (err) {
-      LERR('BACKEND', 'Packaged backend startup failed', err);
-      closeSplash();
-      try {
-        const { response } = await dialog.showMessageBox({
-          type: 'error', title: 'Backend Failed',
-          message: 'The Webline PMS server failed to start.',
-          detail: `Error: ${err.message}\n\nLog: ${LOG_FILE}`,
-          buttons: ['Continue anyway', 'Exit'],
-        });
-        if (response === 1) { app.quit(); return; }
-        L('BACKEND', 'User chose "Continue anyway" despite backend failure');
-      } catch (de) { LERR('BACKEND', 'dialog.showMessageBox threw', de); }
-    }
-
-  } else if (USES_VITE) {
-    // ── LOCAL / DOCKER-DEV: Vite dev server + external backend ───────────────
-    // wait-on in the npm script guarantees both are up before Electron starts.
-    // These checks are a quick internal re-verification with friendly dialogs.
+  if (USES_VITE) {
+    // ── LOCAL / DOCKER-DEV: Vite dev server verification ─────────────────────
     L('VITE', `[${ELECTRON_MODE}] Verifying Vite on :5173...`);
     try {
       await waitForPort(5173, 15000);
@@ -601,51 +564,62 @@ app.whenReady().then(async () => {
     } catch (err) {
       L('VITE', `Vite :5173 not reachable: ${err.message} — continuing (wait-on should have caught this)`);
     }
+  }
 
-    L('BACKEND', `[${ELECTRON_MODE}] Verifying backend health on :5000...`);
-    if (waitForBackend) {
-      try {
-        await waitForBackend(5000, 15000);
-        L('BACKEND', 'Backend :5000 health confirmed ✓');
-      } catch (err) {
-        LERR('BACKEND', 'External backend health check failed', err);
-        closeSplash();
-        const hint = ELECTRON_MODE === 'local'
-          ? 'Run "npm run backend:dev" in a separate terminal first.'
-          : 'Run "docker compose up -d" and wait for the backend container to be healthy.';
-        try {
-          const { response } = await dialog.showMessageBox({
-            type: 'error', title: 'Backend Unavailable',
-            message: `Backend not reachable on localhost:5000\n\nMode: ${ELECTRON_MODE}`,
-            detail: `${hint}\n\nError: ${err.message}\nLog: ${LOG_FILE}`,
-            buttons: ['Continue anyway', 'Exit'],
-          });
-          if (response === 1) { app.quit(); return; }
-        } catch (de) { LERR('BACKEND', 'dialog threw', de); }
-      }
+  // ── Universal Backend Health Verification ──────────────────────────────────
+  if (SPAWNS_BACKEND && launchBackend) {
+    L('BACKEND', `[${ELECTRON_MODE}] Spawning background backend process from ${APP_ROOT}...`);
+    try {
+      await launchBackend(APP_ROOT);
+      L('BACKEND', 'launchBackend completed.');
+    } catch (launchErr) {
+      LERR('BACKEND', 'launchBackend failed to spawn process', launchErr);
     }
+  }
 
-  } else {
-    // ── DOCKER (production testing): no Vite, no backend spawn ───────────────
-    // wait-on in the npm script already confirmed backend health on :5000.
-    // dist/index.html must exist (run "npm run build" first).
-    L('BACKEND', `[${ELECTRON_MODE}] Verifying Docker backend health on :5000...`);
-    if (waitForBackend) {
+  let backendReady = false;
+  while (!backendReady) {
+    L('BACKEND', `[${ELECTRON_MODE}] Verifying backend health on :5000...`);
+    try {
+      if (waitForBackend) {
+        await waitForBackend(5000, 30000);
+      }
+      L('BACKEND', 'Backend :5000 health confirmed ✓');
+      backendReady = true;
+    } catch (err) {
+      LERR('BACKEND', 'Backend health check failed', err);
+      closeSplash();
+
+      const backendLogPath = path.join(app.getPath('userData'), 'logs', 'backend.log');
+      const hint = SPAWNS_BACKEND
+        ? `The HPMS backend service could not be started automatically.\n\nBackend log:\n${backendLogPath}`
+        : (USES_VITE && ELECTRON_MODE === 'local'
+            ? 'Please run "npm run backend:dev" in a separate terminal.'
+            : 'Please ensure the HPMS backend service is running at http://localhost:5000.');
+
       try {
-        await waitForBackend(5000, 15000);
-        L('BACKEND', 'Docker backend :5000 health confirmed ✓');
-      } catch (err) {
-        LERR('BACKEND', 'Docker backend health check failed', err);
-        closeSplash();
-        try {
-          const { response } = await dialog.showMessageBox({
-            type: 'error', title: 'Docker Backend Unavailable',
-            message: 'Docker backend not reachable on localhost:5000',
-            detail: 'Run "docker compose up -d" and wait for the backend\ncontainer healthcheck to pass, then retry electron:docker.\n\nError: ' + err.message,
-            buttons: ['Continue anyway', 'Exit'],
-          });
-          if (response === 1) { app.quit(); return; }
-        } catch (de) { LERR('BACKEND', 'dialog threw', de); }
+        const { response } = await dialog.showMessageBox({
+          type: 'error',
+          title: 'HPMS Backend Unavailable',
+          message: 'Could not connect to the HPMS backend service on port 5000.',
+          detail: `${hint}\n\nError details:\n${err.message}\n\nClick "Retry" once services are running, or "Exit" to close.`,
+          buttons: ['Retry', 'Exit'],
+          defaultId: 0,
+          cancelId: 1
+        });
+
+        if (response === 1) {
+          L('BACKEND', 'User chose Exit — closing application');
+          app.quit();
+          return;
+        }
+
+        L('BACKEND', 'User chose Retry — re-verifying backend health...');
+        try { createSplashWindow(); } catch {}
+      } catch (de) {
+        LERR('BACKEND', 'dialog.showMessageBox threw', de);
+        app.quit();
+        return;
       }
     }
   }
@@ -660,6 +634,30 @@ app.whenReady().then(async () => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       try { createSplashWindow(); createWindow(); } catch {}
+    }
+  });
+
+  app.on('window-all-closed', () => {
+    L('APP', 'All windows closed — initiating shutdown');
+    if (killBackend) {
+      try { killBackend(); } catch (ke) { LERR('APP', 'killBackend on window-all-closed threw', ke); }
+    }
+    if (process.platform !== 'darwin') {
+      app.quit();
+    }
+  });
+
+  app.on('before-quit', () => {
+    L('APP', 'before-quit received — terminating backend child process');
+    if (killBackend) {
+      try { killBackend(); } catch (ke) { LERR('APP', 'killBackend on before-quit threw', ke); }
+    }
+  });
+
+  app.on('will-quit', () => {
+    L('APP', 'will-quit received — finalizing backend process cleanup');
+    if (killBackend) {
+      try { killBackend(); } catch (ke) { LERR('APP', 'killBackend on will-quit threw', ke); }
     }
   });
 

@@ -28,9 +28,44 @@ export function AdminProtectedRoute({ children, navigate }) {
   return <>{children}</>;
 }
 
+/**
+ * hasPermission — case-insensitive role check.
+ * super_admin and admin always pass any protected route check.
+ * All other roles must be explicitly listed in allowedRoles.
+ */
 function hasPermission(userRole, allowedRoles) {
-  if (userRole === "ADMIN" || userRole === "admin") return true;
-  return allowedRoles.includes(userRole);
+  const roleUpper = (userRole || '').toUpperCase();
+  if (roleUpper === 'ADMIN' || roleUpper === 'SUPER_ADMIN') return true;
+  // Case-insensitive match against the allowed set
+  return allowedRoles.some(r => r.toUpperCase() === roleUpper);
+}
+
+/**
+ * Redirect a user to their correct dashboard based on role.
+ */
+function redirectToDashboard(role, navigate) {
+  const roleUpper = (role || '').toUpperCase();
+  switch (roleUpper) {
+    case 'SUPER_ADMIN':
+    case 'ADMIN':
+      navigate('/admin/dashboard');
+      break;
+    case 'RECEPTIONIST':
+      navigate('/reception/dashboard');
+      break;
+    case 'CHEF':
+    case 'KITCHEN_HELPER':
+      navigate('/kitchen/dashboard');
+      break;
+    case 'PANTRY_BOY':
+      navigate('/pantry/dashboard');
+      break;
+    case 'CLEANER':
+      navigate('/housekeeping/dashboard');
+      break;
+    default:
+      navigate('/admin/login');
+  }
 }
 
 export function RoleProtectedRoute({ children, navigate, allowedRoles }) {
@@ -43,29 +78,9 @@ export function RoleProtectedRoute({ children, navigate, allowedRoles }) {
     }
 
     if (!hasPermission(adminUser.role, allowedRoles)) {
-      alert("Access Denied: You don't have permission to view this dashboard.");
-      
-      // Auto-redirect to their correct dashboard
-      switch (adminUser.role) {
-        case 'ADMIN':
-        case 'admin':
-          navigate('/admin/dashboard');
-          break;
-        case 'RECEPTIONIST':
-          navigate('/reception/dashboard');
-          break;
-        case 'CHEF':
-          navigate('/kitchen/dashboard');
-          break;
-        case 'PANTRY_BOY':
-          navigate('/pantry/dashboard');
-          break;
-        case 'CLEANER':
-          navigate('/housekeeping/dashboard');
-          break;
-        default:
-          navigate('/admin/login');
-      }
+      console.warn(`[RoleProtectedRoute] Access denied for role '${adminUser.role}'. Allowed: [${allowedRoles.join(', ')}]`);
+      // Redirect to the dashboard the user is actually allowed to use
+      redirectToDashboard(adminUser.role, navigate);
     }
   }, [adminUser, navigate, allowedRoles]);
 

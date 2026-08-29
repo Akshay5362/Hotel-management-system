@@ -29,9 +29,12 @@
  */
 
 import pool from '../db.js';
+import { db } from '../config/firebaseAdmin.js';
 import { RoomStatusService } from '../services/roomStatusService.js';
 import { hasPermission } from './authController.js';
 import { BusinessDateService, BD_ERRORS } from '../services/businessDateService.js';
+import { isSettingsReadCanaryEnabled } from '../config/featureFlags.js';
+import { AuditHistoryCutoverService } from '../services/auditHistoryCutoverService.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -44,59 +47,64 @@ function requireReason(reason) {
 
 export const getBusinessDateInfo = async (req, res) => {
   try {
-    const businessDate = await BusinessDateService.getBusinessDate(pool);
+    const mysqlHandler = async () => {
+      const businessDate = await BusinessDateService.getBusinessDate(pool);
 
-    const [logs] = await pool.query(`
-      SELECT created_at 
-      FROM audit_logs 
-      WHERE action = 'DAY_END' 
-      ORDER BY created_at DESC 
-      LIMIT 1
-    `);
-    const lastDayEnd = logs.length > 0 ? logs[0].created_at : null;
+      const [logs] = await pool.query(`
+        SELECT created_at 
+        FROM audit_logs 
+        WHERE action = 'DAY_END' 
+        ORDER BY created_at DESC 
+        LIMIT 1
+      `);
+      const lastDayEnd = logs.length > 0 ? logs[0].created_at : null;
 
-    // Fetch room statuses to calculate stats
-    const processedRooms = await RoomStatusService.getRoomStatuses(pool, businessDate);
-    
-    let occupiedRooms    = 0;
-    let bookedRooms      = 0;
-    let dirtyRooms       = 0;
-    let pendingCheckouts = 0;
+      // Fetch room statuses to calculate stats
+      const processedRooms = await RoomStatusService.getRoomStatuses(pool, businessDate);
+      
+      let occupiedRooms    = 0;
+      let bookedRooms      = 0;
+      let dirtyRooms       = 0;
+      let pendingCheckouts = 0;
 
-    const bDateObj = new Date(businessDate);
-    bDateObj.setHours(0, 0, 0, 0);
+      const bDateObj = new Date(businessDate);
+      bDateObj.setHours(0, 0, 0, 0);
 
-    for (const room of processedRooms) {
-      if (room.status === 'occupied') {
-        occupiedRooms++;
-        if (room.expectedCheckOutDate) {
-          const expDateObj = new Date(room.expectedCheckOutDate);
-          expDateObj.setHours(0, 0, 0, 0);
-          if (expDateObj <= bDateObj) pendingCheckouts++;
+      for (const room of processedRooms) {
+        if (room.status === 'occupied') {
+          occupiedRooms++;
+          if (room.expectedCheckOutDate) {
+            const expDateObj = new Date(room.expectedCheckOutDate);
+            expDateObj.setHours(0, 0, 0, 0);
+            if (expDateObj <= bDateObj) pendingCheckouts++;
+          }
+        } else if (room.status === 'booked') {
+          bookedRooms++;
         }
-      } else if (room.status === 'booked') {
-        bookedRooms++;
+        if (room.status === 'dirty' || room.housekeeping_status === 'Dirty') {
+          dirtyRooms++;
+        }
       }
-      if (room.status === 'dirty' || room.housekeeping_status === 'Dirty') {
-        dirtyRooms++;
-      }
-    }
 
-    // Include mode so the UI can show DEV badge and allow reset button
-    const isDev = process.env.NODE_ENV === 'development';
+      // Include mode so the UI can show DEV badge and allow reset button
+      const isDev = process.env.NODE_ENV === 'development';
 
-    res.json({
-      businessDate,
-      systemDate: new Date().toISOString(),   // wall-clock for UI display only
-      lastDayEnd,
-      mode: isDev ? 'development' : 'production',
-      stats: {
-        occupiedRooms,
-        bookedRooms,
-        dirtyRooms,
-        pendingCheckouts
-      }
-    });
+      return {
+        businessDate,
+        systemDate: new Date().toISOString(),   // wall-clock for UI display only
+        lastDayEnd,
+        mode: isDev ? 'development' : 'production',
+        stats: {
+          occupiedRooms,
+          bookedRooms,
+          dirtyRooms,
+          pendingCheckouts
+        }
+      };
+    };
+
+    const result = await AuditHistoryCutoverService.getBusinessDateInfo(mysqlHandler);
+    res.json(result);
   } catch (error) {
     console.error('Error fetching business date info:', error);
     res.status(500).json({ error: 'Failed to fetch business date information.' });
@@ -113,7 +121,7 @@ export const updateBusinessDate = async (req, res) => {
   const clientIp = req.ip || req.connection?.remoteAddress || null;
 
   // ── 1. Permission check (permission-based, not hardcoded role) ────────────
-  const canOverride = await hasPermission(req, 'override_business_date');
+  const canOverride = await hasPermission(req, 'override_business_date', req.permissionOpts || {});
   if (!canOverride) {
     return res.status(403).json({
       error: 'Forbidden: You do not have permission to modify the Business Date.',
@@ -152,7 +160,94 @@ export const updateBusinessDate = async (req, res) => {
     }
   }
 
-  // ── 5. Acquire lock and execute ───────────────────────────────────────────
+  // ── 5. Firestore Primary Path ───────────────────────────────────────────
+  if (isFirebaseOnlyBusinessDateEnabled()) {
+    try {
+      const oldDate = await BusinessDateService.getBusinessDate();
+      let newDate;
+      let auditAction;
+
+      if (action === 'update') {
+        const targetIso = BusinessDateService.parseDate(date);
+        const cmp       = BusinessDateService.compareDates(targetIso, oldDate);
+
+        if (cmp === 0) {
+          return res.status(400).json({
+            error: `Business Date is already ${oldDate}. No change made.`,
+            code:  BD_ERRORS.SAME_DATE,
+          });
+        }
+
+        if (cmp < 0 && !force) {
+          return res.status(400).json({
+            error: `Business Date cannot move backward (current: ${oldDate}, requested: ${targetIso}). Set force=true to override.`,
+            code:  BD_ERRORS.BACKWARD,
+          });
+        }
+
+        await BusinessDateService.setBusinessDate(null, targetIso, { allowBackward: true, allowSameDate: false });
+        newDate     = targetIso;
+        auditAction = 'MANUAL_DATE_CHANGE';
+      } else if (action === 'rollback') {
+        const result = await BusinessDateService.rollbackBusinessDate(null, {
+          userId: adminId, username, role, reason: reason.trim(), clientIp,
+        });
+        newDate     = result.newDate;
+        auditAction = null;
+      } else if (action === 'reset_to_today') {
+        if (process.env.NODE_ENV !== 'development') {
+          return res.status(403).json({
+            error: 'Reset to Today is only available in development mode.',
+            code:  BD_ERRORS.PRODUCTION_GUARD,
+          });
+        }
+        const result = await BusinessDateService.resetToSystemDate(null, {
+          userId: adminId, username, role, reason: reason.trim(), clientIp,
+        });
+        newDate     = result.newDate;
+        auditAction = null;
+      }
+
+      if (auditAction) {
+        const auditDetails = `Manual Business Date change. Old: ${oldDate}, New: ${newDate}. Force: ${force}`;
+        const { createAuditLogFirestore } = await import('../repositories/firestore/auditLogsRepository.js');
+        await createAuditLogFirestore({
+          user_id: adminId,
+          action: auditAction,
+          details: auditDetails,
+          business_date: newDate,
+          previous_business_date: oldDate,
+          new_business_date: newDate,
+          reason: reason.trim(),
+          username: username || null,
+          role: role || null,
+          client_ip: clientIp || null,
+          application_version: '1.0.0'
+        });
+      }
+
+      console.log(`[Settings] Business Date changed (Firestore): ${oldDate} → ${newDate} (action=${action}, user=${username || adminId})`);
+
+      return res.json({
+        success: true,
+        message: `Business Date successfully changed from ${oldDate} to ${newDate}.`,
+        previousDate: oldDate,
+        newDate,
+        action,
+      });
+
+    } catch (error) {
+      if (error.name === 'BusinessDateError') {
+        return res.status(error.httpStatus || 400).json({
+          error: error.message,
+          code:  error.code,
+        });
+      }
+      console.warn('[Settings] Error updating business date (Firestore), attempting fallback:', error.message);
+    }
+  }
+
+  // ── 6. Legacy MySQL Fallback Path ────────────────────────────────────────
   let connection;
   try {
     connection = await pool.getConnection();
@@ -280,5 +375,31 @@ export const updateBusinessDate = async (req, res) => {
     res.status(500).json({ error: 'Failed to update business date. Please try again.' });
   } finally {
     if (connection) connection.release();
+  }
+};
+
+// ── GET /api/settings/hotel-config ──────────────────────────────────────────
+export const getHotelConfig = async (req, res) => {
+  try {
+    const { getHotelConfigFirestore } = await import('../repositories/firestore/systemSettingsRepository.js');
+    const config = await getHotelConfigFirestore();
+    return res.json({ success: true, config });
+  } catch (error) {
+    console.error('[Settings] Error fetching hotel config:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch hotel configuration.' });
+  }
+};
+
+// ── POST /api/settings/hotel-config ─────────────────────────────────────────
+export const updateHotelConfig = async (req, res) => {
+  try {
+    const { getHotelConfigFirestore, updateHotelConfigFirestore } = await import('../repositories/firestore/systemSettingsRepository.js');
+    const incomingConfig = req.body || {};
+    await updateHotelConfigFirestore(incomingConfig);
+    const updated = await getHotelConfigFirestore();
+    return res.json({ success: true, message: 'Hotel configuration updated successfully.', config: updated });
+  } catch (error) {
+    console.error('[Settings] Error updating hotel config:', error);
+    res.status(error.status || 500).json({ success: false, error: error.message || 'Failed to update hotel configuration.' });
   }
 };

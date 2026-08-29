@@ -70,4 +70,20 @@ release/
 win-unpacked/
 win-unpacked.tmp/
 dist-electron/
-*.exe
+*.exebackups/
+node_modules/
+.env
+/backups/
+scratch/
+
+# ========================
+# Local Backup & Scratch Tests
+# ========================
+backend/test-data-cleanup-backup/
+backend/tests/scratch*.mjs
+backend/tests/*.txt
+backend/tests/output/
+*_backup.json
+
+
+.env.production

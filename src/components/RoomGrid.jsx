@@ -1,7 +1,7 @@
 import React from 'react';
 import RoomCard from './RoomCard';
 
-export default function RoomGrid({ rooms, activeFilter, searchQuery, onRoomClick }) {
+export default function RoomGrid({ rooms, activeFilter, searchQuery, onRoomClick, showOperationalBadges = false }) {
   return (
     <div className="room-grid">
       {rooms.map((room) => {
@@ -22,6 +22,7 @@ export default function RoomGrid({ rooms, activeFilter, searchQuery, onRoomClick
             room={room} 
             onClick={onRoomClick}
             isDimmed={isDimmed}
+            showOperationalBadges={showOperationalBadges}
           />
         );
       })}

@@ -1,0 +1,46 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ── Global Deny-by-Default Fallback ──────────────────────────────────────
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    // ── Validation Helpers ────────────────────────────────────────────────────
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isStaff() {
+      return isAuthenticated() && 
+        (request.auth.token.role == 'admin' || request.auth.token.role == 'staff' || request.auth.token.role == 'receptionist');
+    }
+
+    function isValidImageOrPdf() {
+      return request.resource.contentType.matches('image/(jpeg|png|jpg)') ||
+             request.resource.contentType == 'application/pdf';
+    }
+
+    function isUnder5MB() {
+      return request.resource.size <= 5 * 1024 * 1024;
+    }
+
+    // ── Guest Documents (/guest-documents/{guestId}/*) ────────────────────────
+    match /guest-documents/{guestId}/{fileName} {
+      // Unauthenticated / Anonymous access is DENIED
+      allow read: if isStaff() || (isAuthenticated() && request.auth.uid == guestId);
+      allow create, update: if (isStaff() || (isAuthenticated() && request.auth.uid == guestId))
+                               && isValidImageOrPdf() && isUnder5MB();
+      allow delete: if isStaff();
+    }
+
+    // ── Inventory Photos (/inventory-photos/{productSku}/*) ───────────────────
+    match /inventory-photos/{productSku}/{fileName} {
+      // Anonymous read & write are DENIED by default
+      allow read: if isAuthenticated();
+      allow create, update: if isStaff() && isValidImageOrPdf() && isUnder5MB();
+      allow delete: if isStaff();
+    }
+  }
+}

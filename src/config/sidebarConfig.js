@@ -20,6 +20,7 @@ export const sidebarConfig = {
     { label: 'Guests',           icon: '👥', tab: 'guests'       },
     { label: 'Housekeeping',     icon: '🧹', tab: 'housekeeping' },
     { label: 'Inventory',        icon: '📦', tab: 'inventory'    },
+    { label: 'Food & Beverage',  icon: '🍽️', tab: 'food'         },  // Food POS Phase 1
     { label: 'Reports',          icon: '📈', action: 'reports'   },
     { label: 'Analytics',        icon: '📉', action: 'analytics' },
     { label: 'Cash Management',  icon: '💰', action: 'cash'      },
@@ -33,6 +34,7 @@ export const sidebarConfig = {
     { label: 'Room Booking', icon: '📅', tab: 'reservations'          },
     { label: 'Guest Search', icon: '🔍', tab: 'guests'                },
     { label: 'Cash Handover',icon: '💸', action: 'cash'               },
+    { label: 'Food Orders',  icon: '🍽️', tab: 'food'                  },  // Food POS Phase 1
     { label: 'Settings',     icon: '⚙️', action: 'settings'           },
   ],
   CHEF: [

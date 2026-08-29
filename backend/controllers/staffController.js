@@ -9,8 +9,45 @@
  */
 
 import pool from '../db.js';
+import { db, auth, isFirebaseConfigured } from '../config/firebaseAdmin.js';
 import bcrypt from 'bcryptjs';
-import { generateToken } from './authController.js';
+import { isStaffReadCanaryEnabled, isFirebaseOnlyStaffResolutionEnabled, isFirebaseStaffLoginEnabled, isMysqlCutoverFallbacksDisabled } from '../config/featureFlags.js';
+import { StaffCutoverService } from '../services/staffCutoverService.js';
+
+export async function syncStaffFirebaseClaims(staff) {
+  if (!isFirebaseConfigured || !auth) return;
+  const uid = `staff_${String(staff.username).toLowerCase().trim()}`;
+  try {
+    let existingUser;
+    try {
+      existingUser = await auth.getUser(uid);
+    } catch (e) {
+      if (e.code === 'auth/user-not-found') {
+        console.warn(`[syncStaffFirebaseClaims] Firebase Auth user '${uid}' not found. Run Phase 3 Step 3A provisioning script.`);
+        return;
+      }
+      throw e;
+    }
+    const existing = existingUser.customClaims || {};
+    const required = {
+      role: staff.role,
+      user_type: 'staff',
+      mysql_id: Number(staff.id),
+      mysql_staff_id: Number(staff.id),
+      staff_username: String(staff.username).toLowerCase().trim(),
+      status: staff.status || 'Active',
+      deleted: staff.deleted ? 1 : 0
+    };
+    // Check whether update is needed
+    const needsUpdate = Object.entries(required).some(([k, v]) => existing[k] !== v);
+    if (needsUpdate) {
+      await auth.setCustomUserClaims(uid, { ...existing, ...required });
+      console.log(`[syncStaffFirebaseClaims] Claims synced for '${uid}' (role=${staff.role}, status=${staff.status})`);
+    }
+  } catch (err) {
+    console.warn(`[syncStaffFirebaseClaims] Non-fatal: Failed to sync Firebase claims for '${uid}':`, err.message);
+  }
+}
 
 const BCRYPT_ROUNDS = 12;
 
@@ -60,15 +97,32 @@ function validateStaffPayload(body, requirePassword = true) {
   return errors;
 }
 
-// Strip sensitive fields before returning
+// Strip sensitive fields before returning or sending to outbox
 function sanitize(staff) {
-  const { password_hash, deleted, ...safe } = staff;
+  if (!staff) return null;
+  const { password_hash, password, deleted, ...safe } = staff;
   return safe;
 }
 
 // ── POST /api/staff/auth/login ─────────────────────────────────────────────────
-// Email + bcrypt password only. Username is a display name, NOT a login key.
+/**
+ * Phase 3 Step 3C:
+ * When ENABLE_FIREBASE_STAFF_LOGIN=true, this MySQL-based endpoint is DISABLED.
+ * Staff must authenticate through Firebase Authentication (signInWithEmailAndPassword)
+ * to obtain a Firebase ID token, which is then verified by the backend via /api/auth/me.
+ *
+ * When ENABLE_FIREBASE_STAFF_LOGIN=false (default): behavior is unchanged.
+ */
 export const staffLogin = async (req, res) => {
+  // ── Phase 3 Step 3C: Firebase-Only Staff Login Guard ────────────────────────
+  if (isFirebaseStaffLoginEnabled() || isMysqlCutoverFallbacksDisabled()) {
+    return res.status(401).json({
+      error: 'Staff login via email/password is disabled. Please use Firebase Authentication to obtain an ID token.',
+      code: 'FIREBASE_LOGIN_REQUIRED',
+      hint: 'Use Firebase signInWithEmailAndPassword then call /api/auth/me with the Bearer ID token.'
+    });
+  }
+
   const { email, password } = req.body;
 
   if (!email || typeof email !== 'string' || !email.trim())
@@ -87,7 +141,6 @@ export const staffLogin = async (req, res) => {
 
     const staff = rows[0];
 
-    // Block inactive accounts before doing bcrypt (saves CPU on disabled accounts)
     if (staff.status === 'Inactive')
       return res.status(403).json({ error: 'Your account is inactive. Please contact an administrator.' });
 
@@ -95,20 +148,10 @@ export const staffLogin = async (req, res) => {
     if (!passwordMatch)
       return res.status(401).json({ error: 'Invalid email or password.' });
 
-    // Update last_login timestamp (fire-and-forget — never block the login response)
-    pool.query('UPDATE staff SET last_login = NOW() WHERE id = ?', [staff.id]).catch(() => {});
-
-    // Build a signed token. type:'staff' distinguishes it from admin/guest tokens.
-    const tokenPayload = {
-      id:   staff.id,
-      role: staff.role,       // e.g. 'RECEPTIONIST'
-      type: 'staff',          // sentinel — allows middleware to identify staff tokens
-    };
-    const token = generateToken(tokenPayload);
-
     return res.json({
       message: 'Logged in successfully.',
-      token,
+      token: null,
+      idToken: null,
       staff: {
         id:         staff.id,
         name:       staff.full_name,
@@ -129,25 +172,8 @@ export const staffLogin = async (req, res) => {
 // ── GET /api/staff ─────────────────────────────────────────────────────────────
 export const getAllStaff = async (req, res) => {
   try {
-    const { role, department, shift, status, search } = req.query;
-    let where = ['deleted = 0'];
-    const params = [];
-
-    if (role)       { where.push('role = ?');       params.push(role); }
-    if (department) { where.push('department = ?'); params.push(department); }
-    if (shift)      { where.push('shift = ?');      params.push(shift); }
-    if (status)     { where.push('status = ?');     params.push(status); }
-    if (search) {
-      where.push('(full_name LIKE ? OR username LIKE ? OR email LIKE ?)');
-      const like = `%${search}%`;
-      params.push(like, like, like);
-    }
-
-    const [rows] = await pool.query(
-      `SELECT * FROM staff WHERE ${where.join(' AND ')} ORDER BY full_name ASC`,
-      params
-    );
-    return res.json({ staff: rows.map(sanitize), total: rows.length });
+    const result = await StaffCutoverService.getAllStaff(req.query);
+    return res.json(result);
   } catch (error) {
     console.error('getAllStaff error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
@@ -158,12 +184,9 @@ export const getAllStaff = async (req, res) => {
 export const getStaffById = async (req, res) => {
   try {
     const { id } = req.params;
-    const [rows] = await pool.query(
-      'SELECT * FROM staff WHERE id = ? AND deleted = 0',
-      [id]
-    );
-    if (rows.length === 0) return res.status(404).json({ error: 'Staff member not found.' });
-    return res.json({ staff: sanitize(rows[0]) });
+    const staff = await StaffCutoverService.getStaffById(id);
+    if (!staff) return res.status(404).json({ error: 'Staff member not found.' });
+    return res.json({ staff });
   } catch (error) {
     console.error('getStaffById error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
@@ -175,35 +198,12 @@ export const createStaff = async (req, res) => {
   const errors = validateStaffPayload(req.body, true);
   if (errors.length) return res.status(400).json({ error: 'Validation failed.', details: errors });
 
-  const { full_name, username, email, password, role, department, shift, phone, status } = req.body;
-
   try {
-    const password_hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-
-    const [result] = await pool.query(
-      `INSERT INTO staff (full_name, username, email, password_hash, role, department, shift, phone, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        full_name.trim(),
-        username.trim().toLowerCase(),
-        email.trim().toLowerCase(),
-        password_hash,
-        role,
-        department,
-        shift,
-        phone?.trim() || null,
-        status || 'Active',
-      ]
-    );
-
-    const [rows] = await pool.query('SELECT * FROM staff WHERE id = ?', [result.insertId]);
-    return res.status(201).json({ message: 'Staff member created successfully.', staff: sanitize(rows[0]) });
+    const safeStaff = await StaffCutoverService.createStaff(req.body);
+    return res.status(201).json({ message: 'Staff member created successfully.', staff: safeStaff });
   } catch (error) {
-    if (error.code === 'ER_DUP_ENTRY') {
-      if (error.message.includes('username'))
-        return res.status(409).json({ error: 'Username is already taken. Please choose a different username.' });
-      if (error.message.includes('email'))
-        return res.status(409).json({ error: 'Email address is already registered to another staff member.' });
+    if (error.status === 409 || error.code === 'ER_DUP_ENTRY' || error.code === 'DUPLICATE_KEY') {
+      return res.status(409).json({ error: error.message || 'Username or email already exists.' });
     }
     console.error('createStaff error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
@@ -214,41 +214,16 @@ export const createStaff = async (req, res) => {
 export const updateStaff = async (req, res) => {
   const { id } = req.params;
 
-  // For updates, password is optional
   const errors = validateStaffPayload(req.body, !!req.body.password);
   if (errors.length) return res.status(400).json({ error: 'Validation failed.', details: errors });
 
   try {
-    const [existing] = await pool.query('SELECT id FROM staff WHERE id = ? AND deleted = 0', [id]);
-    if (existing.length === 0) return res.status(404).json({ error: 'Staff member not found.' });
-
-    const { full_name, username, email, password, role, department, shift, phone, status } = req.body;
-
-    const updates = {
-      full_name: full_name.trim(),
-      username: username.trim().toLowerCase(),
-      email: email.trim().toLowerCase(),
-      role,
-      department,
-      shift,
-      phone: phone?.trim() || null,
-      status: status || 'Active',
-    };
-
-    if (password) {
-      updates.password_hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    }
-
-    await pool.query('UPDATE staff SET ? WHERE id = ?', [updates, id]);
-
-    const [rows] = await pool.query('SELECT * FROM staff WHERE id = ?', [id]);
-    return res.json({ message: 'Staff member updated successfully.', staff: sanitize(rows[0]) });
+    const safeStaff = await StaffCutoverService.updateStaff(id, req.body);
+    return res.json({ message: 'Staff member updated successfully.', staff: safeStaff });
   } catch (error) {
-    if (error.code === 'ER_DUP_ENTRY') {
-      if (error.message.includes('username'))
-        return res.status(409).json({ error: 'Username is already taken.' });
-      if (error.message.includes('email'))
-        return res.status(409).json({ error: 'Email address is already registered to another staff member.' });
+    if (error.status === 404) return res.status(404).json({ error: 'Staff member not found.' });
+    if (error.status === 409 || error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: error.message || 'Username or email is already taken.' });
     }
     console.error('updateStaff error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
@@ -264,12 +239,10 @@ export const updateStaffStatus = async (req, res) => {
     return res.status(400).json({ error: `status must be one of: ${VALID_STATUSES.join(', ')}.` });
 
   try {
-    const [existing] = await pool.query('SELECT id FROM staff WHERE id = ? AND deleted = 0', [id]);
-    if (existing.length === 0) return res.status(404).json({ error: 'Staff member not found.' });
-
-    await pool.query('UPDATE staff SET status = ? WHERE id = ?', [status, id]);
+    await StaffCutoverService.updateStaffStatus(id, status);
     return res.json({ message: `Staff status updated to ${status}.` });
   } catch (error) {
+    if (error.status === 404) return res.status(404).json({ error: 'Staff member not found.' });
     console.error('updateStaffStatus error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
   }
@@ -280,16 +253,10 @@ export const deleteStaff = async (req, res) => {
   const { id } = req.params;
 
   try {
-    const [existing] = await pool.query('SELECT id FROM staff WHERE id = ? AND deleted = 0', [id]);
-    if (existing.length === 0) return res.status(404).json({ error: 'Staff member not found.' });
-
-    // Soft delete: mark deleted=1 and set status=Inactive. Record is preserved for audit.
-    await pool.query(
-      "UPDATE staff SET deleted = 1, status = 'Inactive' WHERE id = ?",
-      [id]
-    );
-    return res.json({ message: 'Staff member removed. Record retained for audit trail.' });
+    const result = await StaffCutoverService.deleteStaff(id);
+    return res.json(result);
   } catch (error) {
+    if (error.status === 404) return res.status(404).json({ error: 'Staff member not found.' });
     console.error('deleteStaff error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
   }

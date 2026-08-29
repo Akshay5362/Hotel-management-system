@@ -19,6 +19,59 @@ export default function IdentityVerificationModal({ isOpen, onClose, token, room
   const [imgError, setImgError] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
+  const [docBlobUrl, setDocBlobUrl] = useState(null);
+  const [isDocLoading, setIsDocLoading] = useState(false);
+  const [docLoadError, setDocLoadError] = useState(null);
+
+  useEffect(() => {
+    let activeUrl = null;
+    let isCancelled = false;
+
+    if (selectedDoc && selectedDoc.id_document_path) {
+      setIsDocLoading(true);
+      setDocLoadError(null);
+      setImgError(false);
+
+      const rawPath = selectedDoc.id_document_path;
+      const cleanFilename = rawPath.replace(/^\/?guest-documents\//, '').replace(/^\/+/, '');
+
+      fetch(`${API_URL}/admin/guest-documents/file/${encodeURIComponent(cleanFilename)}`, {
+        headers: getApiHeaders(token)
+      })
+        .then(async res => {
+          if (!res.ok) {
+            const errJson = await res.json().catch(() => ({}));
+            throw new Error(errJson.error || `Failed to load document (${res.status})`);
+          }
+          return res.blob();
+        })
+        .then(blob => {
+          if (!isCancelled) {
+            activeUrl = URL.createObjectURL(blob);
+            setDocBlobUrl(activeUrl);
+            setIsDocLoading(false);
+          }
+        })
+        .catch(err => {
+          if (!isCancelled) {
+            setDocLoadError(err.message);
+            setIsDocLoading(false);
+          }
+        });
+    } else {
+      setDocBlobUrl(null);
+      setIsDocLoading(false);
+      setDocLoadError(null);
+    }
+
+    return () => {
+      isCancelled = true;
+      if (activeUrl) {
+        URL.revokeObjectURL(activeUrl);
+      }
+    };
+  }, [selectedDoc, token]);
+
   useEffect(() => {
     if (isOpen) {
       setSelectedDoc(null);
@@ -249,36 +302,56 @@ export default function IdentityVerificationModal({ isOpen, onClose, token, room
                 </div>
 
                 {/* Document Preview */}
-                <div style={{ background: 'rgba(0,0,0,0.35)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.08)', overflow: 'hidden', minHeight: '220px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  {selectedDoc.id_document_path && !selectedDoc.id_document_path.endsWith('.pdf') ? (
-                    imgError ? (
-                      <div style={{ padding: '30px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-                        <div style={{ fontSize: '2.5rem', marginBottom: '8px' }}>🖼️</div>
-                        <div>Image could not be loaded.</div>
-                        <a href={getAssetUrl(`/guest-documents/${selectedDoc.id_document_path}`)} target="_blank" rel="noopener noreferrer" style={{ color: '#38bdf8', fontSize: '0.8rem', marginTop: '6px', display: 'inline-block' }}>
-                          Open file directly →
-                        </a>
-                      </div>
+                <div style={{ background: 'rgba(0,0,0,0.35)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.08)', overflow: 'hidden', minHeight: '220px', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '10px' }}>
+                  {isDocLoading ? (
+                    <div style={{ padding: '30px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
+                      <div style={{ fontSize: '1.5rem', marginBottom: '8px' }}>⏳</div>
+                      <div>Loading secure document...</div>
+                    </div>
+                  ) : docLoadError ? (
+                    <div style={{ padding: '30px', textAlign: 'center', color: '#f87171', fontSize: '0.85rem' }}>
+                      <div style={{ fontSize: '2rem', marginBottom: '8px' }}>⚠️</div>
+                      <div>{docLoadError}</div>
+                    </div>
+                  ) : selectedDoc.id_document_path && docBlobUrl ? (
+                    !selectedDoc.id_document_path.toLowerCase().endsWith('.pdf') ? (
+                      imgError ? (
+                        <div style={{ padding: '30px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
+                          <div style={{ fontSize: '2.5rem', marginBottom: '8px' }}>🖼️</div>
+                          <div>Image preview could not be displayed.</div>
+                          <a href={docBlobUrl} target="_blank" rel="noopener noreferrer" style={{ color: '#38bdf8', fontSize: '0.8rem', marginTop: '6px', display: 'inline-block' }}>
+                            Open file directly →
+                          </a>
+                        </div>
+                      ) : (
+                        <div style={{ textAlign: 'center', width: '100%' }}>
+                          <img
+                            src={docBlobUrl}
+                            alt="Guest ID Document"
+                            onError={() => setImgError(true)}
+                            style={{ maxWidth: '100%', maxHeight: '320px', objectFit: 'contain', borderRadius: '6px' }}
+                          />
+                          <div>
+                            <a href={docBlobUrl} target="_blank" rel="noopener noreferrer" style={{ color: '#38bdf8', fontSize: '0.8rem', marginTop: '8px', display: 'inline-block' }}>
+                              Open file in new tab ↗
+                            </a>
+                          </div>
+                        </div>
+                      )
                     ) : (
-                      <img
-                        src={getAssetUrl(`/guest-documents/${selectedDoc.id_document_path}`)}
-                        alt="Guest ID Document"
-                        onError={() => setImgError(true)}
-                        style={{ maxWidth: '100%', maxHeight: '320px', objectFit: 'contain', borderRadius: '6px' }}
-                      />
+                      <object
+                        data={docBlobUrl}
+                        type="application/pdf"
+                        width="100%"
+                        height="320px"
+                      >
+                        <div style={{ textAlign: 'center', padding: '20px' }}>
+                          <a href={docBlobUrl} target="_blank" rel="noopener noreferrer" style={{ color: '#38bdf8', fontSize: '0.9rem' }}>
+                            📄 Open Secure PDF Document →
+                          </a>
+                        </div>
+                      </object>
                     )
-                  ) : selectedDoc.id_document_path?.endsWith('.pdf') ? (
-                    <object
-                      data={getAssetUrl(`/guest-documents/${selectedDoc.id_document_path}`)}
-                      type="application/pdf"
-                      width="100%"
-                      height="320px"
-                    >
-                      <a href={getAssetUrl(`/guest-documents/${selectedDoc.id_document_path}`)} target="_blank" rel="noopener noreferrer" style={{ color: '#38bdf8' }}>
-                        Open PDF →
-                      </a>
-                    </object>
-
                   ) : (
                     <div style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>No document file attached.</div>
                   )}

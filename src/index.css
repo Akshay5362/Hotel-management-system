@@ -1200,3 +1200,44 @@ input:focus, select:focus, textarea:focus {
   50%       { transform: translateY(-10px); }
 }
 
+/* ==========================================================================
+   Dark Theme Dropdown & Option Visibility Fix (Chrome / Windows / Edge)
+   ========================================================================== */
+select, input, textarea {
+  color-scheme: dark;
+}
+
+select {
+  background-color: #0f172a;
+  color: #f8fafc;
+}
+
+select option {
+  background-color: #0f172a !important;
+  color: #f8fafc !important;
+  padding: 8px 12px;
+}
+
+select option:checked {
+  background-color: #0284c7 !important;
+  color: #ffffff !important;
+}
+
+select option:hover,
+select option:focus {
+  background-color: #1e293b !important;
+  color: #38bdf8 !important;
+}
+
+select option:disabled {
+  color: #64748b !important;
+  background-color: #0f172a !important;
+}
+
+select optgroup {
+  background-color: #0f172a !important;
+  color: #94a3b8 !important;
+  font-weight: 700;
+}
+
+

@@ -32,6 +32,7 @@ export default function ReservationModule({ token, user, onNavigate, showAlert, 
     reservationNumber: 'Auto Generated',
     guestName: '',
     phone: '',
+    dateOfBirth: '',
     email: '',
     address: '',
     nationality: 'Indian',
@@ -283,6 +284,7 @@ export default function ReservationModule({ token, user, onNavigate, showAlert, 
       reservationNumber: res.reservation_number,
       guestName: res.guest_name || '',
       phone: res.phone || '',
+      dateOfBirth: res.date_of_birth || '',
       email: res.email || '',
       address: res.address || '',
       nationality: res.nationality || 'Indian',
@@ -596,9 +598,13 @@ export default function ReservationModule({ token, user, onNavigate, showAlert, 
                   <input type="text" name="phone" value={formData.phone} onChange={handleInputChange} required placeholder="+91 9876543210" style={inputStyle} />
                 </div>
                 <div style={formGroupStyle}>
-                  <label style={labelStyle}>Email Address</label>
-                  <input type="email" name="email" value={formData.email} onChange={handleInputChange} placeholder="guest@example.com" style={inputStyle} />
+                  <label style={labelStyle}>Date of Birth (Optional)</label>
+                  <input type="date" name="dateOfBirth" value={formData.dateOfBirth} onChange={handleInputChange} style={inputStyle} />
                 </div>
+              </div>
+              <div style={formGroupStyle}>
+                <label style={labelStyle}>Email Address</label>
+                <input type="email" name="email" value={formData.email} onChange={handleInputChange} placeholder="guest@example.com" style={inputStyle} />
               </div>
               <div style={formGroupStyle}>
                 <label style={labelStyle}>Residential Address</label>

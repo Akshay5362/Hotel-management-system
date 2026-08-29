@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import Toolbar from './components/Toolbar';
 import RoomGrid from './components/RoomGrid';
 import MetricsBar from './components/MetricsBar';
@@ -23,7 +23,9 @@ import { ReceptionDashboard, KitchenDashboard, PantryDashboard, HousekeepingDash
 import ReceptionPortal from './components/ReceptionPortal';
 import Sidebar from './components/Sidebar';
 import RoomInspectorDrawer from './components/RoomInspectorDrawer';
+import { auth } from './config/firebaseClient';
 import InventoryModule from './components/InventoryModule';
+import FoodPOS from './components/food/FoodPOS';           // Food POS Phase 1 — Menu Master
 import { io } from 'socket.io-client';
 import { API_URL, SOCKET_URL, getApiHeaders } from './config/apiConfig';
 
@@ -157,7 +159,33 @@ function AppContent() {
   
   // Modal controllers
   const [activeModal, setActiveModal] = useState(null); // 'checkin' | 'checkout' | 'shifting' | 'cash' | 'reports' | null
-  const [selectedRoom, setSelectedRoom] = useState(null);
+  const [selectedRoomNumber, setSelectedRoomNumber] = useState(null);
+
+  // Authoritative live selected room derived continuously from rooms array (Single Source of Truth)
+  const liveSelectedRoom = React.useMemo(() => {
+    if (!selectedRoomNumber) return null;
+    const selStr = String(selectedRoomNumber).trim();
+    // IMPORTANT: Never compare r.id (legacy MySQL surrogate PK) against the visible room number.
+    // r.id values do NOT correspond to canonical room numbers after migration
+    // (e.g. Room 12 has mysql id=17, Room 17 has mysql id=14), causing cross-room collisions.
+    // Resolve exclusively by canonical visible number or Firestore document ID.
+    const found = rooms.find(
+      r => String(r.number) === selStr || String(r.doc_id) === selStr
+    );
+    return found || null;
+  }, [rooms, selectedRoomNumber]);
+
+  const setSelectedRoom = React.useCallback((roomOrNum) => {
+    if (!roomOrNum) {
+      setSelectedRoomNumber(null);
+    } else if (typeof roomOrNum === 'object') {
+      // Store canonical room number; fall back to Firestore doc_id.
+      // Never fall back to roomOrNum.id (MySQL surrogate PK) — it does not equal the visible room number.
+      setSelectedRoomNumber(String(roomOrNum.number || roomOrNum.doc_id || ''));
+    } else {
+      setSelectedRoomNumber(String(roomOrNum));
+    }
+  }, []);
 
   // Business context
   const [systemDate, setSystemDate] = useState('11-Jul-2026');
@@ -169,7 +197,9 @@ function AppContent() {
   // Transaction Cash Logs
   const [cashLog, setCashLog] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [isBackendOnline, setIsBackendOnline] = useState(false);
+  const [isBackendOnline, setIsBackendOnline] = useState(true);
+  const [dataStatus, setDataStatus] = useState('fresh'); // 'fresh' | 'stale' | 'degraded'
+  const [staleReason, setStaleReason] = useState(null);
   const [upcomingReservations, setUpcomingReservations] = useState([]);
   const [refundPolicy, setRefundPolicy] = useState({ noStayPct: 100, partialStayPct: 50, fullStayPct: 0, partialHours: 12 });
 
@@ -199,7 +229,29 @@ function AppContent() {
     if ((path === '/login' || path === '/signup') && guestUser) {
       navigate('/dashboard');
     } else if (path === '/admin/login' && adminUser) {
-      navigate('/admin/dashboard');
+      // Route to the correct dashboard based on stored role — do NOT always route to /admin/dashboard
+      const roleUpper = (adminUser.role || '').toUpperCase();
+      switch (roleUpper) {
+        case 'SUPER_ADMIN':
+        case 'ADMIN':
+          navigate('/admin/dashboard');
+          break;
+        case 'RECEPTIONIST':
+          navigate('/reception/dashboard');
+          break;
+        case 'CHEF':
+        case 'KITCHEN_HELPER':
+          navigate('/kitchen/dashboard');
+          break;
+        case 'PANTRY_BOY':
+          navigate('/pantry/dashboard');
+          break;
+        case 'CLEANER':
+          navigate('/housekeeping/dashboard');
+          break;
+        default:
+          navigate('/admin/dashboard');
+      }
     }
   }, [currentPath, guestUser, adminUser]);
 
@@ -262,8 +314,15 @@ function AppContent() {
     });
   };
 
+  // In-flight guard to prevent duplicate concurrent status fetches
+  const statusFetchInFlightRef = useRef(false);
+
   // Load status from backend
   const fetchStatus = useCallback(async () => {
+    if (statusFetchInFlightRef.current) {
+      return; // Avoid duplicate concurrent in-flight status fetches
+    }
+
     const currentToken = adminToken || guestToken;
     const tokenSource = adminToken ? 'AdminAuthContext (localStorage adminToken)' : (guestToken ? 'GuestAuthContext (localStorage guestToken)' : 'None');
     if (!currentToken) {
@@ -271,6 +330,7 @@ function AppContent() {
       return;
     }
 
+    statusFetchInFlightRef.current = true;
     const requestUrl = `${API_URL}/status?_t=${new Date().getTime()}`;
     const authHeader = `Bearer ${currentToken}`;
 
@@ -281,7 +341,7 @@ function AppContent() {
 
       console.log(`[API Request] URL: ${requestUrl} | Token Source: ${tokenSource} | Auth Header: ${authHeader.substring(0, 20)}...`);
 
-      const res = await fetch(requestUrl, { 
+      let res = await fetch(requestUrl, { 
         signal: controller.signal,
         headers: getApiHeaders(currentToken)
       });
@@ -292,40 +352,104 @@ function AppContent() {
       // Any HTTP response from server means backend is reachable and online
       setIsBackendOnline(true);
 
-      if (res.status === 401 || res.status === 403) {
-        console.warn(`[API Auth Warning] Server returned HTTP ${res.status} (Unauthorized/Forbidden).`);
-        const isAdminPath = window.location.pathname.includes('admin');
-        if (isAdminPath) {
-          adminLogout();
-          navigate('/admin/login');
-        } else {
-          guestLogout();
-          navigate('/login');
+      // Handle 401 with graceful token refresh and a single immediate retry
+      if (res.status === 401) {
+        console.warn('[API Auth Warning] Server returned HTTP 401. Attempting token refresh and single retry...');
+        let refreshedSuccessfully = false;
+
+        if (auth && auth.currentUser) {
+          try {
+            const freshToken = await auth.currentUser.getIdToken(true);
+            if (freshToken) {
+              if (adminToken) {
+                localStorage.setItem('adminToken', freshToken);
+              } else if (guestToken) {
+                localStorage.setItem('guestToken', freshToken);
+              }
+
+              // Retry the request once with the fresh token
+              const retryController = new AbortController();
+              const retryTimeout = setTimeout(() => retryController.abort(), 5000);
+              const retryRes = await fetch(requestUrl, {
+                signal: retryController.signal,
+                headers: getApiHeaders(freshToken)
+              });
+              clearTimeout(retryTimeout);
+
+              if (retryRes.ok) {
+                res = retryRes;
+                refreshedSuccessfully = true;
+                console.log('[API Auth Recovery] Retry succeeded with refreshed token.');
+              } else if (retryRes.status === 401) {
+                console.warn('[API Auth Warning] Retry still returned 401 after token refresh.');
+              }
+            }
+          } catch (refreshErr) {
+            console.warn('[API Auth Warning] Token refresh attempt threw:', refreshErr.message);
+          }
         }
+
+        // If refresh + retry failed and user is genuinely unauthenticated in Firebase
+        if (!refreshedSuccessfully) {
+          if (!auth || !auth.currentUser) {
+            console.warn('[API Auth Warning] User is not authenticated in Firebase. Logging out.');
+            const isAdminPath = window.location.pathname.includes('admin');
+            if (isAdminPath) {
+              adminLogout();
+              navigate('/admin/login');
+            } else {
+              guestLogout();
+              navigate('/login');
+            }
+            return;
+          }
+          // If auth.currentUser still exists, do not destroy session prematurely on transient error
+          console.warn('[API Auth Warning] Skipping hard logout because Firebase session is still active.');
+          return;
+        }
+      }
+
+      // Handle 403: Forbidden (Role / Permission check failed — do NOT logout authenticated users)
+      if (res.status === 403) {
+        console.warn('[API Auth Warning] Server returned HTTP 403 (Forbidden: user lacks permission). Session preserved.');
         return;
       }
 
-      if (!res.ok) {
-        const errorText = await res.text().catch(() => '');
-        console.error(`[API Server Error] HTTP ${res.status} - ${errorText}`);
-        throw new Error(`Failed to fetch dashboard data: HTTP ${res.status}`);
+      if (res.ok) {
+        const data = await res.json();
+        console.log('[API Response Body]', data);
+
+        if (Array.isArray(data.rooms)) {
+          setRooms(data.rooms);
+        }
+        if (data.systemDate) setSystemDate(data.systemDate);
+        if (data.todayCheckins !== undefined) setTodayCheckins(data.todayCheckins);
+        if (data.todayCheckouts !== undefined) setTodayCheckouts(data.todayCheckouts);
+        if (data.continuedRooms !== undefined) setContinuedRooms(data.continuedRooms);
+        if (data.cashLog) setCashLog(data.cashLog);
+        if (data.upcomingReservations) setUpcomingReservations(data.upcomingReservations || []);
+
+        setDataStatus(data.data_status || 'fresh');
+        setStaleReason(data.stale_reason || null);
+      } else {
+        const errorJson = await res.json().catch(() => null);
+        console.warn('[API Server Warning] Non-200 status response from backend:', res.status, errorJson);
+        if (res.status === 503 || errorJson?.code === 'FIRESTORE_RESOURCE_EXHAUSTED') {
+          setDataStatus('degraded');
+          setStaleReason('FIRESTORE_RESOURCE_EXHAUSTED');
+        }
       }
-
-      const data = await res.json();
-      console.log('[API Response Body]', data);
-
-      setRooms(data.rooms);
-      setSystemDate(data.systemDate);
-      setTodayCheckins(data.todayCheckins);
-      setTodayCheckouts(data.todayCheckouts);
-      setContinuedRooms(data.continuedRooms);
-      setCashLog(data.cashLog);
-      setUpcomingReservations(data.upcomingReservations || []);
     } catch (err) {
-      console.error('[API Network Error] Backend unreachable / connection error:', err);
-      setIsBackendOnline(false);
+      if (err.name === 'AbortError') {
+        console.warn('[API Warning] Status request timed out (5s). Preserving backend online state.');
+        setDataStatus('degraded');
+        setStaleReason('REQUEST_TIMEOUT');
+      } else {
+        console.error('[API Network Error] Backend unreachable / connection error:', err);
+        setIsBackendOnline(false);
+      }
     } finally {
-      // Always stop loading — no matter what happens
+      statusFetchInFlightRef.current = false;
       setIsLoading(false);
     }
   }, [adminToken, guestToken, navigate]);
@@ -376,6 +500,13 @@ function AppContent() {
       document.dispatchEvent(new CustomEvent('guest-request-refresh'));
     });
 
+    socket.on('food:order_ready', (data) => {
+      if (data && data.order_number) {
+        const dest = data.destination_type === 'ROOM' ? `Room ${data.room_number}` : (data.table_name || 'Restaurant');
+        showAlert(`Food Order ${data.order_number} is READY for dispatch to ${dest} (Server: ${data.waiter_name || 'Staff'})`, 'Kitchen Alert — Order Ready');
+      }
+    });
+
     return () => {
       if (fallbackInterval) clearInterval(fallbackInterval);
       socket.disconnect();
@@ -393,6 +524,9 @@ function AppContent() {
     const poll = async () => {
       // Don't poll while a modal is open (to avoid data flickering mid-operation)
       if (activeModal) return;
+      // Skip automatic background interval poll if page/tab is currently hidden
+      if (typeof document !== 'undefined' && document.hidden) return;
+
       setIsSyncing(true);
       try {
         await fetchStatus();
@@ -407,15 +541,28 @@ function AppContent() {
     // Immediate first poll
     poll();
     const interval = setInterval(poll, 20000); // every 20 seconds
-    return () => clearInterval(interval);
+
+    // Visibility change listener: refresh immediately upon returning to tab
+    const handleVisibilityChange = () => {
+      if (typeof document !== 'undefined' && !document.hidden && !activeModal) {
+        poll();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [adminToken, adminUser?.role, activeModal]);
+  }, [adminToken, adminUser?.role, activeModal, fetchStatus]);
 
 
   useEffect(() => {
-    if (adminToken || guestToken) {
+    // For guests (non-admin), trigger initial status load here (admins are polled by the effect above)
+    if (guestToken && !adminToken) {
       fetchStatus();
-    } else {
+    } else if (!adminToken && !guestToken) {
       setIsLoading(false);
     }
 
@@ -489,33 +636,6 @@ function AppContent() {
     }
 
     setSelectedRoom(freshRoom);
-    if (freshRoom.status === 'vacant') {
-      setActiveModal('checkin');
-    } else if (freshRoom.status === 'occupied') {
-      setActiveModal('checkout');
-    } else if (freshRoom.status === 'booked') {
-      // Build a context-aware message about payment method
-      const paymentNote = freshRoom.payment_method === 'Cash' || !freshRoom.payment_method
-        ? `\n\n💵 This guest selected CASH payment. Confirm you have received \u20b9${freshRoom.deposit} cash at the reception before proceeding.`
-        : `\n\nPayment method: ${freshRoom.payment_method}`;
-
-      const confirmed = await showConfirm(
-        `Guest ${freshRoom.guestName} has booked Room ${freshRoom.number} with a \u20b9${freshRoom.deposit} deposit.${paymentNote}\n\nCheck in this guest now?`,
-        'Guest Arrival — Confirm Check-In',
-        'Yes, Check In',
-        'Cancel'
-      );
-      if (confirmed) {
-        checkInBookedGuest(freshRoom.number);
-      }
-    } else if (freshRoom.status === 'dirty') {
-      const confirmed = await showConfirm(`Mark Room ${freshRoom.number} as CLEAN and make it vacant?`, 'Clean Room Service');
-      if (confirmed) {
-        cleanRoom(freshRoom.number);
-      }
-    } else {
-      showAlert(`Room ${freshRoom.number} is inactive and cannot be operated.`, 'Room Status');
-    }
   };
 
   // Action Bar clicks
@@ -783,6 +903,7 @@ function AppContent() {
       checkInDate: res.checkInDate,
       expectedCheckOutDate: res.expectedCheckOutDate,
       address: res.address || '',
+      state: res.state || '',
       gst_no: res.gst_no || '',
       pincode: res.pincode || '',
       country: res.country || '',
@@ -816,12 +937,19 @@ function AppContent() {
   };
 
   // Shift guest room
-  const shiftGuest = async (fromRoomNumber, toRoomNumber) => {
+  const shiftGuest = async (fromRoomNumber, toRoomNumber, adjustmentOptions = {}) => {
     try {
       const res = await fetch(`${API_URL}/rooms/shift`, {
         method: 'POST',
         headers: getApiHeaders(adminToken, { 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ fromRoomNumber, toRoomNumber })
+        body: JSON.stringify({
+          fromRoomNumber,
+          toRoomNumber,
+          adjustmentType: adjustmentOptions.adjustmentType || 'AUTOMATIC',
+          manualAdjustmentAmount: adjustmentOptions.manualAdjustmentAmount || 0,
+          manualAdjustmentReason: adjustmentOptions.manualAdjustmentReason || '',
+          idempotencyKey: `shift_${fromRoomNumber}_${toRoomNumber}_${Date.now()}`
+        })
       });
 
       if (!res.ok) {
@@ -841,12 +969,12 @@ function AppContent() {
   };
 
   // Add bill posting ledger item
-  const addLedgerItem = async (roomNumber, desc, amount) => {
+  const addLedgerItem = async (roomNumber, desc, amount, category = 'General') => {
     try {
       const res = await fetch(`${API_URL}/rooms/${roomNumber}/ledger`, {
         method: 'POST',
         headers: getApiHeaders(adminToken, { 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ desc, amount })
+        body: JSON.stringify({ desc, amount, category })
       });
 
       if (!res.ok) {
@@ -861,10 +989,10 @@ function AppContent() {
       // Update selectedRoom state locally for CheckoutModal reactive sync
       setSelectedRoom(prev => {
         if (prev && prev.number === roomNumber) {
-          const nextId = prev.ledger.length > 0 ? Math.max(...prev.ledger.map(item => item.id)) + 1 : 1;
+          const nextId = prev.ledger && prev.ledger.length > 0 ? Math.max(...prev.ledger.map(item => item.id || 0)) + 1 : 1;
           return {
             ...prev,
-            ledger: [...prev.ledger, { id: nextId, desc, qty: 1, amount }]
+            ledger: [...(prev.ledger || []), { id: nextId, desc, qty: 1, amount, category }]
           };
         }
         return prev;
@@ -898,11 +1026,47 @@ function AppContent() {
     }
   };
 
-  // Helper date formatter
+  // Handle Room Status change (Mark Active / Inactive, Mark Clean / Dirty)
+  const handleRoomStatusChange = async (roomNumber, action) => {
+    try {
+      const res = await fetch(`${API_URL}/rooms/${roomNumber}/status`, {
+        method: 'PUT',
+        headers: getApiHeaders(adminToken, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ action })
+      });
+
+      if (!res.ok) {
+        const errData = await res.json();
+        showAlert(errData.error || 'Failed to update room status', 'Room Update Error');
+        return;
+      }
+
+      const data = await res.json();
+      const updatedRoom = data.room;
+
+      if (updatedRoom) {
+        // Match ONLY by canonical visible room number — never by r.id (MySQL surrogate PK).
+        // r.id does not equal the visible room number after migration (e.g. Room 12 has id=17,
+        // Room 17 has id=14), so the old r.id branch caused cross-room number corruption.
+        setRooms(prev => prev.map(r => String(r.number) === String(roomNumber) ? { ...r, ...updatedRoom } : r));
+      }
+
+      await fetchStatus();
+
+      showAlert(`Room ${roomNumber} updated successfully.`, 'Status Updated');
+    } catch (err) {
+      console.error('Error in handleRoomStatusChange:', err);
+      showAlert('Network error, please try again.', 'Connection Error');
+    }
+  };
+
+  // Helper date formatter — converts YYYY-MM-DD (or "YYYY-MM-DD HH:mm") → DD-Mon-YYYY
   const formatDateString = (dateStr) => {
     if (!dateStr) return '';
-    const parts = dateStr.split('-');
-    if (parts.length !== 3) return dateStr;
+    // Strip any time component (e.g. "2026-08-19 11:00" → "2026-08-19")
+    const datePart = String(dateStr).split(' ')[0];
+    const parts = datePart.split('-');
+    if (parts.length !== 3) return datePart;
     const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     const year = parts[0];
     const month = months[parseInt(parts[1], 10) - 1];
@@ -926,7 +1090,7 @@ function AppContent() {
     inactive: inactiveCount
   };
 
-  const occupancyRate = Math.round((occupiedCount / rooms.length) * 100);
+  const occupancyRate = rooms.length === 0 ? 0 : Math.round((occupiedCount / rooms.length) * 100);
 
   const globalStats = {
     total: rooms.length,
@@ -939,7 +1103,9 @@ function AppContent() {
     continuedRooms
   };
 
-  const vacantRoomsList = rooms.filter(r => r.status === 'vacant');
+  const vacantRoomsList = useMemo(() => {
+    return rooms.filter(r => r.status === 'vacant');
+  }, [rooms]);
 
   const handlePromptSubmit = (e) => {
     e.preventDefault();
@@ -961,19 +1127,30 @@ function AppContent() {
   }
 
   const handleAuthSuccess = (userData, userToken) => {
-    if (userData.role === 'admin' || userData.loginType === 'staff') {
+    // Determine whether this is a staff/admin user regardless of which auth path delivered it.
+    // getMe now returns loginType:'staff'|'admin' and type:'staff'|'admin'.
+    // Legacy JWT path returns loginType:'staff'.
+    const roleUpper    = (userData.role || '').toUpperCase();
+    const loginType    = (userData.loginType || userData.type || '').toLowerCase();
+    const isStaffLogin = loginType === 'staff' || loginType === 'admin'
+      || roleUpper === 'ADMIN' || roleUpper === 'SUPER_ADMIN'
+      || roleUpper === 'RECEPTIONIST' || roleUpper === 'CHEF'
+      || roleUpper === 'KITCHEN_HELPER' || roleUpper === 'PANTRY_BOY' || roleUpper === 'CLEANER';
+
+    if (isStaffLogin) {
       adminLogin(userData, userToken);
-      
-      // Route based on role
-      switch (userData.role) {
+
+      // Route to the correct dashboard based on the role returned by the server.
+      switch (roleUpper) {
+        case 'SUPER_ADMIN':
         case 'ADMIN':
-        case 'admin':
           navigate('/admin/dashboard');
           break;
         case 'RECEPTIONIST':
           navigate('/reception/dashboard');
           break;
         case 'CHEF':
+        case 'KITCHEN_HELPER':
           navigate('/kitchen/dashboard');
           break;
         case 'PANTRY_BOY':
@@ -983,6 +1160,7 @@ function AppContent() {
           navigate('/housekeeping/dashboard');
           break;
         default:
+          // Unknown staff role — send back to login, do NOT grant admin access
           navigate('/admin/login');
       }
     } else {
@@ -1134,6 +1312,12 @@ function AppContent() {
               <InventoryModule />
             </div>
           )}
+          {/* ── Food / Restaurant POS — Phase 1 Menu Master ───────────────────── */}
+          {adminTab === 'food' && (
+            <div className="dashboard-body">
+              <FoodPOS token={adminToken} user={adminUser} />
+            </div>
+          )}
           {adminTab === 'guests' && (
 
             <div className="dashboard-body">
@@ -1152,31 +1336,66 @@ function AppContent() {
               />
             </div>
           )}
-          {(adminTab === 'frontdesk' || adminTab === 'rooms') && (
-          <div className="dashboard-body">
-            <div className="room-grid-wrapper">
-              <RoomGrid 
-                rooms={rooms}
-                activeFilter={filter}
-                searchQuery={searchQuery}
-                onRoomClick={handleRoomClick}
-              />
+          {adminTab === 'frontdesk' && (
+            <div className="dashboard-body">
+              <div className="room-grid-wrapper">
+                <RoomGrid 
+                  rooms={rooms}
+                  activeFilter={filter}
+                  searchQuery={searchQuery}
+                  onRoomClick={handleRoomClick}
+                  showOperationalBadges={false}
+                />
+              </div>
             </div>
-          </div>
+          )}
+
+          {adminTab === 'rooms' && (
+            <div className="dashboard-body">
+              <div style={{
+                background: 'rgba(255, 255, 255, 0.03)',
+                border: '1px solid var(--border-color)',
+                borderRadius: '8px',
+                padding: '12px 16px',
+                marginBottom: '16px',
+                display: 'flex',
+                justify: 'space-between',
+                alignItems: 'center'
+              }}>
+                <div>
+                  <h2 style={{ fontSize: '1.1rem', fontWeight: '700', color: 'var(--text-main)', margin: 0 }}>
+                    🛏️ Rooms Management & Operational Controls
+                  </h2>
+                  <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                    Manage room availability (Active/Inactive) and housekeeping (Clean/Dirty)
+                  </span>
+                </div>
+              </div>
+              <div className="room-grid-wrapper">
+                <RoomGrid 
+                  rooms={rooms}
+                  activeFilter={filter}
+                  searchQuery={searchQuery}
+                  onRoomClick={handleRoomClick}
+                  showOperationalBadges={true}
+                />
+              </div>
+            </div>
           )}
 
           {/* Bottom Metrics Information Bar */}
           <MetricsBar 
             stats={globalStats}
             systemStatus={isBackendOnline}
+            dataStatus={dataStatus}
+            staleReason={staleReason}
           />
-
 
           {/* Modals & Dialog Portals */}
           <CheckInModal 
             isOpen={activeModal === 'checkin'}
             onClose={() => { setActiveModal(null); setSelectedRoom(null); }}
-            room={selectedRoom}
+            room={liveSelectedRoom}
             onCheckIn={checkInGuest}
             showAlert={showAlert}
           />
@@ -1184,7 +1403,8 @@ function AppContent() {
           <CheckOutModal 
             isOpen={activeModal === 'checkout'}
             onClose={() => { setActiveModal(null); setSelectedRoom(null); }}
-            room={selectedRoom}
+            room={liveSelectedRoom}
+            token={adminToken}
             onCheckOut={checkOutGuest}
             onAddLedgerItem={addLedgerItem}
             onModifyClick={() => setActiveModal('modify_checkin')}
@@ -1196,7 +1416,7 @@ function AppContent() {
           <ModifyCheckInModal
             isOpen={activeModal === 'modify_checkin'}
             onClose={() => { setActiveModal(null); setSelectedRoom(null); }}
-            room={selectedRoom}
+            room={liveSelectedRoom}
             onModify={modifyCheckInGuest}
             showAlert={showAlert}
           />
@@ -1218,7 +1438,7 @@ function AppContent() {
           <RoomShiftingModal 
             isOpen={activeModal === 'shifting'}
             onClose={() => { setActiveModal(null); setSelectedRoom(null); }}
-            room={selectedRoom}
+            room={liveSelectedRoom}
             vacantRooms={vacantRoomsList}
             onShiftRoom={shiftGuest}
             showAlert={showAlert}
@@ -1240,7 +1460,7 @@ function AppContent() {
 
           <ReportsModal 
             isOpen={activeModal === 'reports'}
-            onClose={() => setActiveModal(null)}
+            onClose={() => setActiveModal(null)} 
             rooms={rooms}
             cashLog={cashLog}
             currentDate={systemDate}
@@ -1257,7 +1477,7 @@ function AppContent() {
           <RefundCheckoutModal
             isOpen={activeModal === 'refund_checkout'}
             onClose={() => setActiveModal('checkout')}
-            room={selectedRoom}
+            room={liveSelectedRoom}
             token={adminToken}
             onRefundComplete={processRefundCheckout}
             showAlert={showAlert}
@@ -1270,9 +1490,12 @@ function AppContent() {
           />
         </div>
         <RoomInspectorDrawer 
-          selectedRoom={selectedRoom} 
+          selectedRoom={liveSelectedRoom} 
           onClose={() => setSelectedRoom(null)}
-          onActionClick={handleActionClick} 
+          onCheckInClick={(room) => { setSelectedRoom(room); setActiveModal('checkin'); }}
+          onCheckOutClick={(room) => { setSelectedRoom(room); setActiveModal('checkout'); }}
+          onRoomStatusChange={handleRoomStatusChange}
+          token={adminToken}
         />
         </div>
       </RoleProtectedRoute>

@@ -1,0 +1,263 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Global Deny-by-Default Fallback ──────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ── Helper Functions ──────────────────────────────────────────────────────
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserRole() {
+      return isAuthenticated() && request.auth.token.role != null
+        ? request.auth.token.role
+        : 'guest';
+    }
+
+    function isAdmin() {
+      return getUserRole() == 'admin' || getUserRole() == 'super_admin';
+    }
+
+    function isStaff() {
+      return getUserRole() == 'admin' || getUserRole() == 'super_admin' || getUserRole() == 'staff' || getUserRole() == 'receptionist';
+    }
+
+    function isOwner(userUid) {
+      return isAuthenticated() && request.auth.uid == userUid;
+    }
+
+    function isHousekeeping() {
+      return getUserRole() == 'housekeeping';
+    }
+
+    function isManager() {
+      return getUserRole() == 'manager' || isAdmin();
+    }
+
+    function isKitchen() {
+      return getUserRole() == 'kitchen' || getUserRole() == 'chef' || isAdmin();
+    }
+
+    // Kitchen field-level guard: kitchen cannot modify financial, destination, or identity fields
+    function isKitchenSafeUpdate() {
+      let protectedFields = [
+        'items', 'subtotal', 'tax_total', 'grand_total',
+        'payment_status', 'food_payment_id', 'ledger_item_id',
+        'complimentary_id', 'complimentary_request_id',
+        'billed_at', 'billed_by_uid',
+        'room_number', 'room_id', 'booking_id',
+        'guest_id', 'guest_name',
+        'waiter_uid', 'waiter_name',
+        'destination_type', 'order_number',
+        'created_by_uid', 'order_id'
+      ];
+      return !protectedFields.hasAny(request.resource.data.diff(resource.data).affectedKeys());
+    }
+
+    // ── Collection Rules ──────────────────────────────────────────────────────
+    match /settings/{settingId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    match /users/{userUid} {
+      allow read: if isOwner(userUid) || isStaff();
+      allow write: if isOwner(userUid) || isAdmin();
+    }
+
+    match /guests/{guestId} {
+      allow read: if isStaff() || (isAuthenticated() && resource.data.user_uid == request.auth.uid);
+      allow write: if isStaff() || (isAuthenticated() && request.resource.data.user_uid == request.auth.uid);
+    }
+
+    match /rooms/{roomId} {
+      allow read: if isAuthenticated();
+      allow write: if isStaff();
+    }
+
+    match /bookings/{bookingId} {
+      allow read: if isStaff() || (isAuthenticated() && resource.data.user_uid == request.auth.uid);
+      allow write: if isStaff();
+
+      match /ledger_items/{itemId} {
+        allow read: if isStaff() || (isAuthenticated() && get(/databases/$(database)/documents/bookings/$(bookingId)).data.user_uid == request.auth.uid);
+        allow write: if isStaff();
+      }
+
+      match /payments/{paymentId} {
+        allow read: if isStaff() || (isAuthenticated() && get(/databases/$(database)/documents/bookings/$(bookingId)).data.user_uid == request.auth.uid);
+        allow write: if isStaff();
+      }
+
+      match /history/{historyId} {
+        allow read: if isStaff() || (isAuthenticated() && get(/databases/$(database)/documents/bookings/$(bookingId)).data.user_uid == request.auth.uid);
+        allow create: if isStaff();
+        allow update, delete: if false; // Immutable — Admin SDK only
+      }
+    }
+
+    match /reservations/{reservationId} {
+      allow read, write: if isStaff();
+    }
+
+    match /stay_extensions/{extensionId} {
+      allow read: if isStaff() || (isAuthenticated() && resource.data.user_uid == request.auth.uid);
+      allow create: if isAuthenticated() && request.resource.data.user_uid == request.auth.uid;
+      allow update, delete: if isStaff();
+    }
+
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated() && resource.data.user_uid == request.auth.uid;
+      allow write: if isStaff();
+    }
+
+    // ── Phase 2 — Previously Uncovered Collections ───────────────────────────
+
+    match /room_types/{typeId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isStaff();
+      allow delete: if isAdmin();
+    }
+
+    match /staff/{staffId} {
+      allow read: if isStaff();
+      allow create, update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /inventory_categories/{categoryId} {
+      allow read: if isStaff();
+      allow create, delete: if isAdmin();
+      allow update: if isStaff();
+    }
+
+    match /inventory_products/{productId} {
+      allow read: if isStaff();
+      allow create, delete: if isAdmin();
+      allow update: if isStaff();
+    }
+
+    match /cash_logs/{logId} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /cash_submissions/{submissionId} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update, delete: if isAdmin();
+    }
+
+    match /audit_logs/{logId} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update, delete: if false;
+    }
+
+    match /invoices/{invoiceId} {
+      allow read: if isStaff() || (isAuthenticated() && resource.data.user_uid == request.auth.uid);
+      allow create: if isStaff();
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /housekeeping/{recordId} {
+      allow read: if isStaff() || isHousekeeping();
+      allow create: if isStaff();
+      allow update: if isStaff() || isHousekeeping();
+      allow delete: if isAdmin();
+    }
+
+    match /booking_history/{historyId} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update, delete: if false;
+    }
+
+    match /payments/{paymentId} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /ledger_items/{itemId} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /razorpay_transactions/{txId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // Highly Sensitive Collections: Server-Side / Admin SDK Only
+    match /checkout_snapshots/{snapshotId} {
+      allow read, write: if false;
+    }
+
+    match /daily_analytics/{analyticsId} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+
+    // ── Food / Restaurant POS Collections ────────────────────────────────────
+
+    match /food_menu_categories/{categoryId} {
+      allow read:   if isStaff() || isKitchen();
+      allow create: if isStaff();
+      allow update: if isStaff();
+      allow delete: if isAdmin();
+    }
+
+    match /food_menu_items/{itemId} {
+      allow read:   if isStaff() || isKitchen();
+      allow create: if isStaff();
+      allow update: if isStaff();
+      allow delete: if isAdmin();
+    }
+
+    match /food_tax_config/{configId} {
+      allow read:  if isStaff();
+      allow write: if isAdmin();
+    }
+
+    match /food_tables/{tableId} {
+      allow read:  if isStaff();
+      allow write: if isAdmin();
+    }
+
+    match /food_orders/{orderId} {
+      allow read:   if isStaff() || isKitchen();
+      allow create: if isStaff();
+      allow update: if isAdmin() || (isKitchen() && isKitchenSafeUpdate());
+      allow delete: if isAdmin();
+    }
+
+    match /food_payments/{paymentId} {
+      allow read:   if isStaff();
+      allow create: if isStaff();
+      allow update: if isAdmin();
+      allow delete: if false; // Immutable payment audit trail
+    }
+
+    match /food_complimentary_requests/{reqId} {
+      allow read:   if isStaff() || isManager();
+      allow create: if isStaff();
+      allow update: if isManager(); // Admin / Manager approval
+      allow delete: if false;       // Immutable audit records
+    }
+
+    match /food_order_counters/{dateId} {
+      allow read, write: if false; // Strict Admin SDK only
+    }
+  }
+}

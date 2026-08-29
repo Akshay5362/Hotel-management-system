@@ -1,4 +1,4 @@
-import { FactoryResetService } from '../services/FactoryResetService.js';
+import { FactoryResetCutoverService } from '../services/factoryResetCutoverService.js';
 
 // ─── Canonical required confirmation phrase ────────────────────────────────────
 const REQUIRED_PHRASE = 'RESET HOTEL DATA';
@@ -24,15 +24,16 @@ function logRequest(req, httpStatus, extra = {}) {
 export const getFactoryResetStatus = async (req, res) => {
   logRequest(req, 200, { action: 'STATUS' });
   try {
-    const statusData = await FactoryResetService.verifyReset();
+    const statusData = await FactoryResetCutoverService.verifyReset();
     return res.status(200).json({
       success:    true,
       status:     'Ready',
-      message:    'Factory Reset service is operational. All systems ready.',
+      message:    'Firestore Factory Reset service is operational. All systems ready.',
       validation: statusData,
     });
   } catch (error) {
-    return res.status(500).json({ success: false, error: error.message });
+    const statusCode = error.status || 500;
+    return res.status(statusCode).json({ success: false, error: error.message, code: error.code });
   }
 };
 
@@ -48,6 +49,7 @@ export const factoryReset = async (req, res) => {
     return res.status(400).json({
       success: false,
       error:   `Confirmation phrase incorrect. You must type exactly: ${REQUIRED_PHRASE}`,
+      code:    'INVALID_CONFIRMATION_PHRASE'
     });
   }
 
@@ -58,21 +60,24 @@ export const factoryReset = async (req, res) => {
   });
 
   try {
-    const result = await FactoryResetService.factoryReset();
+    const operatorId = String(req.user?.id || req.user?.uid || 'system');
+    const result = await FactoryResetCutoverService.factoryReset(operatorId);
 
     logRequest(req, 200, {
       action:     'COMPLETED',
-      executionMs: result.summary.executionMs,
-      guests:     result.summary.guestsDeleted,
-      bookings:   result.summary.bookingsDeleted,
+      executionMs: result.summary?.executionMs,
+      guests:     result.summary?.guestsDeleted,
+      bookings:   result.summary?.bookingsDeleted,
     });
 
     return res.status(200).json(result);
   } catch (error) {
-    logRequest(req, 500, { action: 'FAILED', error: error.message });
-    return res.status(500).json({
+    const statusCode = error.status || 500;
+    logRequest(req, statusCode, { action: 'FAILED', error: error.message });
+    return res.status(statusCode).json({
       success: false,
       error:   error.message,
+      code:    error.code
     });
   }
 };

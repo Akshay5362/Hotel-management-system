@@ -1,6 +1,39 @@
 import React, { useState } from 'react';
 import { API_BASE_URL, getApiHeaders } from '../config/apiConfig';
+import { auth, signInWithEmailAndPassword, isClientConfigured } from '../config/firebaseClient';
+import { resolveFirebaseEmail, resolveFallbackFirebaseEmail } from '../config/authMapping';
+import {
+  resolveFirebaseGuestEmail,
+  validateGuestClaims,
+  mapFirebaseGuestAuthError
+} from '../utils/resolveFirebaseGuestEmail';
 
+
+/**
+ * Phase 3 Step 3C: Maps Firebase Auth error codes to user-friendly messages.
+ * Prevents raw Firebase error codes from being shown to staff users.
+ * Matches the existing backend error contract where possible.
+ */
+function mapFirebaseAuthError(err) {
+  const code = err?.code || '';
+  if (code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found' || code === 'auth/invalid-email') {
+    return 'Invalid username or password.';
+  }
+  if (code === 'auth/user-disabled') {
+    return 'Your account has been disabled. Please contact an administrator.';
+  }
+  if (code === 'auth/too-many-requests') {
+    return 'Too many failed login attempts. Please try again later.';
+  }
+  if (code === 'auth/network-request-failed') {
+    return 'Network error. Please check your connection and try again.';
+  }
+  // Return the message if it's already user-friendly (from our backend /api/auth/me)
+  if (err?.message && !err.message.startsWith('Firebase:')) {
+    return err.message;
+  }
+  return 'Authentication failed. Please try again.';
+}
 
 export default function AuthCard({ isAdmin = false, initialIsSignUp = false, onAuthSuccess, showAlert, onNavigate }) {
   const [isSignUp, setIsSignUp] = useState(initialIsSignUp);
@@ -36,6 +69,153 @@ export default function AuthCard({ isAdmin = false, initialIsSignUp = false, onA
     }
 
     setIsLoading(true);
+
+    // ── Phase 3 Step 3C: Staff/Admin Firebase Login ──────────────────────────────────────
+    if (isAdmin && isClientConfigured && auth) {
+      const emailToUse = resolveFirebaseEmail(username);
+
+      try {
+        let userCredential;
+        try {
+          userCredential = await signInWithEmailAndPassword(auth, emailToUse, password);
+        } catch (primaryErr) {
+          const fallbackEmail = resolveFallbackFirebaseEmail(username);
+          if (fallbackEmail) {
+            userCredential = await signInWithEmailAndPassword(auth, fallbackEmail, password);
+          } else {
+            throw primaryErr;
+          }
+        }
+
+        const idToken = await userCredential.user.getIdToken(true);
+
+        // ── Call /api/auth/me — server verifies token + resolves real role ──
+        // Never use /api/status for identity: it returns no user object.
+        // Never default unknown staff to 'admin'.
+        const meRes = await fetch(`${API_BASE_URL}/api/auth/me`, {
+          method: 'GET',
+          headers: getApiHeaders(idToken)
+        });
+
+        if (!meRes.ok) {
+          const meData = await meRes.json().catch(() => ({}));
+          const errMsg = meData.error || `Identity verification failed (HTTP ${meRes.status})`;
+          // 422 = role indeterminate — do NOT assign admin silently
+          throw new Error(errMsg);
+        }
+
+        const meData = await meRes.json();
+        if (!meData.user || !meData.user.role) {
+          throw new Error('Server returned identity response with no role. Contact administrator.');
+        }
+
+        showAlert('Logged in successfully!', 'Authentication Success');
+        onAuthSuccess(meData.user, idToken);
+        setIsLoading(false);
+        return;
+      } catch (fbErr) {
+        console.warn('[AuthCard] Firebase Client Auth login attempt failed/fallback:', fbErr.message);
+        if (fbErr.message && (fbErr.message.includes('inactive') || fbErr.message.includes('Forbidden') || fbErr.message.includes('disabled') || fbErr.message.includes('Identity verification') || fbErr.message.includes('Role could not') || fbErr.message.includes('no role'))) {
+          showAlert(fbErr.message, 'Authentication Error');
+          setIsLoading(false);
+          return;
+        }
+        // Phase 3 Step 3C: When Firebase-only staff login is enabled, do NOT fall through
+        // to the legacy MySQL /api/auth/signin endpoint for staff. Show the Firebase error directly.
+        const isFirebaseStaffLoginEnabled = import.meta.env?.VITE_ENABLE_FIREBASE_STAFF_LOGIN !== 'false';
+        if (isFirebaseStaffLoginEnabled) {
+          const friendlyError = mapFirebaseAuthError(fbErr);
+          showAlert(friendlyError, 'Authentication Error');
+          setIsLoading(false);
+          return;
+        }
+      }
+    }
+
+    // ── Phase 3 Step 3D-3: Guest Firebase Login ──────────────────────────────────────────
+    // Activated only when VITE_ENABLE_FIREBASE_GUEST_LOGIN=true AND guest portal sign-in.
+    // NEVER runs for staff/admin (isAdmin=true) — that path is above.
+    // NEVER runs during guest signup (isSignUp=true) — signup goes directly to legacy path.
+    //
+    // SECURITY: After obtaining the ID token, we call /api/auth/me and validate
+    // that the returned user has role='guest' and user_type='guest'.
+    // Staff/admin tokens are REJECTED here even if they somehow reach this path.
+    const isFirebaseGuestLoginEnabled = import.meta.env?.VITE_ENABLE_FIREBASE_GUEST_LOGIN === 'true';
+    if (!isAdmin && !isSignUp && isFirebaseGuestLoginEnabled && isClientConfigured && auth) {
+      const guestEmail = resolveFirebaseGuestEmail(username);
+      if (!guestEmail) {
+        showAlert('Could not resolve your guest account email. Please contact the front desk.', 'Authentication Error');
+        setIsLoading(false);
+        return;
+      }
+
+      try {
+        // 1. Authenticate with Firebase using resolved guest email
+        let userCredential;
+        try {
+          userCredential = await signInWithEmailAndPassword(auth, guestEmail, password);
+        } catch (primaryErr) {
+          if (
+            primaryErr.code === 'auth/user-not-found' ||
+            primaryErr.code === 'auth/invalid-credential' ||
+            primaryErr.code === 'auth/wrong-password'
+          ) {
+            // Guest account may not have been provisioned yet — show a clean message
+            // DO NOT fall through to legacy MySQL path when flag is ON
+            const friendlyErr = mapFirebaseGuestAuthError(primaryErr);
+            showAlert(friendlyErr, 'Authentication Error');
+            setIsLoading(false);
+            return;
+          }
+          throw primaryErr; // Re-throw unexpected errors (network, disabled, etc.)
+        }
+
+        // 2. Obtain a fresh ID token
+        const idToken = await userCredential.user.getIdToken(true);
+
+        // 3. Verify identity server-side and resolve canonical guest object
+        const meRes = await fetch(`${API_BASE_URL}/api/auth/me`, {
+          method: 'GET',
+          headers: getApiHeaders(idToken)
+        });
+
+        if (!meRes.ok) {
+          const meData = await meRes.json().catch(() => ({}));
+          const errMsg = meData.error || `Identity verification failed (HTTP ${meRes.status})`;
+          throw new Error(errMsg);
+        }
+
+        const meData = await meRes.json();
+        if (!meData.user) {
+          throw new Error('Server returned no user identity. Please try again.');
+        }
+
+        // 4. SECURITY: Validate returned claims are guest-only
+        //    Reject staff/admin tokens that may have reached this path
+        const claimsCheck = validateGuestClaims(meData.user);
+        if (!claimsCheck.valid) {
+          // Sign out the non-guest Firebase session immediately
+          try { await auth.signOut?.() || await import('../config/firebaseClient').then(m => m.signOut(m.auth)); } catch (_) {}
+          throw new Error(claimsCheck.error);
+        }
+
+        // 5. Success — deliver canonical guest user object + Firebase ID token to app
+        showAlert('Logged in successfully!', 'Authentication Success');
+        onAuthSuccess(meData.user, idToken);
+        setIsLoading(false);
+        return;
+
+      } catch (fbErr) {
+        console.warn('[AuthCard] Guest Firebase login error:', fbErr.message);
+        const friendlyError = mapFirebaseGuestAuthError(fbErr);
+        showAlert(friendlyError, 'Authentication Error');
+        setIsLoading(false);
+        return;
+        // DO NOT fall through to legacy MySQL path when VITE_ENABLE_FIREBASE_GUEST_LOGIN=true
+      }
+    }
+
+    // ── Legacy MySQL path (flag OFF, or signup, or Firebase unavailable) ─────────────────
     const endpoint = (!isAdmin && isSignUp) ? '/api/auth/signup' : '/api/auth/signin';
     
     // The frontend must not send the role for guest sign up
@@ -44,13 +224,11 @@ export default function AuthCard({ isAdmin = false, initialIsSignUp = false, onA
       : { username, password };
 
     try {
-
       const res = await fetch(`${API_BASE_URL}${endpoint}`, {
         method: 'POST',
         headers: getApiHeaders(null, { 'Content-Type': 'application/json' }),
         body: JSON.stringify(payload)
       });
-
 
       const data = await res.json();
       if (!res.ok) {

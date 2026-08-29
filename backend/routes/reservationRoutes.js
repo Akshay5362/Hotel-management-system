@@ -9,21 +9,25 @@ import {
   getAvailableRoomsForReservation,
   getReservationReport
 } from '../controllers/reservationController.js';
-import { authenticate } from '../controllers/authController.js';
+import { authenticate, requireRole } from '../controllers/authController.js';
 
 const router = express.Router();
 
 // Apply authentication middleware to all reservation routes
 router.use(authenticate);
 
-// Reservation routes
+// Availability checking (shared for authenticated users)
 router.get('/available-rooms', getAvailableRoomsForReservation);
-router.get('/report', getReservationReport);
-router.get('/', getReservations);
+
+// Reservation creation (shared creation path)
 router.post('/', createReservation);
-router.get('/:id', getReservationById);
-router.put('/:id', updateReservation);
-router.post('/:id/cancel', cancelReservation);
-router.post('/:id/checkin', checkInReservation);
+
+// Reservation management operations (Admin & Receptionist only)
+router.get('/report', requireRole('admin', 'receptionist'), getReservationReport);
+router.get('/', requireRole('admin', 'receptionist'), getReservations);
+router.get('/:id', requireRole('admin', 'receptionist'), getReservationById);
+router.put('/:id', requireRole('admin', 'receptionist'), updateReservation);
+router.post('/:id/cancel', requireRole('admin', 'receptionist'), cancelReservation);
+router.post('/:id/checkin', requireRole('admin', 'receptionist'), checkInReservation);
 
 export default router;

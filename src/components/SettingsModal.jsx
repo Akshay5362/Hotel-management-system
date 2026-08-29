@@ -156,8 +156,8 @@ export default function SettingsModal({ isOpen, onClose }) {
   const [frError,    setFrError]    = useState('');
   const [frSummary,  setFrSummary]  = useState(null);
 
-  // ── Permission check: only 'admin' role that is NOT staff can modify ────────
-  const isSuperAdmin = adminUser?.role === 'admin' && adminUser?.type !== 'staff';
+  // ── Permission check: only 'admin'/'super_admin' role that is NOT staff can modify ────────
+  const isSuperAdmin = (adminUser?.role?.toLowerCase() === 'admin' || adminUser?.role?.toLowerCase() === 'super_admin') && adminUser?.type !== 'staff';
   const isDev        = data.mode === 'development';
 
   // ── Computed: direction of target date vs current ─────────────────────────
