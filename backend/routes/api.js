@@ -1,6 +1,6 @@
 import express from 'express';
 import { checkIn, checkOut, clean, addLedgerItem, recordPayment, adjustRoomRent, shift, bookRoom, modifyCheckIn, guestRequestCheckIn, guestAddService, guestReportMaintenance, guestExtendStay, getGuestBill, getGuestNotifications, markNotificationRead, guestRequestCheckout, guestSubmitFeedback, getGuestHistory, getGuestHistoryAdmin, uploadIdentity, getRefundPolicy, updateRefundPolicy, processRefundCheckout, getPublicRooms, adminExtendStay, adminLateCheckout, adminNoShow, updateRoomStatus, getLedger } from '../controllers/roomController.js';
-import { getStatus, runDayEnd, undoDayEnd, getGuestRequests, resolveGuestRequest, resolveExtensionRequest, getGuestDocuments, verifyGuestDocument, deleteGuestDocument, searchGuests, listGuests, searchGuestsStaff } from '../controllers/auditController.js';
+import { getStatus, runDayEnd, undoDayEnd, getGuestRequests, resolveGuestRequest, resolveExtensionRequest, getGuestDocuments, verifyGuestDocument, deleteGuestDocument, streamGuestDocument, searchGuests, listGuests, searchGuestsStaff } from '../controllers/auditController.js';
 import { getBusinessDateInfo, updateBusinessDate, getHotelConfig, updateHotelConfig } from '../controllers/settingsController.js';
 import { submitCash, getCashSubmissions } from '../controllers/cashController.js';
 import { staffLogin, getAllStaff, getStaffById, createStaff, updateStaff, updateStaffStatus, deleteStaff } from '../controllers/staffController.js';
@@ -16,6 +16,7 @@ import reservationRoutes from './reservationRoutes.js';
 import factoryResetRoutes from './factoryResetRoutes.js';
 import inventoryRoutes from './inventoryRoutes.js';
 import roomTypeRoutes from './roomTypeRoutes.js';
+import foodRoutes from './foodRoutes.js';          // ── Food / Restaurant POS (Phase 1)
 
 const router = express.Router();
 
@@ -37,7 +38,7 @@ router.get('/auth/me', getMe);
 router.post('/staff/auth/login', staffLogin);
 
 // Audit & status routes
-router.get('/status', authenticate, getStatus);
+router.get('/status', authenticate, requireRole('admin', 'receptionist'), getStatus);
 router.post('/dayend', authenticate, requireRole('admin'), runDayEnd);
 router.post('/dayend/undo', authenticate, requireSuperAdmin, undoDayEnd);
 
@@ -89,6 +90,7 @@ router.get('/admin/guest-history/:guestId', authenticate, requireRole('admin', '
 router.post('/admin/guest-requests/:id/resolve', authenticate, requireRole('admin', 'receptionist'), resolveGuestRequest);
 router.post('/admin/guest-requests/extension/:id/resolve', authenticate, requireRole('admin', 'receptionist'), resolveExtensionRequest);
 router.get('/admin/guest-documents', authenticate, requireRole('admin', 'receptionist'), getGuestDocuments);
+router.get('/admin/guest-documents/file/:filename', authenticate, requireRole('admin', 'receptionist'), streamGuestDocument);
 router.post('/admin/guest-documents/:guestId/verify', authenticate, requireRole('admin', 'receptionist'), verifyGuestDocument);
 router.delete('/admin/guest-documents/:guestId', authenticate, requireRole('admin'), deleteGuestDocument);
 router.get('/admin/guests', authenticate, requireRole('admin', 'receptionist'), listGuests);
@@ -98,9 +100,9 @@ router.get('/admin/guests/search', authenticate, requireRole('admin', 'reception
 router.get('/guest/history', authenticate, requireGuest, getGuestHistory);
 router.post('/guest/feedback', authenticate, requireGuest, guestSubmitFeedback);
 
-// ── Reception Staff — Guest Search (no requireAdmin) ──────────────────────
-router.get('/reception/guests/search', authenticate, searchGuestsStaff);
-router.get('/reception/guests/history/:guestId', authenticate, getGuestHistoryAdmin);
+// ── Reception Staff — Guest Search ──────────────────────────────────────────
+router.get('/reception/guests/search', authenticate, requireRole('admin', 'receptionist'), searchGuestsStaff);
+router.get('/reception/guests/history/:guestId', authenticate, requireRole('admin', 'receptionist'), getGuestHistoryAdmin);
 
 // ── Payment Module (Phase 2) ────────────────────────────────────────────────
 router.use('/payments', paymentRoutes);
@@ -132,6 +134,10 @@ router.use('/room-types', roomTypeRoutes);
 
 // ── Factory Reset Module (Phase 1 Architecture) ─────────────────────────────
 router.use('/system/factory-reset', factoryResetRoutes);
+
+// ── Food / Restaurant POS Module (Phase 1 — Menu Master) ────────────────────
+// auth is applied per-route inside foodRoutes.js
+router.use('/food', foodRoutes);
 
 export default router;
 

@@ -22,30 +22,8 @@ import { getUserByUsernameFirestore, getUserByIdFirestore } from '../repositorie
 import { createAuditLogFirestore } from '../repositories/firestore/auditLogsRepository.js';
 import { hasFirestorePermission } from '../repositories/firestore/rbacRepository.js';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'hotel-pms-super-secret-key-12345!';
-
 function hashPassword(pass) {
   return crypto.createHash('sha256').update(pass).digest('hex');
-}
-
-export function generateToken(user) {
-  const payload = JSON.stringify({ id: user.id, role: user.role });
-  const base64Payload = Buffer.from(payload).toString('base64url');
-  const signature = crypto.createHmac('sha256', JWT_SECRET).update(base64Payload).digest('base64url');
-  return `${base64Payload}.${signature}`;
-}
-
-export function verifyToken(token) {
-  try {
-    const [base64Payload, signature] = token.split('.');
-    if (!base64Payload || !signature) return null;
-    const expectedSignature = crypto.createHmac('sha256', JWT_SECRET).update(base64Payload).digest('base64url');
-    if (signature !== expectedSignature) return null;
-    const payloadJson = Buffer.from(base64Payload, 'base64url').toString('utf8');
-    return JSON.parse(payloadJson);
-  } catch (e) {
-    return null;
-  }
 }
 
 export const signUp = async (req, res) => {
@@ -157,11 +135,19 @@ export const signUp = async (req, res) => {
         loyalty_points: 0
       };
 
-      const token = generateToken(user);
+      let idToken = null;
+      try {
+        const authResult = await verifyFirebasePassword(email, password);
+        if (authResult.status === 200 && authResult.data?.idToken) {
+          idToken = authResult.data.idToken;
+        }
+      } catch (_) {}
+
       return res.status(201).json({
         message: 'Account registered successfully',
         user,
-        token
+        token: idToken,
+        idToken
       });
 
     } catch (fbErr) {
@@ -264,11 +250,11 @@ export const signUp = async (req, res) => {
       }
     }
 
-    const token = generateToken(user);
     res.status(201).json({
       message: 'Account registered successfully',
       user,
-      token
+      token: null,
+      idToken: null
     });
 
   } catch (error) {
@@ -490,7 +476,7 @@ export const signIn = async (req, res) => {
           return res.status(403).json({ error: 'Your account is inactive. Please contact an administrator.', code: 'ACCOUNT_INACTIVE' });
         }
 
-        const token = generateToken(user);
+        const idToken = authResult.data.idToken;
 
         try {
           const businessDate = await BusinessDateService.getBusinessDate();
@@ -504,7 +490,7 @@ export const signIn = async (req, res) => {
           console.warn('[signIn] Non-fatal audit log warning:', auditErr.message);
         }
 
-        return res.json({ message: 'Logged in successfully', user, token, idToken: authResult.data.idToken });
+        return res.json({ message: 'Logged in successfully', user, token: idToken, idToken });
       }
 
       // If Firebase Auth returns error
@@ -569,14 +555,11 @@ export const signIn = async (req, res) => {
         if (!passwordMatch) {
           return res.status(400).json({ error: 'Invalid username or password' });
         }
-        pool.query('UPDATE staff SET last_login = NOW() WHERE id = ?', [staff.id]).catch(() => {});
         const safeStaff = {
           id: staff.id, username: staff.username, full_name: staff.full_name,
           role: staff.role, department: staff.department, shift: staff.shift, loginType: 'staff'
         };
-        const tokenPayload = { id: staff.id, role: staff.role, type: 'staff' };
-        const token = generateToken(tokenPayload);
-        return res.json({ message: 'Logged in successfully', user: safeStaff, token });
+        return res.json({ message: 'Logged in successfully', user: safeStaff, token: null, idToken: null });
       }
 
       return res.status(400).json({ error: 'Invalid username or password' });
@@ -608,15 +591,7 @@ export const signIn = async (req, res) => {
       await ensureGuestLazyAuthMigration(safeUser, password);
     }
 
-    const token = generateToken(safeUser);
-
-    const businessDate = await BusinessDateService.getBusinessDate(pool);
-    await pool.query(
-      `INSERT INTO audit_logs (user_id, action, details, business_date) VALUES (?, 'LOGIN', ?, ?)`,
-      [safeUser.id, `User logged in: ${safeUser.username} (${safeUser.role})`, businessDate]
-    );
-
-    res.json({ message: 'Logged in successfully', user: safeUser, token });
+    return res.json({ message: 'Logged in successfully', user: safeUser, token: null, idToken: null });
   } catch (error) {
     console.error('Error during signIn:', error);
     res.status(500).json({ error: 'Internal Server Error' });
@@ -1037,78 +1012,28 @@ export const authenticate = async (req, res, next) => {
 
   const token = parts[1];
 
-  // Dual Auth Resolution: Attempt Firebase ID token verification if feature flag is enabled
-  const isFirebaseAuthEnabled = process.env.ENABLE_FIREBASE_AUTH === 'true';
-
-  if (isFirebaseAuthEnabled && isFirebaseConfigured && auth) {
-    try {
-      const decodedFirebase = await auth.verifyIdToken(token);
-      if (decodedFirebase) {
-        req.firebaseUser = decodedFirebase;
-        try {
-          req.user = await resolveCanonicalFirebaseUser(decodedFirebase);
-          return next();
-        } catch (resolveErr) {
-          if (resolveErr.code === 'ACCOUNT_INACTIVE' || resolveErr.status === 403) {
-            return res.status(403).json({ error: resolveErr.message, code: 'ACCOUNT_INACTIVE' });
-          }
-          if (resolveErr.code === 'ROLE_INDETERMINATE' || resolveErr.status === 422) {
-            return res.status(422).json({ error: resolveErr.message, code: 'ROLE_INDETERMINATE' });
-          }
-          console.error('[authenticate] resolveCanonicalFirebaseUser error:', resolveErr.message);
-        }
-      }
-    } catch (fbError) {
-      // Fallback to legacy JWT verification below if Firebase token verification fails
-    }
+  if (!isFirebaseConfigured || !auth) {
+    return res.status(503).json({ error: 'Authentication service unavailable' });
   }
 
-  // Legacy HMAC-SHA256 JWT verification fallback
-  const decoded = verifyToken(token);
-  if (!decoded) return res.status(401).json({ error: 'Invalid or expired token' });
-
-  const isGuest = decoded.role === 'guest' || decoded.type === 'guest';
-  const userType = isGuest ? 'guest' : (decoded.type || decoded.user_type || (decoded.role === 'admin' ? 'admin' : 'staff'));
-  const isStaff  = userType === 'staff';
-  const isRootAdmin = !isStaff && (decoded.role === 'admin' && (decoded.id === 1 || !decoded.id));
-
-  req.user = {
-    ...decoded,
-    id: decoded.id || decoded.mysql_id || null,
-    mysql_id: decoded.id || decoded.mysql_id || null,
-    user_type: userType,
-    type: userType,
-    loginType: userType,
-    isRootAdmin,
-    authProvider: 'legacy'
-  };
-
-  // Staff Account Status Check for Legacy Token
-  if (isStaff) {
-    const staffDbId = req.user.id || req.user.mysql_id || req.user.staff_id;
-    if (staffDbId) {
-      if (isFirebaseOnlyStaffResolutionEnabled() || isMysqlCutoverFallbacksDisabled()) {
-        try {
-          const staffDoc = await getStaffByUsernameFirestore(staffDbId) || await getStaffByIdFirestore(staffDbId);
-          if (staffDoc && (staffDoc.status === 'Inactive' || staffDoc.deleted === 1 || staffDoc.deleted === true)) {
-            return res.status(403).json({ error: 'Your account is inactive. Please contact an administrator.', code: 'ACCOUNT_INACTIVE' });
-          }
-        } catch (err) {}
-      } else {
-        try {
-          const [staffRows] = await pool.query(
-            'SELECT status, deleted FROM staff WHERE (id = ? OR username = ?) AND deleted = 0 LIMIT 1',
-            [staffDbId, staffDbId]
-          );
-          if (staffRows.length > 0 && staffRows[0].status === 'Inactive') {
-            return res.status(403).json({ error: 'Your account is inactive. Please contact an administrator.', code: 'ACCOUNT_INACTIVE' });
-          }
-        } catch (err) {}
-      }
+  try {
+    const decodedFirebase = await auth.verifyIdToken(token);
+    if (!decodedFirebase) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
     }
-  }
 
-  next();
+    req.firebaseUser = decodedFirebase;
+    req.user = await resolveCanonicalFirebaseUser(decodedFirebase);
+    return next();
+  } catch (err) {
+    if (err.code === 'ACCOUNT_INACTIVE' || err.status === 403) {
+      return res.status(403).json({ error: err.message, code: 'ACCOUNT_INACTIVE' });
+    }
+    if (err.code === 'ROLE_INDETERMINATE' || err.status === 422) {
+      return res.status(422).json({ error: err.message, code: 'ROLE_INDETERMINATE' });
+    }
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
 };
 
 /** Admin or Staff — general hotel operations. */
@@ -1250,132 +1175,36 @@ export const getMe = async (req, res) => {
   }
 
   const token = parts[1];
-  const isFirebaseAuthEnabled = process.env.ENABLE_FIREBASE_AUTH === 'true';
 
-  // ── Firebase path ────────────────────────────────────────────────────────
-  if (isFirebaseAuthEnabled && isFirebaseConfigured && auth) {
-    try {
-      const decoded = await auth.verifyIdToken(token);
-      try {
-        const user = await resolveCanonicalFirebaseUser(decoded);
-        return res.json({ user });
-      } catch (err) {
-        if (err.code === 'ACCOUNT_INACTIVE' || err.status === 403) {
-          return res.status(403).json({
-            error: err.message,
-            code: 'ACCOUNT_INACTIVE'
-          });
-        }
-        if (err.code === 'ROLE_INDETERMINATE' || err.status === 422) {
-          return res.status(422).json({
-            error: err.message,
-            code: 'ROLE_INDETERMINATE'
-          });
-        }
-        throw err;
-      }
-    } catch (fbError) {
-      if (fbError.code === 'ACCOUNT_INACTIVE' || fbError.status === 403) {
-        return res.status(403).json({ error: fbError.message, code: 'ACCOUNT_INACTIVE' });
-      }
-      console.warn('[getMe] Firebase token verification failed, trying legacy JWT:', fbError.message);
-    }
+  if (!isFirebaseConfigured || !auth) {
+    return res.status(503).json({ error: 'Authentication service unavailable' });
   }
 
-  // ── Legacy JWT fallback ──────────────────────────────────────────────────
-  const decoded = verifyToken(token);
-  if (!decoded) {
+  try {
+    const decoded = await auth.verifyIdToken(token);
+    try {
+      const user = await resolveCanonicalFirebaseUser(decoded);
+      return res.json({ user });
+    } catch (err) {
+      if (err.code === 'ACCOUNT_INACTIVE' || err.status === 403) {
+        return res.status(403).json({
+          error: err.message,
+          code: 'ACCOUNT_INACTIVE'
+        });
+      }
+      if (err.code === 'ROLE_INDETERMINATE' || err.status === 422) {
+        return res.status(422).json({
+          error: err.message,
+          code: 'ROLE_INDETERMINATE'
+        });
+      }
+      throw err;
+    }
+  } catch (fbError) {
+    if (fbError.code === 'ACCOUNT_INACTIVE' || fbError.status === 403) {
+      return res.status(403).json({ error: fbError.message, code: 'ACCOUNT_INACTIVE' });
+    }
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
-
-  const isGuest = decoded.role === 'guest' || decoded.type === 'guest';
-  const userType = isGuest ? 'guest' : (decoded.type || decoded.user_type || (decoded.role === 'admin' ? 'admin' : 'staff'));
-  const isStaff  = userType === 'staff';
-  const isRootAdmin = !isStaff && (decoded.role === 'admin' && (decoded.id === 1 || !decoded.id));
-
-  // For staff legacy tokens, resolve the staff record for canonical role
-  if (isStaff && (decoded.id || decoded.mysql_id || decoded.username)) {
-    const dbId = decoded.id || decoded.mysql_id || decoded.username;
-    if (isFirebaseOnlyStaffResolutionEnabled() || isMysqlCutoverFallbacksDisabled()) {
-      try {
-        const staff = await getStaffByUsernameFirestore(dbId) || await getStaffByIdFirestore(dbId);
-        if (staff) {
-          if (staff.status === 'Inactive' || staff.deleted === 1 || staff.deleted === true) {
-            return res.status(403).json({
-              error: 'Your account is inactive. Please contact an administrator.',
-              code: 'ACCOUNT_INACTIVE'
-            });
-          }
-          return res.json({
-            user: {
-              id:           staff.id || staff.mysql_staff_id || dbId,
-              username:     staff.username,
-              full_name:    staff.full_name,
-              role:         staff.role,
-              department:   staff.department,
-              shift:        staff.shift,
-              loginType:    'staff',
-              user_type:    'staff',
-              type:         'staff',
-              isRootAdmin:  false,
-              authProvider: 'legacy'
-            }
-          });
-        }
-      } catch (fsErr) {
-        console.error('[getMe] Firestore staff lookup error:', fsErr.message);
-      }
-    } else {
-      try {
-        const [staffRows] = await pool.query(
-          `SELECT id, username, full_name, role, department, shift, status, deleted
-           FROM staff WHERE (id = ? OR username = ?) AND deleted = 0 LIMIT 1`,
-          [dbId, dbId]
-        );
-
-        if (staffRows.length > 0) {
-          const staff = staffRows[0];
-          if (staff.status === 'Inactive' || staff.deleted === 1) {
-            return res.status(403).json({
-              error: 'Your account is inactive. Please contact an administrator.',
-              code: 'ACCOUNT_INACTIVE'
-            });
-          }
-          return res.json({
-            user: {
-              id:           staff.id,
-              username:     staff.username,
-              full_name:    staff.full_name,
-              role:         staff.role,
-              department:   staff.department,
-              shift:        staff.shift,
-              loginType:    'staff',
-              user_type:    'staff',
-              type:         'staff',
-              isRootAdmin:  false,
-              authProvider: 'legacy'
-            }
-          });
-        }
-      } catch (dbErr) {
-        console.error('[getMe] Legacy JWT MySQL staff lookup error:', dbErr.message);
-      }
-    }
-  }
-
-  // Non-staff / root admin legacy token — return decoded claims directly
-  return res.json({
-    user: {
-      id:           decoded.id || 1,
-      username:     decoded.username || 'admin',
-      full_name:    decoded.fullName || decoded.full_name || 'ADMINISTRATOR',
-      role:         decoded.role || 'admin',
-      loginType:    userType,
-      user_type:    userType,
-      type:         userType,
-      isRootAdmin,
-      authProvider: 'legacy'
-    }
-  });
 };
 

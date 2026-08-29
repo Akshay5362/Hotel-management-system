@@ -1,15 +1,7 @@
-import crypto from 'crypto';
-
-const JWT_SECRET = 'hotel-pms-super-secret-key-12345!';
-function generateLegacyToken(user) {
-  const payload = JSON.stringify({ id: user.id, role: user.role, type: user.type || 'staff' });
-  const base64Payload = Buffer.from(payload).toString('base64url');
-  const signature = crypto.createHmac('sha256', JWT_SECRET).update(base64Payload).digest('base64url');
-  return base64Payload + '.' + signature;
-}
+import { getTestFirebaseToken } from './helpers/firebaseTestTokenHelper.mjs';
 
 async function testLiveStatus() {
-  const token = generateLegacyToken({ id: 1, role: 'admin', type: 'staff' });
+  const token = await getTestFirebaseToken({ id: 1, role: 'admin', type: 'staff' });
   const res = await fetch('http://localhost:5000/api/status', {
     headers: { Authorization: 'Bearer ' + token }
   });

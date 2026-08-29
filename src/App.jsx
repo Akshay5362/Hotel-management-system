@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import Toolbar from './components/Toolbar';
 import RoomGrid from './components/RoomGrid';
 import MetricsBar from './components/MetricsBar';
@@ -23,7 +23,9 @@ import { ReceptionDashboard, KitchenDashboard, PantryDashboard, HousekeepingDash
 import ReceptionPortal from './components/ReceptionPortal';
 import Sidebar from './components/Sidebar';
 import RoomInspectorDrawer from './components/RoomInspectorDrawer';
+import { auth } from './config/firebaseClient';
 import InventoryModule from './components/InventoryModule';
+import FoodPOS from './components/food/FoodPOS';           // Food POS Phase 1 — Menu Master
 import { io } from 'socket.io-client';
 import { API_URL, SOCKET_URL, getApiHeaders } from './config/apiConfig';
 
@@ -162,7 +164,14 @@ function AppContent() {
   // Authoritative live selected room derived continuously from rooms array (Single Source of Truth)
   const liveSelectedRoom = React.useMemo(() => {
     if (!selectedRoomNumber) return null;
-    const found = rooms.find(r => String(r.number) === String(selectedRoomNumber) || String(r.id) === String(selectedRoomNumber) || String(r.doc_id) === String(selectedRoomNumber));
+    const selStr = String(selectedRoomNumber).trim();
+    // IMPORTANT: Never compare r.id (legacy MySQL surrogate PK) against the visible room number.
+    // r.id values do NOT correspond to canonical room numbers after migration
+    // (e.g. Room 12 has mysql id=17, Room 17 has mysql id=14), causing cross-room collisions.
+    // Resolve exclusively by canonical visible number or Firestore document ID.
+    const found = rooms.find(
+      r => String(r.number) === selStr || String(r.doc_id) === selStr
+    );
     return found || null;
   }, [rooms, selectedRoomNumber]);
 
@@ -170,7 +179,9 @@ function AppContent() {
     if (!roomOrNum) {
       setSelectedRoomNumber(null);
     } else if (typeof roomOrNum === 'object') {
-      setSelectedRoomNumber(String(roomOrNum.number || roomOrNum.id || ''));
+      // Store canonical room number; fall back to Firestore doc_id.
+      // Never fall back to roomOrNum.id (MySQL surrogate PK) — it does not equal the visible room number.
+      setSelectedRoomNumber(String(roomOrNum.number || roomOrNum.doc_id || ''));
     } else {
       setSelectedRoomNumber(String(roomOrNum));
     }
@@ -330,7 +341,7 @@ function AppContent() {
 
       console.log(`[API Request] URL: ${requestUrl} | Token Source: ${tokenSource} | Auth Header: ${authHeader.substring(0, 20)}...`);
 
-      const res = await fetch(requestUrl, { 
+      let res = await fetch(requestUrl, { 
         signal: controller.signal,
         headers: getApiHeaders(currentToken)
       });
@@ -341,16 +352,66 @@ function AppContent() {
       // Any HTTP response from server means backend is reachable and online
       setIsBackendOnline(true);
 
-      if (res.status === 401 || res.status === 403) {
-        console.warn(`[API Auth Warning] Server returned HTTP ${res.status} (Unauthorized/Forbidden).`);
-        const isAdminPath = window.location.pathname.includes('admin');
-        if (isAdminPath) {
-          adminLogout();
-          navigate('/admin/login');
-        } else {
-          guestLogout();
-          navigate('/login');
+      // Handle 401 with graceful token refresh and a single immediate retry
+      if (res.status === 401) {
+        console.warn('[API Auth Warning] Server returned HTTP 401. Attempting token refresh and single retry...');
+        let refreshedSuccessfully = false;
+
+        if (auth && auth.currentUser) {
+          try {
+            const freshToken = await auth.currentUser.getIdToken(true);
+            if (freshToken) {
+              if (adminToken) {
+                localStorage.setItem('adminToken', freshToken);
+              } else if (guestToken) {
+                localStorage.setItem('guestToken', freshToken);
+              }
+
+              // Retry the request once with the fresh token
+              const retryController = new AbortController();
+              const retryTimeout = setTimeout(() => retryController.abort(), 5000);
+              const retryRes = await fetch(requestUrl, {
+                signal: retryController.signal,
+                headers: getApiHeaders(freshToken)
+              });
+              clearTimeout(retryTimeout);
+
+              if (retryRes.ok) {
+                res = retryRes;
+                refreshedSuccessfully = true;
+                console.log('[API Auth Recovery] Retry succeeded with refreshed token.');
+              } else if (retryRes.status === 401) {
+                console.warn('[API Auth Warning] Retry still returned 401 after token refresh.');
+              }
+            }
+          } catch (refreshErr) {
+            console.warn('[API Auth Warning] Token refresh attempt threw:', refreshErr.message);
+          }
         }
+
+        // If refresh + retry failed and user is genuinely unauthenticated in Firebase
+        if (!refreshedSuccessfully) {
+          if (!auth || !auth.currentUser) {
+            console.warn('[API Auth Warning] User is not authenticated in Firebase. Logging out.');
+            const isAdminPath = window.location.pathname.includes('admin');
+            if (isAdminPath) {
+              adminLogout();
+              navigate('/admin/login');
+            } else {
+              guestLogout();
+              navigate('/login');
+            }
+            return;
+          }
+          // If auth.currentUser still exists, do not destroy session prematurely on transient error
+          console.warn('[API Auth Warning] Skipping hard logout because Firebase session is still active.');
+          return;
+        }
+      }
+
+      // Handle 403: Forbidden (Role / Permission check failed — do NOT logout authenticated users)
+      if (res.status === 403) {
+        console.warn('[API Auth Warning] Server returned HTTP 403 (Forbidden: user lacks permission). Session preserved.');
         return;
       }
 
@@ -437,6 +498,13 @@ function AppContent() {
       fetchRequestCount();
       // Dispatch an event so GuestRequestsModal can refresh if it's currently open
       document.dispatchEvent(new CustomEvent('guest-request-refresh'));
+    });
+
+    socket.on('food:order_ready', (data) => {
+      if (data && data.order_number) {
+        const dest = data.destination_type === 'ROOM' ? `Room ${data.room_number}` : (data.table_name || 'Restaurant');
+        showAlert(`Food Order ${data.order_number} is READY for dispatch to ${dest} (Server: ${data.waiter_name || 'Staff'})`, 'Kitchen Alert — Order Ready');
+      }
     });
 
     return () => {
@@ -977,7 +1045,10 @@ function AppContent() {
       const updatedRoom = data.room;
 
       if (updatedRoom) {
-        setRooms(prev => prev.map(r => (String(r.number) === String(roomNumber) || String(r.id) === String(roomNumber)) ? { ...r, ...updatedRoom } : r));
+        // Match ONLY by canonical visible room number — never by r.id (MySQL surrogate PK).
+        // r.id does not equal the visible room number after migration (e.g. Room 12 has id=17,
+        // Room 17 has id=14), so the old r.id branch caused cross-room number corruption.
+        setRooms(prev => prev.map(r => String(r.number) === String(roomNumber) ? { ...r, ...updatedRoom } : r));
       }
 
       await fetchStatus();
@@ -1032,7 +1103,9 @@ function AppContent() {
     continuedRooms
   };
 
-  const vacantRoomsList = rooms.filter(r => r.status === 'vacant');
+  const vacantRoomsList = useMemo(() => {
+    return rooms.filter(r => r.status === 'vacant');
+  }, [rooms]);
 
   const handlePromptSubmit = (e) => {
     e.preventDefault();
@@ -1237,6 +1310,12 @@ function AppContent() {
           {adminTab === 'inventory' && (
             <div className="dashboard-body">
               <InventoryModule />
+            </div>
+          )}
+          {/* ── Food / Restaurant POS — Phase 1 Menu Master ───────────────────── */}
+          {adminTab === 'food' && (
+            <div className="dashboard-body">
+              <FoodPOS token={adminToken} user={adminUser} />
             </div>
           )}
           {adminTab === 'guests' && (

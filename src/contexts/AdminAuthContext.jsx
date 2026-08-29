@@ -1,5 +1,5 @@
 import React, { createContext, useState, useEffect } from 'react';
-import { auth, signOut, onAuthStateChanged } from '../config/firebaseClient';
+import { auth, signOut, onIdTokenChanged } from '../config/firebaseClient';
 import { API_BASE_URL, getApiHeaders } from '../config/apiConfig';
 
 export const AdminAuthContext = createContext(null);
@@ -16,14 +16,14 @@ export function AdminAuthProvider({ children }) {
 
   useEffect(() => {
     if (!auth) return;
-    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+    const unsubscribe = onIdTokenChanged(auth, async (firebaseUser) => {
       if (firebaseUser) {
         try {
-          const freshToken = await firebaseUser.getIdToken(false);
+          const freshToken = await firebaseUser.getIdToken();
           setAdminToken(freshToken);
           localStorage.setItem('adminToken', freshToken);
 
-          // Re-validate role from server on every auth state change (page refresh).
+          // Re-validate role from server on auth state change (e.g. initial load / role update).
           // This prevents a stale localStorage role from surviving a role change.
           try {
             const meRes = await fetch(`${API_BASE_URL}/api/auth/me`, {
@@ -47,6 +47,10 @@ export function AdminAuthProvider({ children }) {
         } catch (e) {
           console.warn('[AdminAuthContext] Token refresh failed:', e.message);
         }
+      } else {
+        // Firebase user signed out
+        localStorage.removeItem('adminToken');
+        setAdminToken('');
       }
     });
     return () => unsubscribe();

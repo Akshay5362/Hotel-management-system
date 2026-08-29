@@ -1,13 +1,5 @@
-import crypto from 'crypto';
 import { listDocs } from '../repositories/firestore/firestoreUtils.js';
-
-const JWT_SECRET = 'hotel-pms-super-secret-key-12345!';
-function generateLegacyToken(user) {
-  const payload = JSON.stringify({ id: user.id, role: user.role, type: user.type || 'staff' });
-  const base64Payload = Buffer.from(payload).toString('base64url');
-  const signature = crypto.createHmac('sha256', JWT_SECRET).update(base64Payload).digest('base64url');
-  return base64Payload + '.' + signature;
-}
+import { getTestFirebaseToken } from './helpers/firebaseTestTokenHelper.mjs';
 
 const EXPECTED_CANONICAL = [
   { number: '1', type: 'PREMIUM', rate: 2500, doc_id: 'room_1' },
@@ -44,7 +36,7 @@ async function verifyCanonicalInventory() {
   }
 
   // 2. Live API /status Verification
-  const token = generateLegacyToken({ id: 1, role: 'admin', type: 'staff' });
+  const token = await getTestFirebaseToken({ id: 1, role: 'admin', type: 'staff' });
   const res = await fetch('http://127.0.0.1:5000/api/status', {
     headers: { Authorization: 'Bearer ' + token }
   });

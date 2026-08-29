@@ -1,22 +1,14 @@
 import assert from 'assert';
-import crypto from 'crypto';
 import { FactoryResetCutoverService } from '../services/factoryResetCutoverService.js';
-
-const JWT_SECRET = 'hotel-pms-super-secret-key-12345!';
-function generateLegacyToken(user) {
-  const payload = JSON.stringify({ id: user.id, role: user.role, type: user.type || 'staff' });
-  const base64Payload = Buffer.from(payload).toString('base64url');
-  const signature = crypto.createHmac('sha256', JWT_SECRET).update(base64Payload).digest('base64url');
-  return base64Payload + '.' + signature;
-}
+import { getSuperAdminTestToken, getReceptionistTestToken } from './helpers/firebaseTestTokenHelper.mjs';
 
 async function runHardeningTests() {
   console.log('============================================================');
   console.log('HPMS FACTORY RESET PRODUCTION HARDENING TESTS (READ-ONLY)');
   console.log('============================================================');
 
-  const superAdminToken = generateLegacyToken({ id: 1, role: 'admin', type: 'admin', isRootAdmin: true });
-  const receptionistToken = generateLegacyToken({ id: 2, role: 'receptionist', type: 'staff' });
+  const superAdminToken = await getSuperAdminTestToken();
+  const receptionistToken = await getReceptionistTestToken();
 
   // 1. Status Preflight Check (Read-Only)
   console.log('\n--- 1. GET /api/system/factory-reset/status (Super Admin) ---');

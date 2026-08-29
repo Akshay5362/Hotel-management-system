@@ -1,5 +1,5 @@
 import React, { createContext, useState, useEffect } from 'react';
-import { auth, signOut, onAuthStateChanged } from '../config/firebaseClient';
+import { auth, signOut, onIdTokenChanged } from '../config/firebaseClient';
 
 export const GuestAuthContext = createContext(null);
 
@@ -15,18 +15,21 @@ export function GuestAuthProvider({ children }) {
 
   useEffect(() => {
     if (!auth) return;
-    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+    const unsubscribe = onIdTokenChanged(auth, async (firebaseUser) => {
       if (firebaseUser) {
         const storedToken = localStorage.getItem('guestToken');
         if (storedToken && !localStorage.getItem('adminToken')) {
           try {
-            const freshToken = await firebaseUser.getIdToken(false);
+            const freshToken = await firebaseUser.getIdToken();
             setGuestToken(freshToken);
             localStorage.setItem('guestToken', freshToken);
           } catch (e) {
             console.warn('[GuestAuthContext] Token refresh failed:', e.message);
           }
         }
+      } else if (!localStorage.getItem('adminToken')) {
+        localStorage.removeItem('guestToken');
+        setGuestToken('');
       }
     });
     return () => unsubscribe();

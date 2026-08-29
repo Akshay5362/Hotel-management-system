@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 
 export default function RoomShiftingModal({
   isOpen,
@@ -14,14 +14,29 @@ export default function RoomShiftingModal({
   const [manualAmount, setManualAmount] = useState('');
   const [reason, setReason] = useState('');
 
+  // Track open state transitions to guarantee form resets ONLY on rising edge (closed -> open)
+  const prevIsOpenRef = useRef(false);
+
+  // Initialize / reset form state ONLY on rising edge when modal transitions from closed to open
   useEffect(() => {
-    if (isOpen && vacantRooms.length > 0) {
-      setTargetRoomNo(vacantRooms[0].number);
+    if (isOpen && !prevIsOpenRef.current) {
+      setTargetRoomNo(vacantRooms.length > 0 ? String(vacantRooms[0].number) : '');
       setAdjustmentType('AUTOMATIC');
       setManualAmount('');
       setReason('');
     }
+    prevIsOpenRef.current = isOpen;
   }, [isOpen, vacantRooms]);
+
+  // If vacantRooms changes while modal is open, ensure targetRoomNo still points to a valid vacant room
+  useEffect(() => {
+    if (isOpen && vacantRooms.length > 0 && targetRoomNo) {
+      const stillAvailable = vacantRooms.some(r => String(r.number) === String(targetRoomNo));
+      if (!stillAvailable) {
+        setTargetRoomNo(String(vacantRooms[0].number));
+      }
+    }
+  }, [isOpen, vacantRooms, targetRoomNo]);
 
   if (!isOpen || !room) return null;
 
@@ -273,7 +288,6 @@ export default function RoomShiftingModal({
                     placeholder="e.g. Guest requested premium amenity upgrade / Manager approved discount"
                     value={reason}
                     onChange={(e) => setReason(e.target.value)}
-                    required
                   />
                 </div>
               )}

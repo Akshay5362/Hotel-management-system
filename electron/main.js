@@ -201,7 +201,7 @@ let mainWindow = null, splashWindow = null;
 
 // ─── SINGLE INSTANCE LOCK — DISABLED FOR DIAGNOSTIC ──────────────────────────
 // Set ENABLE_LOCK = true to re-enable after debugging is complete.
-const ENABLE_LOCK = false;
+const ENABLE_LOCK = true;
 if (ENABLE_LOCK) {
   const gotLock = app.requestSingleInstanceLock();
   L('LOCK', `requestSingleInstanceLock() = ${gotLock}`);

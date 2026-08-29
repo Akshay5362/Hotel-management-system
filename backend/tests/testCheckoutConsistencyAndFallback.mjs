@@ -1,15 +1,7 @@
 import assert from 'assert';
-import crypto from 'crypto';
 import { db } from '../config/firebaseAdmin.js';
 import { getDoc } from '../repositories/firestore/firestoreUtils.js';
-
-const JWT_SECRET = 'hotel-pms-super-secret-key-12345!';
-function generateLegacyToken(user) {
-  const payload = JSON.stringify({ id: user.id, role: user.role, type: user.type || 'staff' });
-  const base64Payload = Buffer.from(payload).toString('base64url');
-  const signature = crypto.createHmac('sha256', JWT_SECRET).update(base64Payload).digest('base64url');
-  return base64Payload + '.' + signature;
-}
+import { getAdminTestToken } from './helpers/firebaseTestTokenHelper.mjs';
 
 async function runCheckoutConsistencyTests() {
   console.log('============================================================');
@@ -53,7 +45,7 @@ async function runCheckoutConsistencyTests() {
 
   // 3. GET /api/status Dashboard Parity
   console.log('\n--- 3. LIVE GET /api/status DASHBOARD PARITY ---');
-  const token = generateLegacyToken({ id: 1, role: 'admin', type: 'staff' });
+  const token = await getAdminTestToken();
   const statusRes = await fetch('http://127.0.0.1:5000/api/status', {
     headers: { Authorization: 'Bearer ' + token }
   });

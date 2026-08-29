@@ -146,22 +146,22 @@ async function main() {
     }
   }
 
-  // Test 3: Legacy HMAC JWT → /api/status (fallback must still work)
-  console.log('\nTEST 3: Legacy HMAC JWT Fallback → /api/status');
+  // Test 3: Legacy HMAC JWT → /api/status (must be REJECTED with HTTP 401)
+  console.log('\nTEST 3: Legacy HMAC JWT Rejection → /api/status');
 
   for (const account of TEST_ACCOUNTS) {
     const legacyToken = generateLegacyToken({ id: account.mysql_id, role: account.expectedClaim, type: 'staff' });
     try {
       const result = await hitApi('/api/status', legacyToken);
-      if (result.status === 200) {
-        pass(`Legacy JWT for ${account.role} (id=${account.mysql_id}) → /api/status: HTTP ${result.status}`);
+      if (result.status === 401) {
+        pass(`Legacy JWT for ${account.role} (id=${account.mysql_id}) correctly REJECTED: HTTP ${result.status}`);
         passed++;
       } else {
-        fail(`Legacy JWT for ${account.role}: /api/status returned HTTP ${result.status} — ${JSON.stringify(result.body)}`);
+        fail(`Legacy JWT for ${account.role} was unexpectedly ACCEPTED: /api/status returned HTTP ${result.status}`);
         failed++;
       }
     } catch (e) {
-      fail(`Legacy JWT for ${account.role}: ${e.message}`);
+      fail(`Legacy JWT test error for ${account.role}: ${e.message}`);
       failed++;
     }
   }

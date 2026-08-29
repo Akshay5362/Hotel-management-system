@@ -77,8 +77,7 @@ app.use(express.json());
 // Mount the API Router
 app.use('/api', apiRouter);
 
-// Serve uploaded documents statically (Admin verification UI needs this)
-app.use('/guest-documents', express.static(path.join(__dirname, 'guest-documents')));
+// Serve static product photos for inventory
 app.use('/inventory-photos', express.static(path.join(__dirname, 'inventory-photos')));
 
 // Basic root checker

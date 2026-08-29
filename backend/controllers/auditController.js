@@ -1,6 +1,7 @@
 import pool from '../db.js';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { RoomStatusService } from '../services/roomStatusService.js';
 import { BusinessDateService, BD_ERRORS } from '../services/businessDateService.js';
 import { FirestoreAvailabilityService } from '../services/firestoreAvailabilityService.js';
@@ -14,6 +15,10 @@ import { FirestoreRoomStatusService } from '../services/firestoreRoomStatusServi
 import { SafeCutoverFallbackService } from '../services/safeCutoverFallbackService.js';
 import { GuestAdminService } from '../services/guestAdminService.js';
 import { GuestRequestsService, invalidateGuestRequestsCache } from '../services/guestRequestsService.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const GUEST_DOCS_DIR = path.resolve(__dirname, '..', 'guest-documents');
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -1145,6 +1150,59 @@ export const deleteGuestDocument = async (req, res) => {
   } catch (error) {
     console.error('deleteGuestDocument error:', error);
     res.status(error.status || 500).json({ success: false, message: error.message || 'Internal Server Error' });
+  }
+};
+
+// ─── ADMIN: STREAM GUEST DOCUMENT (AUTHENTICATED) ──────────────────────────
+export const streamGuestDocument = async (req, res) => {
+  try {
+    const { filename } = req.params;
+    if (!filename || typeof filename !== 'string') {
+      return res.status(400).json({ error: 'Filename is required' });
+    }
+
+    // Strictly validate filename to prevent path traversal and invalid characters
+    const baseFilename = path.basename(filename);
+    if (baseFilename !== filename || filename.includes('..') || filename.includes('/') || filename.includes('\\') || filename.includes('\0')) {
+      return res.status(400).json({ error: 'Invalid filename format' });
+    }
+
+    // Strict extension validation
+    const ext = path.extname(filename).toLowerCase();
+    const mimeMap = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.pdf': 'application/pdf'
+    };
+
+    const contentType = mimeMap[ext];
+    if (!contentType) {
+      return res.status(400).json({ error: 'Unsupported file type' });
+    }
+
+    const filePath = path.resolve(GUEST_DOCS_DIR, filename);
+
+    // Verify resolved path stays strictly inside GUEST_DOCS_DIR
+    if (!filePath.startsWith(GUEST_DOCS_DIR + path.sep) && filePath !== GUEST_DOCS_DIR) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'private, no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+
+    const fileStream = fs.createReadStream(filePath);
+    fileStream.pipe(res);
+  } catch (err) {
+    console.error('streamGuestDocument error:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
   }
 };
 

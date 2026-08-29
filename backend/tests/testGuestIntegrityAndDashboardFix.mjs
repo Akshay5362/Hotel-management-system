@@ -1,15 +1,7 @@
 import assert from 'assert';
-import crypto from 'crypto';
+import { getAdminTestToken } from './helpers/firebaseTestTokenHelper.mjs';
 
-const JWT_SECRET = 'hotel-pms-super-secret-key-12345!';
-function generateToken(user) {
-  const payload = JSON.stringify({ id: user.id, role: user.role, type: user.type || 'admin', isRootAdmin: true });
-  const base64Payload = Buffer.from(payload).toString('base64url');
-  const signature = crypto.createHmac('sha256', JWT_SECRET).update(base64Payload).digest('base64url');
-  return base64Payload + '.' + signature;
-}
-
-const adminToken = generateToken({ id: 1, role: 'admin' });
+const adminToken = await getAdminTestToken();
 
 async function waitForServer() {
   for (let i = 0; i < 15; i++) {

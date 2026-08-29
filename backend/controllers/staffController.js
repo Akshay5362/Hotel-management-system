@@ -11,7 +11,6 @@
 import pool from '../db.js';
 import { db, auth, isFirebaseConfigured } from '../config/firebaseAdmin.js';
 import bcrypt from 'bcryptjs';
-import { generateToken } from './authController.js';
 import { isStaffReadCanaryEnabled, isFirebaseOnlyStaffResolutionEnabled, isFirebaseStaffLoginEnabled, isMysqlCutoverFallbacksDisabled } from '../config/featureFlags.js';
 import { StaffCutoverService } from '../services/staffCutoverService.js';
 
@@ -149,18 +148,10 @@ export const staffLogin = async (req, res) => {
     if (!passwordMatch)
       return res.status(401).json({ error: 'Invalid email or password.' });
 
-    pool.query('UPDATE staff SET last_login = NOW() WHERE id = ?', [staff.id]).catch(() => {});
-
-    const tokenPayload = {
-      id:   staff.id,
-      role: staff.role,
-      type: 'staff',
-    };
-    const token = generateToken(tokenPayload);
-
     return res.json({
       message: 'Logged in successfully.',
-      token,
+      token: null,
+      idToken: null,
       staff: {
         id:         staff.id,
         name:       staff.full_name,

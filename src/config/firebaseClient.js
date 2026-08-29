@@ -1,5 +1,5 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
+import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, onIdTokenChanged } from 'firebase/auth';
 
 const firebaseConfig = {
   apiKey:            import.meta.env?.VITE_FIREBASE_API_KEY            || '',
@@ -23,5 +23,5 @@ try {
 
 export const isClientConfigured = Boolean(app && auth);
 
-export { app, auth, signInWithEmailAndPassword, signOut, onAuthStateChanged, firebaseConfig };
+export { app, auth, signInWithEmailAndPassword, signOut, onAuthStateChanged, onIdTokenChanged, firebaseConfig };
 export default firebaseConfig;

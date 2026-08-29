@@ -2,6 +2,12 @@ import React, { useState, useContext } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AuthContext } from '../contexts/AuthContext';
 import { API_BASE_URL } from '../services/api';
+import { auth, signInWithEmailAndPassword, signOut, isClientConfigured } from '../config/firebaseClient';
+import {
+  resolveFirebaseGuestEmail,
+  validateGuestClaims,
+  mapFirebaseGuestAuthError
+} from '../utils/resolveFirebaseGuestEmail';
 
 export default function Login() {
   const [isSignUp, setIsSignUp] = useState(false);
@@ -44,23 +50,66 @@ export default function Login() {
     }
 
     setIsLoading(true);
-    const endpoint = isSignUp ? '/auth/signup' : '/auth/signin';
-    const payload = isSignUp ? { username, password, fullName, phone } : { username, password };
 
     try {
-      const res = await fetch(`${API_BASE_URL}${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+      if (isSignUp) {
+        // ── 1. Register Guest Account (Provisions Firebase Auth + Firestore on Backend) ──
+        const signupRes = await fetch(`${API_BASE_URL}/auth/signup`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+          body: JSON.stringify({ username, password, fullName, phone })
+        });
 
-      const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.error || data.message || 'Authentication failed');
+        const signupData = await signupRes.json();
+        if (!signupRes.ok) {
+          throw new Error(signupData.error || signupData.message || 'Registration failed');
+        }
       }
 
-      login(data.user, data.token);
+      // ── 2. Authenticate directly via Firebase Client SDK ──────────────────────
+      if (!isClientConfigured || !auth) {
+        throw new Error('Firebase Client Authentication is not configured.');
+      }
+
+      const guestEmail = resolveFirebaseGuestEmail(username);
+      let userCredential;
+      try {
+        userCredential = await signInWithEmailAndPassword(auth, guestEmail, password);
+      } catch (fbErr) {
+        throw new Error(mapFirebaseGuestAuthError(fbErr));
+      }
+
+      // ── 3. Obtain fresh Firebase ID Token (RS256) ──────────────────────────────
+      const idToken = await userCredential.user.getIdToken(true);
+
+      // ── 4. Verify Identity with Backend and Obtain Canonical Guest Object ─────
+      const meRes = await fetch(`${API_BASE_URL}/auth/me`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${idToken}`,
+          'ngrok-skip-browser-warning': 'true'
+        }
+      });
+
+      if (!meRes.ok) {
+        const meData = await meRes.json().catch(() => ({}));
+        throw new Error(meData.error || `Identity verification failed (HTTP ${meRes.status})`);
+      }
+
+      const meData = await meRes.json();
+      if (!meData.user) {
+        throw new Error('Server returned no user identity. Please try again.');
+      }
+
+      // ── 5. Validate Guest Claims (Prevent Privilege Confusion) ────────────────
+      const claimsCheck = validateGuestClaims(meData.user);
+      if (!claimsCheck.valid) {
+        try { await signOut(auth); } catch (_) {}
+        throw new Error(claimsCheck.error);
+      }
+
+      // ── 6. Store Canonical User and Firebase ID Token in Session State ────────
+      login(meData.user, idToken);
       navigate('/dashboard');
 
     } catch (err) {
@@ -99,6 +148,7 @@ export default function Login() {
                   value={fullName}
                   onChange={e => setFullName(e.target.value)}
                   placeholder="John Doe"
+                  required
                   style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'rgba(255,255,255,0.05)', color: '#fff' }}
                 />
               </div>
@@ -116,12 +166,13 @@ export default function Login() {
           )}
 
           <div className="form-group" style={{ margin: 0 }}>
-            <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Username (Email)</label>
+            <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Username (Email or Handle)</label>
             <input
               type="text"
               value={username}
               onChange={e => setUsername(e.target.value)}
               placeholder="guest@example.com"
+              required
               style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'rgba(255,255,255,0.05)', color: '#fff' }}
             />
           </div>
@@ -133,6 +184,7 @@ export default function Login() {
               value={password}
               onChange={e => setPassword(e.target.value)}
               placeholder="••••••••"
+              required
               style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'rgba(255,255,255,0.05)', color: '#fff' }}
             />
           </div>
@@ -155,7 +207,7 @@ export default function Login() {
           {isSignUp ? 'Already have an account?' : 'New to Hotel Sky-5?'}
           <button
             type="button"
-            onClick={() => setIsSignUp(!isSignUp)}
+            onClick={() => { setIsSignUp(!isSignUp); setErrorMsg(''); }}
             style={{
               background: 'none', border: 'none', color: 'var(--color-vacant)',
               fontWeight: 'bold', cursor: 'pointer', marginLeft: '5px'

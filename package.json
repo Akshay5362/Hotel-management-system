@@ -39,7 +39,8 @@
       "!dist/*.yml",
       "!dist/builder-debug.yml",
       "electron/**/*",
-      "package.json"
+      "package.json",
+      "!node_modules/**"
     ],
     "extraResources": [
       {

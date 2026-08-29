@@ -1,10 +1,17 @@
 import pool from '../db.js';
 import { BusinessDateService } from '../services/businessDateService.js';
 import { RoomStatusService } from '../services/roomStatusService.js';
-import { isFirestoreReportsShadowEnabled } from '../config/featureFlags.js';
-import { FirestoreShadowComparisonService } from '../services/firestoreShadowComparisonService.js';
-import { FirestoreReportsService } from '../services/firestoreReportsService.js';
 import { ReportsCutoverService } from '../services/reportsCutoverService.js';
+import {
+  filterRecordsByDateRange,
+  getEffectivePaymentAmount,
+  computeDaysInRange,
+  calculateStayOverlapNights,
+  getBookingRoomTariff,
+  getHistoricalRoomRevenueForBooking,
+  calculateAvailableRoomNights,
+  calculateAvailableRoomsForDate
+} from '../services/firestoreReportsService.js';
 
 // Helper to parse 'DD-MMM-YYYY' to a comparable Date object
 const parseBusinessDate = (dateStr) => {
@@ -23,22 +30,6 @@ const parseBusinessDate = (dateStr) => {
   return new Date(dateStr);
 };
 
-const filterByDateRange = (records, startDate, endDate, dateField = 'business_date') => {
-  const start = startDate ? new Date(startDate) : new Date(0);
-  const end = endDate ? new Date(endDate) : new Date();
-  end.setHours(23, 59, 59, 999);
-
-  return records.filter(record => {
-    let recDate = record[dateField];
-    if (recDate instanceof Date) {
-      return recDate >= start && recDate <= end;
-    }
-    const parsed = parseBusinessDate(recDate);
-    if (!parsed) return false;
-    return parsed >= start && parsed <= end;
-  });
-};
-
 export const getDashboardOverview = async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
@@ -48,24 +39,39 @@ export const getDashboardOverview = async (req, res) => {
       async () => {
         const [payments] = await pool.query('SELECT * FROM payments');
         const [bookings] = await pool.query('SELECT * FROM bookings');
+        const [ledgerItems] = await pool.query('SELECT * FROM ledger_items');
+        const [statusHistory] = await pool.query('SELECT * FROM room_status_history');
         const businessDate = await BusinessDateService.getBusinessDate(pool);
         const rooms = await RoomStatusService.getRoomStatuses(pool, businessDate);
 
-        const filteredPayments = filterByDateRange(payments, startDate, endDate, 'business_date');
-        const totalRevenue = filteredPayments.reduce((sum, p) => sum + p.amount, 0);
+        // 1. Total revenue factoring in refunds
+        const filteredPayments = filterRecordsByDateRange(payments, startDate, endDate, 'business_date');
+        const totalRevenue = filteredPayments.reduce((sum, p) => sum + getEffectivePaymentAmount(p), 0);
 
-        const filteredBookings = filterByDateRange(bookings, startDate, endDate, 'created_at');
+        // 2. New bookings created in period
+        const filteredBookings = filterRecordsByDateRange(bookings, startDate, endDate, 'created_at');
         const totalBookings = filteredBookings.length;
 
-        const totalRooms = rooms.length;
-        const occupiedRooms = rooms.filter(r => r.status === 'occupied').length;
-        const occupancyRate = totalRooms === 0 ? 0 : Math.round((occupiedRooms / totalRooms) * 100);
+        // 3. Available room nights in date range deducting maintenance/OOO/blocked nights
+        const totalAvailableRoomNights = calculateAvailableRoomNights(rooms, statusHistory, startDate, endDate);
 
-        const roomRevenue = filteredBookings.reduce((sum, b) => sum + (b.total_amount || 0), 0);
-        const validBookings = filteredBookings.filter(b => ['Reserved', 'Checked In', 'Checked Out'].includes(b.booking_status));
-        const totalRoomsBooked = validBookings.length;
-        const adr = totalRoomsBooked === 0 ? 0 : Math.round(roomRevenue / totalRoomsBooked);
-        const revPAR = totalRooms === 0 ? 0 : Math.round(roomRevenue / totalRooms);
+        // 4. Calculate occupied room nights and room revenue for valid stays overlapping the period
+        const validBookings = bookings.filter(b => ['Reserved', 'Checked In', 'Checked Out'].includes(b.booking_status));
+        let totalOccupiedRoomNights = 0;
+        let totalRoomRevenue = 0;
+
+        validBookings.forEach(b => {
+          const overlap = calculateStayOverlapNights(b, startDate, endDate);
+          if (overlap > 0) {
+            totalOccupiedRoomNights += overlap;
+            const bookingRoomRev = getHistoricalRoomRevenueForBooking(b, ledgerItems, startDate, endDate);
+            totalRoomRevenue += bookingRoomRev;
+          }
+        });
+
+        const occupancyRate = totalAvailableRoomNights === 0 ? 0 : Math.min(100, Math.round((totalOccupiedRoomNights / totalAvailableRoomNights) * 100));
+        const adr = totalOccupiedRoomNights === 0 ? 0 : Math.round(totalRoomRevenue / totalOccupiedRoomNights);
+        const revPAR = totalAvailableRoomNights === 0 ? 0 : Math.round(totalRoomRevenue / totalAvailableRoomNights);
 
         return {
           totalRevenue,
@@ -98,19 +104,23 @@ export const getRevenueReport = async (req, res) => {
       { startDate, endDate },
       async () => {
         const [payments] = await pool.query('SELECT * FROM payments');
-        const filteredPayments = filterByDateRange(payments, startDate, endDate, 'business_date');
+        const filteredPayments = filterRecordsByDateRange(payments, startDate, endDate, 'business_date');
 
         const revenueByDate = {};
         const revenueByType = {};
+        let totalNetRevenue = 0;
 
         filteredPayments.forEach(p => {
           const date = p.business_date;
-          if (!revenueByDate[date]) revenueByDate[date] = 0;
-          revenueByDate[date] += p.amount;
+          const amt = getEffectivePaymentAmount(p);
+          totalNetRevenue += amt;
 
-          const type = p.payment_type;
+          if (!revenueByDate[date]) revenueByDate[date] = 0;
+          revenueByDate[date] += amt;
+
+          const type = p.payment_type || p.payment_method || 'Other';
           if (!revenueByType[type]) revenueByType[type] = 0;
-          revenueByType[type] += p.amount;
+          revenueByType[type] += amt;
         });
 
         const chartData = Object.keys(revenueByDate).map(date => ({
@@ -119,7 +129,7 @@ export const getRevenueReport = async (req, res) => {
         })).sort((a, b) => parseBusinessDate(a.date) - parseBusinessDate(b.date));
 
         return {
-          total: filteredPayments.reduce((sum, p) => sum + p.amount, 0),
+          total: totalNetRevenue,
           chartData,
           breakdown: revenueByType
         };
@@ -148,15 +158,38 @@ export const getOccupancyReport = async (req, res) => {
         const rooms = await RoomStatusService.getRoomStatuses(pool, businessDate);
         const [roomTypes] = await pool.query('SELECT * FROM room_types');
         const [bookings] = await pool.query('SELECT * FROM bookings');
+        const [statusHistory] = await pool.query('SELECT * FROM room_status_history');
 
-        const roomTypeStats = roomTypes.map(rt => {
-          const typeRooms = rooms.filter(r => r.room_type_id === rt.id);
-          const occupied = typeRooms.filter(r => r.status === 'occupied').length;
-          return {
+        const roomTypeMap = new Map();
+        roomTypes.forEach(rt => {
+          const typeRooms = rooms.filter(r => r.room_type_id === rt.id && r.status !== 'inactive');
+          roomTypeMap.set(rt.id, {
+            id: rt.id,
             name: rt.title,
-            total: typeRooms.length,
-            occupied: occupied,
-            occupancyRate: typeRooms.length === 0 ? 0 : Math.round((occupied / typeRooms.length) * 100)
+            totalRooms: typeRooms.length,
+            typeRooms,
+            occupiedNights: 0
+          });
+        });
+
+        const validBookings = bookings.filter(b => ['Reserved', 'Checked In', 'Checked Out'].includes(b.booking_status));
+        validBookings.forEach(b => {
+          const overlap = calculateStayOverlapNights(b, startDate, endDate);
+          if (overlap > 0) {
+            const room = rooms.find(r => r.id === b.room_id || r.number === b.room_number);
+            if (room && roomTypeMap.has(room.room_type_id)) {
+              roomTypeMap.get(room.room_type_id).occupiedNights += overlap;
+            }
+          }
+        });
+
+        const roomTypeStats = Array.from(roomTypeMap.values()).map(stat => {
+          const availableNights = calculateAvailableRoomNights(stat.typeRooms, statusHistory, startDate, endDate);
+          return {
+            name: stat.name,
+            total: stat.totalRooms,
+            occupied: stat.occupiedNights,
+            occupancyRate: availableNights === 0 ? 0 : Math.min(100, Math.round((stat.occupiedNights / availableNights) * 100))
           };
         });
 
@@ -167,7 +200,7 @@ export const getOccupancyReport = async (req, res) => {
           'Cancelled': 0
         };
 
-        const filteredBookings = filterByDateRange(bookings, startDate, endDate, 'created_at');
+        const filteredBookings = filterRecordsByDateRange(bookings, startDate, endDate, 'created_at');
         filteredBookings.forEach(b => {
           if (statusCounts[b.booking_status] !== undefined) {
             statusCounts[b.booking_status]++;
@@ -199,7 +232,7 @@ export const getGuestAnalytics = async (req, res) => {
       { startDate, endDate },
       async () => {
         const [guests] = await pool.query('SELECT * FROM guests');
-        const filteredGuests = filterByDateRange(guests, startDate, endDate, 'created_at');
+        const filteredGuests = filterRecordsByDateRange(guests, startDate, endDate, 'created_at');
 
         const loyaltyStats = {};
         const genderStats = {};
@@ -241,11 +274,11 @@ export const getBookingAnalytics = async (req, res) => {
       { startDate, endDate },
       async () => {
         const [bookings] = await pool.query('SELECT * FROM bookings');
-        const filteredBookings = filterByDateRange(bookings, startDate, endDate, 'created_at');
+        const filteredBookings = filterRecordsByDateRange(bookings, startDate, endDate, 'created_at');
 
         const bookingByDate = {};
         filteredBookings.forEach(b => {
-          const d = b.created_at.toISOString().split('T')[0];
+          const d = b.created_at ? new Date(b.created_at).toISOString().split('T')[0] : '2026-08-19';
           if (!bookingByDate[d]) bookingByDate[d] = 0;
           bookingByDate[d]++;
         });
@@ -280,11 +313,11 @@ export const getCancellationReport = async (req, res) => {
       { startDate, endDate },
       async () => {
         const [bookings] = await pool.query('SELECT * FROM bookings');
-        const filteredBookings = filterByDateRange(bookings, startDate, endDate, 'created_at');
+        const filteredBookings = filterRecordsByDateRange(bookings, startDate, endDate, 'created_at');
 
         const cancelled = filteredBookings.filter(b => b.booking_status === 'Cancelled');
         const totalCancelled = cancelled.length;
-        const lostRevenue = cancelled.reduce((sum, b) => sum + (b.total_amount || 0), 0);
+        const lostRevenue = cancelled.reduce((sum, b) => sum + Number(b.total_amount || 0), 0);
 
         return {
           totalCancelled,
@@ -313,10 +346,10 @@ export const getProfitReport = async (req, res) => {
       { startDate, endDate },
       async () => {
         const [payments] = await pool.query('SELECT * FROM payments');
-        const filteredPayments = filterByDateRange(payments, startDate, endDate, 'business_date');
+        const filteredPayments = filterRecordsByDateRange(payments, startDate, endDate, 'business_date');
 
-        const totalRevenue = filteredPayments.reduce((sum, p) => sum + p.amount, 0);
-        const estimatedCosts = totalRevenue * 0.3;
+        const totalRevenue = filteredPayments.reduce((sum, p) => sum + getEffectivePaymentAmount(p), 0);
+        const estimatedCosts = Math.round(totalRevenue * 0.3);
         const estimatedProfit = totalRevenue - estimatedCosts;
 
         return {
@@ -346,15 +379,45 @@ export const getADRReport = async (req, res) => {
       { startDate, endDate },
       async () => {
         const [bookings] = await pool.query('SELECT * FROM bookings');
-        const filteredBookings = filterByDateRange(bookings, startDate, endDate, 'created_at');
+        const [ledgerItems] = await pool.query('SELECT * FROM ledger_items');
+        const validBookings = bookings.filter(b => ['Reserved', 'Checked In', 'Checked Out'].includes(b.booking_status));
 
         const byDate = {};
-        filteredBookings.forEach(b => {
-          if (!['Reserved', 'Checked In', 'Checked Out'].includes(b.booking_status)) return;
-          const date = b.created_at.toISOString().split('T')[0];
-          if (!byDate[date]) byDate[date] = { revenue: 0, rooms: 0 };
-          byDate[date].revenue += (b.total_amount || 0);
-          byDate[date].rooms += 1;
+        const startStr = startDate ? new Date(startDate).toISOString().split('T')[0] : null;
+        const endStr = endDate ? new Date(endDate).toISOString().split('T')[0] : null;
+
+        if (startStr && endStr) {
+          const curr = new Date(startStr);
+          const endObj = new Date(endStr);
+          while (curr <= endObj) {
+            const dKey = curr.toISOString().split('T')[0];
+            byDate[dKey] = { revenue: 0, rooms: 0 };
+            curr.setDate(curr.getDate() + 1);
+          }
+        }
+
+        validBookings.forEach(b => {
+          const checkIn = b.check_in_date ? new Date(b.check_in_date).toISOString().split('T')[0] : null;
+          let checkOut = b.check_out_date ? new Date(b.check_out_date).toISOString().split('T')[0] : null;
+          if (!checkIn) return;
+          if (!checkOut || checkOut <= checkIn) {
+            const d = new Date(checkIn);
+            d.setDate(d.getDate() + 1);
+            checkOut = d.toISOString().split('T')[0];
+          }
+
+          const stayDate = new Date(checkIn);
+          const outDate = new Date(checkOut);
+          while (stayDate < outDate) {
+            const dKey = stayDate.toISOString().split('T')[0];
+            if (!startStr || (dKey >= startStr && dKey <= endStr)) {
+              if (!byDate[dKey]) byDate[dKey] = { revenue: 0, rooms: 0 };
+              const dayRev = getHistoricalRoomRevenueForBooking(b, ledgerItems, dKey, dKey);
+              byDate[dKey].revenue += dayRev;
+              byDate[dKey].rooms += 1;
+            }
+            stayDate.setDate(stayDate.getDate() + 1);
+          }
         });
 
         const chartData = Object.keys(byDate).map(date => ({
@@ -381,23 +444,57 @@ export const getRevPARReport = async (req, res) => {
       { startDate, endDate },
       async () => {
         const [bookings] = await pool.query('SELECT * FROM bookings');
+        const [ledgerItems] = await pool.query('SELECT * FROM ledger_items');
+        const [statusHistory] = await pool.query('SELECT * FROM room_status_history');
         const businessDate = await BusinessDateService.getBusinessDate(pool);
         const rooms = await RoomStatusService.getRoomStatuses(pool, businessDate);
-        const totalRooms = rooms.length;
 
-        const filteredBookings = filterByDateRange(bookings, startDate, endDate, 'created_at');
+        const validBookings = bookings.filter(b => ['Reserved', 'Checked In', 'Checked Out'].includes(b.booking_status));
 
         const byDate = {};
-        filteredBookings.forEach(b => {
-          const date = b.created_at.toISOString().split('T')[0];
-          if (!byDate[date]) byDate[date] = { revenue: 0 };
-          byDate[date].revenue += (b.total_amount || 0);
+        const startStr = startDate ? new Date(startDate).toISOString().split('T')[0] : null;
+        const endStr = endDate ? new Date(endDate).toISOString().split('T')[0] : null;
+
+        if (startStr && endStr) {
+          const curr = new Date(startStr);
+          const endObj = new Date(endStr);
+          while (curr <= endObj) {
+            const dKey = curr.toISOString().split('T')[0];
+            byDate[dKey] = { revenue: 0 };
+            curr.setDate(curr.getDate() + 1);
+          }
+        }
+
+        validBookings.forEach(b => {
+          const checkIn = b.check_in_date ? new Date(b.check_in_date).toISOString().split('T')[0] : null;
+          let checkOut = b.check_out_date ? new Date(b.check_out_date).toISOString().split('T')[0] : null;
+          if (!checkIn) return;
+          if (!checkOut || checkOut <= checkIn) {
+            const d = new Date(checkIn);
+            d.setDate(d.getDate() + 1);
+            checkOut = d.toISOString().split('T')[0];
+          }
+
+          const stayDate = new Date(checkIn);
+          const outDate = new Date(checkOut);
+          while (stayDate < outDate) {
+            const dKey = stayDate.toISOString().split('T')[0];
+            if (!startStr || (dKey >= startStr && dKey <= endStr)) {
+              if (!byDate[dKey]) byDate[dKey] = { revenue: 0 };
+              const dayRev = getHistoricalRoomRevenueForBooking(b, ledgerItems, dKey, dKey);
+              byDate[dKey].revenue += dayRev;
+            }
+            stayDate.setDate(stayDate.getDate() + 1);
+          }
         });
 
-        const chartData = Object.keys(byDate).map(date => ({
-          date,
-          revPAR: totalRooms === 0 ? 0 : Math.round(byDate[date].revenue / totalRooms)
-        })).sort((a, b) => new Date(a.date) - new Date(b.date));
+        const chartData = Object.keys(byDate).map(date => {
+          const dailyAvailable = calculateAvailableRoomsForDate(rooms, statusHistory, date);
+          return {
+            date,
+            revPAR: dailyAvailable === 0 ? 0 : Math.round(byDate[date].revenue / dailyAvailable)
+          };
+        }).sort((a, b) => new Date(a.date) - new Date(b.date));
 
         return { chartData };
       }
@@ -420,15 +517,39 @@ export const getRoomTypePerformance = async (req, res) => {
         const businessDate = await BusinessDateService.getBusinessDate(pool);
         const rooms = await RoomStatusService.getRoomStatuses(pool, businessDate);
         const [roomTypes] = await pool.query('SELECT * FROM room_types');
+        const [bookings] = await pool.query('SELECT * FROM bookings');
+        const [statusHistory] = await pool.query('SELECT * FROM room_status_history');
 
-        const roomTypeStats = roomTypes.map(rt => {
-          const typeRooms = rooms.filter(r => r.room_type_id === rt.id);
-          const occupied = typeRooms.filter(r => r.status === 'occupied').length;
-          return {
+        const roomTypeMap = new Map();
+        roomTypes.forEach(rt => {
+          const typeRooms = rooms.filter(r => r.room_type_id === rt.id && r.status !== 'inactive');
+          roomTypeMap.set(rt.id, {
+            id: rt.id,
             name: rt.title,
-            total: typeRooms.length,
-            occupied: occupied,
-            occupancyRate: typeRooms.length === 0 ? 0 : Math.round((occupied / typeRooms.length) * 100)
+            totalRooms: typeRooms.length,
+            typeRooms,
+            occupiedNights: 0
+          });
+        });
+
+        const validBookings = bookings.filter(b => ['Reserved', 'Checked In', 'Checked Out'].includes(b.booking_status));
+        validBookings.forEach(b => {
+          const overlap = calculateStayOverlapNights(b, startDate, endDate);
+          if (overlap > 0) {
+            const room = rooms.find(r => r.id === b.room_id || r.number === b.room_number);
+            if (room && roomTypeMap.has(room.room_type_id)) {
+              roomTypeMap.get(room.room_type_id).occupiedNights += overlap;
+            }
+          }
+        });
+
+        const roomTypeStats = Array.from(roomTypeMap.values()).map(stat => {
+          const availableNights = calculateAvailableRoomNights(stat.typeRooms, statusHistory, startDate, endDate);
+          return {
+            name: stat.name,
+            total: stat.totalRooms,
+            occupied: stat.occupiedNights,
+            occupancyRate: availableNights === 0 ? 0 : Math.min(100, Math.round((stat.occupiedNights / availableNights) * 100))
           };
         });
 
@@ -451,13 +572,14 @@ export const getPaymentsReport = async (req, res) => {
       { startDate, endDate },
       async () => {
         const [payments] = await pool.query('SELECT * FROM payments');
-        const filteredPayments = filterByDateRange(payments, startDate, endDate, 'business_date');
+        const filteredPayments = filterRecordsByDateRange(payments, startDate, endDate, 'business_date');
 
         const paymentMethods = {};
         filteredPayments.forEach(p => {
-          const method = p.payment_type || 'Unknown';
+          const method = p.payment_method || p.payment_type || 'Unknown';
+          const amt = getEffectivePaymentAmount(p);
           if (!paymentMethods[method]) paymentMethods[method] = 0;
-          paymentMethods[method] += p.amount;
+          paymentMethods[method] += amt;
         });
 
         const breakdown = Object.keys(paymentMethods).map(name => ({

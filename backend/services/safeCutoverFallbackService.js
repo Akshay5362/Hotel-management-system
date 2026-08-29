@@ -11,7 +11,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-export const DEFAULT_CUTOVER_TIMEOUT_MS = 2500;
+export const DEFAULT_CUTOVER_TIMEOUT_MS = 8000; // Increased from 2500ms: production cold gRPC channel RTT is 2697–3073ms on reception PC
 
 export class SafeCutoverFallbackService {
 

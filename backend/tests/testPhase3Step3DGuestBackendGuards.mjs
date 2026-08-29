@@ -788,15 +788,12 @@ console.log('\n--- TEST E30: SECURITY — lazy migration does not log/return pas
 
 console.log('\n─── F. Compatibility ───────────────────────────────────────────────────');
 
-// TEST 31: Legacy JWT still works (verifyToken path unaffected)
-console.log('\n--- TEST F31: Legacy JWT still works ---');
+// TEST 31: Legacy JWT is decommissioned (generateToken / verifyToken removed)
+console.log('\n--- TEST F31: Legacy JWT decommissioned ---');
 {
-  const { verifyToken, generateToken } = await import('../controllers/authController.js');
-  const token = generateToken({ id: 5, role: 'guest' });
-  const decoded = verifyToken(token);
-  assert(decoded !== null, 'F31: Legacy JWT: verifyToken returns non-null for valid token');
-  assert(decoded.id === 5, 'F31: Legacy JWT: decoded.id correct');
-  assert(decoded.role === 'guest', 'F31: Legacy JWT: decoded.role correct');
+  const authModule = await import('../controllers/authController.js');
+  assert(authModule.generateToken === undefined, 'F31: Legacy JWT: generateToken is removed');
+  assert(authModule.verifyToken === undefined, 'F31: Legacy JWT: verifyToken is removed');
 }
 
 // TEST 32: Staff Firebase token still resolves correctly (unaffected by guest flags)
