@@ -102,11 +102,11 @@ export default function CashStatusModal({ isOpen, onClose, cashLog, token, admin
 
   // ── Cash calculations ───────────────────────────────────────────────────────
   const advances = cashLog
-    .filter(log => log.type === 'Advance Deposit')
+    .filter(log => log.type === 'Advance Deposit' || log.type === 'Partial Payment' || log.type === 'Full Settlement')
     .reduce((sum, log) => sum + Number(log.amount), 0);
 
   const settlements = cashLog
-    .filter(log => log.type === 'Checkout Settlement')
+    .filter(log => log.type === 'Checkout Settlement' || log.type === 'Settlement')
     .reduce((sum, log) => sum + Number(log.amount), 0);
 
   const refunds = cashLog

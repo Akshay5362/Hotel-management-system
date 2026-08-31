@@ -150,6 +150,14 @@ export const processCheckOutFirestoreTransaction = async ({
     );
     paymentSnap.forEach(d => existingPayments.push(d.data()));
 
+    // 3b. FIND THE RESERVATION LINKED TO THIS BOOKING (if any). Walk-in
+    // bookings (no originating reservation) simply produce zero results
+    // here, which is expected and not an error.
+    const reservationSnap = await transaction.get(
+      db.collection('reservations').where('booking_id', '==', activeBookingDocId)
+    );
+    const linkedReservationRefs = reservationSnap.docs.map(d => d.ref);
+
     const financials = LedgerFirestoreAdapter.calculateAuthoritativeBalance(existingLedgers, existingPayments);
 
     let grossCharges = financials.grossCharges;
@@ -264,6 +272,16 @@ export const processCheckOutFirestoreTransaction = async ({
       check_out_date: businessDate,
       updated_at: nowIso
     }, { merge: true });
+
+    // 5b. SYNC LINKED RESERVATION STATUS TO CHECKED-OUT. Only the status
+    // and updated_at fields are touched here -- room_number, guest, and
+    // date fields are never modified by checkout.
+    linkedReservationRefs.forEach(reservationRef => {
+      transaction.set(reservationRef, {
+        status: 'Checked-Out',
+        updated_at: nowIso
+      }, { merge: true });
+    });
 
     // 6. CREATE / UPDATE INVOICE DOCUMENT
     const numPart = activeBookingData.booking_number 

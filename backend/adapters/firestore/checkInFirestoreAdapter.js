@@ -135,7 +135,7 @@ export const processCheckInFirestoreTransaction = async ({
     actualBusinessDate = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
   }
   const actualCheckInDate = checkInDate || actualBusinessDate;
-  const guestNameUpper = guestName ? String(guestName).trim().toUpperCase() : 'UNKNOWN';
+  let guestNameUpper = guestName ? String(guestName).trim().toUpperCase() : 'UNKNOWN';
 
   // Execute inside Firestore Atomic Transaction with maxAttempts: 2 to avoid excessive backoff
   return await db.runTransaction(async (transaction) => {
@@ -201,23 +201,31 @@ export const processCheckInFirestoreTransaction = async ({
         if (resData.status === 'Cancelled') {
           throw { status: 400, message: 'Cannot check in a cancelled reservation.' };
         }
+        // Fall back to the linked reservation's guest identity when the
+        // caller did not explicitly supply one, so reservation-linked
+        // check-ins reuse the existing guest document instead of creating
+        // a new timestamp-keyed one.
+        if (!guestName && resData.guest_name) {
+          guestNameUpper = String(resData.guest_name).trim().toUpperCase();
+        }
       }
     }
 
     // 3. RESOLVE GUEST DOCUMENT
-    const phoneKey = phone ? String(phone).trim() : (guestId || `guest_${Date.now()}`);
+    const resolvedPhone = phone || (resData && resData.phone) || null;
+    const phoneKey = resolvedPhone ? String(resolvedPhone).trim() : (guestId || `guest_${Date.now()}`);
     const guestRef = db.collection('guests').doc(String(phoneKey).startsWith('guest_') ? String(phoneKey) : `guest_${phoneKey}`);
     const guestSnap = await transaction.get(guestRef);
 
     const nowIso = new Date().toISOString();
     const guestData = {
       full_name: guestNameUpper,
-      phone: phone || '',
+      phone: resolvedPhone || '',
       email: email || (guestSnap.exists ? guestSnap.data().email : (resData ? resData.email : '')) || '',
-      age: (age !== undefined && age !== null) ? Number(age) : (guestSnap.exists ? guestSnap.data().age : null),
+      age: (age !== undefined && age !== null) ? Number(age) : (guestSnap.exists ? (guestSnap.data().age || null) : null),
       address: address || (guestSnap.exists ? guestSnap.data().address : (resData ? resData.address : '')) || '',
       country: country || (guestSnap.exists ? guestSnap.data().country : (resData ? resData.nationality : '')) || '',
-      date_of_birth: resolvedDob || (guestSnap.exists ? guestSnap.data().date_of_birth : null),
+      date_of_birth: resolvedDob || (guestSnap.exists ? (guestSnap.data().date_of_birth || null) : null),
       gst_no: gstNo || (guestSnap.exists ? guestSnap.data().gst_no : '') || '',
       company_name: companyName || (guestSnap.exists ? guestSnap.data().company_name : '') || '',
       city: city || (guestSnap.exists ? guestSnap.data().city : '') || '',
@@ -249,7 +257,7 @@ export const processCheckInFirestoreTransaction = async ({
       guest_id: guestRef.id,
       guest_name: guestNameUpper,
       age: (age !== undefined && age !== null) ? Number(age) : null,
-      phone: phone || '',
+      phone: resolvedPhone || '',
       email: email || '',
       country: country || '',
       state: state || '',

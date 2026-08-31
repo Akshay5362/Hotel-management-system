@@ -14,11 +14,11 @@ export default function ReportsModal({ isOpen, onClose, rooms, cashLog, currentD
 
   // Financial calculations
   const totalAdvances = cashLog
-    .filter(log => log.type === 'Advance Deposit')
+    .filter(log => log.type === 'Advance Deposit' || log.type === 'Partial Payment' || log.type === 'Full Settlement')
     .reduce((sum, log) => sum + log.amount, 0);
 
   const totalSettlements = cashLog
-    .filter(log => log.type === 'Checkout Settlement')
+    .filter(log => log.type === 'Checkout Settlement' || log.type === 'Settlement')
     .reduce((sum, log) => sum + log.amount, 0);
 
   const totalRevenue = cashLog.reduce((sum, log) => {
