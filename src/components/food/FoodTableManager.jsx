@@ -89,7 +89,7 @@ export default function FoodTableManager({ token, user }) {
 
       const res = await fetch(url, {
         method,
-        headers: getApiHeaders(token),
+        headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
         body: JSON.stringify(payload)
       });
       const data = await res.json();
