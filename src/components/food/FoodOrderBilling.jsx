@@ -40,7 +40,7 @@ export default function FoodOrderBilling({ order, token, user, onBack, onComplet
     try {
       const res = await fetch(`${API_URL}/food/orders/${order.order_id}/pay-now`, {
         method: 'POST',
-        headers: getApiHeaders(token),
+        headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ payment_method: payMethod, notes })
       });
       const data = await res.json();
@@ -94,7 +94,7 @@ export default function FoodOrderBilling({ order, token, user, onBack, onComplet
     try {
       const res = await fetch(`${API_URL}/food/orders/${order.order_id}/complimentary/request`, {
         method: 'POST',
-        headers: getApiHeaders(token),
+        headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           recipient: compRecipient,
           recipient_type: compRecipientType,
