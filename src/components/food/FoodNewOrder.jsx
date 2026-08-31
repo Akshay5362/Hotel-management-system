@@ -126,7 +126,7 @@ function DestinationPanel({
   staffList, loadingStaff, selectedStaff, setSelectedStaff,
   tablesList, loadingTables, selectedTable, setSelectedTable,
   ownerName, setOwnerName,
-  selectedWaiter, setSelectedWaiter,
+  waiterList, selectedWaiter, setSelectedWaiter,
   destError
 }) {
   const filteredRooms = useMemo(() => {
@@ -281,14 +281,14 @@ function DestinationPanel({
           style={inputStyle}
           value={selectedWaiter?.staff_id || ''}
           onChange={e => {
-            const found = staffList.find(s => s.staff_id === e.target.value);
+            const found = waiterList.find(w => w.staff_id === e.target.value);
             setSelectedWaiter(found || null);
           }}
         >
           <option value="">— Select Assigned Waiter —</option>
-          {staffList.map(s => (
-            <option key={s.staff_id} value={s.staff_id}>
-              {s.staff_name} {s.role ? `(${s.role})` : ''}
+          {waiterList.map(w => (
+            <option key={w.staff_id} value={w.staff_id}>
+              {w.staff_name}
             </option>
           ))}
         </select>
@@ -463,6 +463,8 @@ export default function FoodNewOrder({ token, user }) {
   const [loadingTables,   setLoadingTables]   = useState(false);
   const [selectedTable,   setSelectedTable]   = useState(null);
   const [ownerName,       setOwnerName]       = useState('');
+  const [waiterList,      setWaiterList]      = useState([]);
+  const [loadingWaiters,  setLoadingWaiters]  = useState(false);
   const [selectedWaiter,  setSelectedWaiter]  = useState(null);
   const [destError,       setDestError]       = useState('');
 
@@ -496,10 +498,7 @@ export default function FoodNewOrder({ token, user }) {
     setLoadingStaff(true);
     fetch(`${FOOD_BASE}/context/staff`, { headers: getHeaders() })
       .then(r => r.json())
-      .then(d => {
-        setStaffList(d.staff || []);
-        if (d.staff && d.staff.length > 0) setSelectedWaiter(d.staff[0]);
-      })
+      .then(d => setStaffList(d.staff || []))
       .catch(e => console.error('[FoodNewOrder] staff context error:', e))
       .finally(() => setLoadingStaff(false));
 
@@ -509,6 +508,17 @@ export default function FoodNewOrder({ token, user }) {
       .then(d => setTablesList(d.tables || []))
       .catch(e => console.error('[FoodNewOrder] tables error:', e))
       .finally(() => setLoadingTables(false));
+
+    setLoadingWaiters(true);
+    fetch(`${FOOD_BASE}/waiters?active_only=true`, { headers: getHeaders() })
+      .then(r => r.json())
+      .then(d => {
+        const waiters = (d.waiters || []).map(w => ({ staff_id: w.waiter_id, staff_name: w.waiter_name }));
+        setWaiterList(waiters);
+        if (waiters.length > 0) setSelectedWaiter(waiters[0]);
+      })
+      .catch(e => console.error('[FoodNewOrder] waiters error:', e))
+      .finally(() => setLoadingWaiters(false));
   }, []);
 
   useEffect(() => {
@@ -757,7 +767,7 @@ export default function FoodNewOrder({ token, user }) {
             staffList={staffList} loadingStaff={loadingStaff} selectedStaff={selectedStaff} setSelectedStaff={setSelectedStaff}
             tablesList={tablesList} loadingTables={loadingTables} selectedTable={selectedTable} setSelectedTable={setSelectedTable}
             ownerName={ownerName} setOwnerName={setOwnerName}
-            selectedWaiter={selectedWaiter} setSelectedWaiter={setSelectedWaiter}
+            waiterList={waiterList} selectedWaiter={selectedWaiter} setSelectedWaiter={setSelectedWaiter}
             destError={destError}
           />
         </div>

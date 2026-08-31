@@ -14,11 +14,12 @@
  */
 
 import React, { useState } from 'react';
-import { UtensilsCrossed, BookOpen, ShoppingCart, ClipboardList, Layers, Gift, ChefHat, BarChart3 } from 'lucide-react';
+import { UtensilsCrossed, BookOpen, ShoppingCart, ClipboardList, Layers, Gift, ChefHat, BarChart3, Users } from 'lucide-react';
 import FoodMenuManager from './FoodMenuManager';
 import FoodNewOrder from './FoodNewOrder';
 import FoodKitchenDisplay from './FoodKitchenDisplay';
 import FoodTableManager from './FoodTableManager';
+import FoodWaiterManager from './FoodWaiterManager';
 import FoodComplimentaryApproval from './FoodComplimentaryApproval';
 import FoodOrderHistory from './FoodOrderHistory';
 import FoodReports from './FoodReports';
@@ -56,6 +57,14 @@ const TABS = [
     phase: 2,
     ready: true,
     desc:  'Manage dining tables'
+  },
+  {
+    key:   'waiters',
+    label: 'Waiter Master',
+    icon:  Users,
+    phase: 2,
+    ready: true,
+    desc:  'Manage waiters for order assignment'
   },
   {
     key:   'complimentary',
@@ -230,6 +239,10 @@ export default function FoodPOS({ token, user }) {
 
         {activeTab === 'tables' && (
           <FoodTableManager token={token} user={user} />
+        )}
+
+        {activeTab === 'waiters' && (
+          <FoodWaiterManager token={token} user={user} />
         )}
 
         {activeTab === 'complimentary' && (

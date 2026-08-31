@@ -71,6 +71,14 @@ import {
   deleteFoodTable
 } from '../controllers/foodTableController.js';
 
+import {
+  getFoodWaiters,
+  getFoodWaiterById,
+  createFoodWaiter,
+  updateFoodWaiter,
+  deleteFoodWaiter
+} from '../controllers/foodWaiterController.js';
+
 const router = express.Router();
 
 // All food routes require a valid authentication token
@@ -104,6 +112,13 @@ router.get('/tables/:id', getFoodTableById);
 router.post('/tables', requireAdmin, createFoodTable);
 router.put('/tables/:id', requireAdmin, updateFoodTable);
 router.delete('/tables/:id', requireAdmin, deleteFoodTable);
+
+// ── Food Waiters Master ────────────────────────────────────────────────────────
+router.get('/waiters', getFoodWaiters);
+router.get('/waiters/:id', getFoodWaiterById);
+router.post('/waiters', requireAdmin, createFoodWaiter);
+router.put('/waiters/:id', requireAdmin, updateFoodWaiter);
+router.delete('/waiters/:id', requireAdmin, deleteFoodWaiter);
 
 // ── Food Context & Creation (Phase 2A & 2B) ───────────────────────────────────
 router.get('/context/rooms', requireAdmin, getFoodOrderRoomContext);
