@@ -62,7 +62,3 @@ export function ReceptionDashboard() {
 export function PantryDashboard() {
   return <BaseDashboard title="Pantry Operations" icon="☕" color="#f472b6" />;
 }
-
-export function HousekeepingDashboard() {
-  return <BaseDashboard title="Housekeeping & Cleaning" icon="🧹" color="#4ade80" />;
-}

@@ -1,4 +1,5 @@
 import { HousekeepingCutoverService } from '../services/housekeepingCutoverService.js';
+import { normalizeUserRole } from './authController.js';
 
 export const getHousekeepingRooms = async (req, res) => {
   try {
@@ -13,8 +14,18 @@ export const getHousekeepingRooms = async (req, res) => {
 export const assignHousekeeper = async (req, res) => {
   const { roomId, userId, priority } = req.body;
   const performedBy = req.user?.id || null;
-  
+
   if (!roomId) return res.status(400).json({ error: 'Room ID is required' });
+
+  // Room/task assignment is an Admin/Reception management action — cleaners
+  // operate their own assigned tasks via update-status only. Independent of
+  // the route-level requireRole(...) list, mirroring the Food KDS pattern.
+  if (normalizeUserRole(req.user) === 'housekeeper') {
+    return res.status(403).json({
+      error: 'Forbidden: Only Admin/Reception may assign or reassign housekeeping tasks.',
+      code: 'HOUSEKEEPING_ASSIGN_FORBIDDEN'
+    });
+  }
 
   try {
     const result = await HousekeepingCutoverService.assignHousekeeper({
@@ -22,7 +33,7 @@ export const assignHousekeeper = async (req, res) => {
       userId,
       priority,
       performedBy,
-      io: req.io
+      io: req.app.get('io')
     });
     res.json(result);
   } catch (error) {
@@ -44,7 +55,7 @@ export const updateHousekeepingStatus = async (req, res) => {
       status,
       notes,
       performedBy,
-      io: req.io
+      io: req.app.get('io')
     });
     res.json(result);
   } catch (error) {

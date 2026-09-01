@@ -19,8 +19,9 @@ import SettingsModal from './components/SettingsModal';
 import { AdminAuthProvider, AdminAuthContext } from './contexts/AdminAuthContext';
 import { GuestAuthProvider, GuestAuthContext } from './contexts/GuestAuthContext';
 import { AdminProtectedRoute, GuestProtectedRoute, RoleProtectedRoute } from './components/ProtectedRoutes';
-import { ReceptionDashboard, PantryDashboard, HousekeepingDashboard } from './components/StaffDashboards';
+import { ReceptionDashboard, PantryDashboard } from './components/StaffDashboards';
 import KitchenDashboard from './components/KitchenDashboard';
+import HousekeepingDashboard from './components/HousekeepingDashboard';
 import ReceptionPortal from './components/ReceptionPortal';
 import Sidebar from './components/Sidebar';
 import RoomInspectorDrawer from './components/RoomInspectorDrawer';
@@ -247,6 +248,7 @@ function AppContent() {
           navigate('/kitchen/dashboard');
           break;
         case 'CLEANER':
+        case 'HOUSEKEEPING':
           navigate('/housekeeping/dashboard');
           break;
         default:
@@ -1156,6 +1158,7 @@ function AppContent() {
           navigate('/kitchen/dashboard');
           break;
         case 'CLEANER':
+        case 'HOUSEKEEPING':
           navigate('/housekeeping/dashboard');
           break;
         default:
@@ -1519,7 +1522,7 @@ function AppContent() {
     );
   } else if (currentPath === '/housekeeping/dashboard') {
     pageContent = (
-      <RoleProtectedRoute allowedRoles={['CLEANER']} navigate={navigate}>
+      <RoleProtectedRoute allowedRoles={['CLEANER', 'HOUSEKEEPING']} navigate={navigate}>
         <HousekeepingDashboard />
       </RoleProtectedRoute>
     );

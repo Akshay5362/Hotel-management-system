@@ -4,6 +4,13 @@ import { io } from 'socket.io-client';
 import { API_URL, SOCKET_URL, getApiHeaders } from '../config/apiConfig';
 let socket;
 
+// The two existing housekeeping worker accounts (staff_9 / staff_10) — per
+// the finalized workflow, assignment is limited to exactly these two.
+const CLEANERS = [
+  { uid: 'staff_9',  label: 'Cleaner 1' },
+  { uid: 'staff_10', label: 'Cleaner 2' }
+];
+
 
 export default function AdminHousekeeping({ onBack }) {
   const [rooms, setRooms] = useState([]);
@@ -22,7 +29,9 @@ export default function AdminHousekeeping({ onBack }) {
 
   const fetchRooms = async () => {
     try {
-      const res = await fetch(`${API_URL}/housekeeping/rooms`);
+      const res = await fetch(`${API_URL}/housekeeping/rooms`, {
+        headers: getApiHeaders(localStorage.getItem('adminToken'))
+      });
       if (res.ok) {
         const data = await res.json();
         setRooms(data);
@@ -64,6 +73,19 @@ export default function AdminHousekeeping({ onBack }) {
       });
       fetchRooms();
 
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleAssignCleaner = async (roomId, userId) => {
+    try {
+      await fetch(`${API_URL}/housekeeping/assign`, {
+        method: 'POST',
+        headers: getApiHeaders(localStorage.getItem('adminToken'), { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ roomId, userId: userId || null })
+      });
+      fetchRooms();
     } catch (err) {
       console.error(err);
     }
@@ -151,6 +173,7 @@ export default function AdminHousekeeping({ onBack }) {
               <th style={{ padding: '15px 20px', color: 'var(--text-muted)', fontWeight: '600' }}>Room</th>
               <th style={{ padding: '15px 20px', color: 'var(--text-muted)', fontWeight: '600' }}>Occupancy</th>
               <th style={{ padding: '15px 20px', color: 'var(--text-muted)', fontWeight: '600' }}>Guest</th>
+              <th style={{ padding: '15px 20px', color: 'var(--text-muted)', fontWeight: '600' }}>Assigned Cleaner</th>
               <th style={{ padding: '15px 20px', color: 'var(--text-muted)', fontWeight: '600' }}>Priority</th>
               <th style={{ padding: '15px 20px', color: 'var(--text-muted)', fontWeight: '600' }}>HK Status</th>
               <th style={{ padding: '15px 20px', color: 'var(--text-muted)', fontWeight: '600' }}>Last Cleaned</th>
@@ -158,7 +181,7 @@ export default function AdminHousekeeping({ onBack }) {
           </thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan="6" style={{ textAlign: 'center', padding: '30px' }}>Loading...</td></tr>
+              <tr><td colSpan="7" style={{ textAlign: 'center', padding: '30px' }}>Loading...</td></tr>
             ) : filteredRooms.map(r => (
               <tr key={r.id} style={{ borderBottom: '1px solid var(--border-color)', transition: 'background 0.2s', cursor: 'default' }} onMouseOver={e => e.currentTarget.style.background='rgba(255,255,255,0.03)'} onMouseOut={e => e.currentTarget.style.background='transparent'}>
                 <td style={{ padding: '15px 20px' }}>
@@ -170,7 +193,28 @@ export default function AdminHousekeeping({ onBack }) {
                 </td>
                 <td style={{ padding: '15px 20px' }}>{r.guest_name || '-'}</td>
                 <td style={{ padding: '15px 20px' }}>
-                  <select 
+                  <select
+                    value={r.housekeeping_assigned_to || ''}
+                    onChange={(e) => handleAssignCleaner(r.id, e.target.value)}
+                    style={{
+                      background: r.housekeeping_assigned_to ? 'rgba(56,189,248,0.15)' : 'rgba(255,255,255,0.05)',
+                      color: r.housekeeping_assigned_to ? '#7dd3fc' : 'var(--text-muted)',
+                      border: 'none',
+                      padding: '6px 12px',
+                      borderRadius: '8px',
+                      fontWeight: '600',
+                      outline: 'none',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    <option value="">Unassigned</option>
+                    {CLEANERS.map(c => (
+                      <option key={c.uid} value={c.uid}>{c.label}</option>
+                    ))}
+                  </select>
+                </td>
+                <td style={{ padding: '15px 20px' }}>
+                  <select
                     value={r.housekeeping_priority || 'Normal'}
                     onChange={(e) => handlePriorityChange(r.id, e.target.value)}
                     style={{ 
@@ -218,7 +262,7 @@ export default function AdminHousekeeping({ onBack }) {
               </tr>
             ))}
             {filteredRooms.length === 0 && !loading && (
-              <tr><td colSpan="6" style={{ textAlign: 'center', padding: '30px', color: 'var(--text-muted)' }}>No rooms match the selected filters.</td></tr>
+              <tr><td colSpan="7" style={{ textAlign: 'center', padding: '30px', color: 'var(--text-muted)' }}>No rooms match the selected filters.</td></tr>
             )}
           </tbody>
         </table>

@@ -21,6 +21,7 @@ import {
   getRoomByIdFirestore,
   updateRoomFirestore
 } from '../repositories/firestore/roomsRepository.js';
+import { getStaffByIdFirestore } from '../repositories/firestore/staffRepository.js';
 
 export class HousekeepingCutoverService {
 
@@ -85,10 +86,20 @@ export class HousekeepingCutoverService {
         }
 
         const roomNumber = String(room.number);
-        const action = userId ? `Assigned to ${userId}` : 'Unassigned';
+
+        // Resolve the assignee's display name so Admin's UI can show who a
+        // room is assigned to — the room doc only ever stored the raw UID
+        // before, leaving assigned_to_name permanently null on read.
+        let assignedToName = null;
+        if (userId) {
+          const staffDoc = await getStaffByIdFirestore(userId);
+          assignedToName = staffDoc?.full_name || null;
+        }
+        const action = userId ? `Assigned to ${assignedToName || userId}` : 'Unassigned';
 
         await updateRoomFirestore(room.docId || roomId, {
           housekeeping_assigned_to: userId ? String(userId) : null,
+          assigned_to_name: assignedToName,
           housekeeping_priority: priority || room.housekeeping_priority || 'Normal',
           updated_at: new Date().toISOString()
         });
