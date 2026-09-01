@@ -34,7 +34,28 @@ function getElapsedMinutes(isoString) {
   return Math.max(0, Math.floor(diff / 60000));
 }
 
+function formatTime(isoString) {
+  if (!isoString) return '—';
+  try {
+    return new Date(isoString).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
+  } catch {
+    return '—';
+  }
+}
+
+// Mirrors backend normalizeUserRole()'s kitchen-role mapping (authController.js) —
+// staff-type users whose raw role is CHEF / KITCHEN_HELPER / PANTRY_BOY / KITCHEN
+// (the actual stored Firestore staff role value is the unified "kitchen").
+// The backend is the actual authority (backend/controllers/foodOrderLifecycleController.js);
+// this only decides which controls this screen renders.
+function isKitchenRole(user) {
+  const isStaffUser = user?.type === 'staff' || user?.user_type === 'staff';
+  const rawRole = String(user?.role || '').toUpperCase().trim();
+  return isStaffUser && ['CHEF', 'KITCHEN_HELPER', 'PANTRY_BOY', 'KITCHEN'].includes(rawRole);
+}
+
 export default function FoodKitchenDisplay({ token, user }) {
+  const isKitchenUser = isKitchenRole(user);
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -121,14 +142,16 @@ export default function FoodKitchenDisplay({ token, user }) {
     try {
       const res = await fetch(`${API_URL}/food/orders/${orderId}/status`, {
         method: 'PUT',
-        headers: getApiHeaders(token),
+        headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ next_status: nextStatus })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `Failed to transition to ${nextStatus}`);
 
-      // Optimistic update reconciled by socket
-      setOrders(prev => prev.map(o => o.order_id === orderId ? { ...o, order_status: nextStatus } : o));
+      // Re-sync from the server rather than patching only order_status locally —
+      // the transition also stamps a kitchen_*_at timestamp server-side that the
+      // monitoring milestones need.
+      await fetchActiveQueue();
     } catch (err) {
       alert(`Transition Error: ${err.message}`);
       // Re-sync to ensure no corrupted UI state
@@ -139,7 +162,11 @@ export default function FoodKitchenDisplay({ token, user }) {
   };
 
   // ── 4. Keyboard Shortcuts Workflow ──────────────────────────────────────────
+  // Reception/Admin get no listener at all — not just hidden buttons, no write
+  // path reachable from this screen for non-kitchen roles.
   useEffect(() => {
+    if (!isKitchenUser) return;
+
     const handleKeyDown = (e) => {
       if (!selectedOrderId || ['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
       const targetOrder = orders.find(o => o.order_id === selectedOrderId);
@@ -156,7 +183,7 @@ export default function FoodKitchenDisplay({ token, user }) {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedOrderId, orders]);
+  }, [isKitchenUser, selectedOrderId, orders]);
 
   // Filter columns
   const receivedOrders = orders.filter(o => ['PLACED', 'RECEIVED'].includes(o.order_status));
@@ -205,14 +232,21 @@ export default function FoodKitchenDisplay({ token, user }) {
                 {connected ? <Wifi size={13} /> : <WifiOff size={13} />}
                 {connected ? 'Real-time Connected' : 'Connecting / Polling'}
               </span>
+              {!isKitchenUser && (
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#a78bfa', fontWeight: '700', background: 'rgba(167,139,250,0.12)', border: '1px solid rgba(167,139,250,0.3)', padding: '2px 8px', borderRadius: '6px' }}>
+                  Monitoring View — kitchen controls restricted
+                </span>
+              )}
             </div>
           </div>
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <div style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.4)', padding: '6px 12px', background: 'rgba(255,255,255,0.03)', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.06)' }}>
-            Keys: <strong style={{ color: '#38bdf8' }}>1: Receive</strong> | <strong style={{ color: '#fbbf24' }}>2: Prepare</strong> | <strong style={{ color: '#34d399' }}>3: Ready</strong>
-          </div>
+          {isKitchenUser && (
+            <div style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.4)', padding: '6px 12px', background: 'rgba(255,255,255,0.03)', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.06)' }}>
+              Keys: <strong style={{ color: '#38bdf8' }}>1: Receive</strong> | <strong style={{ color: '#fbbf24' }}>2: Prepare</strong> | <strong style={{ color: '#34d399' }}>3: Ready</strong>
+            </div>
+          )}
 
           <button
             onClick={fetchActiveQueue}
@@ -272,6 +306,7 @@ export default function FoodKitchenDisplay({ token, user }) {
           onTransition={handleTransition}
           updatingId={updatingId}
           actionType="START_PREPARING"
+          isKitchenUser={isKitchenUser}
         />
 
         {/* COLUMN 2: PREPARING */}
@@ -284,6 +319,7 @@ export default function FoodKitchenDisplay({ token, user }) {
           onTransition={handleTransition}
           updatingId={updatingId}
           actionType="MARK_READY"
+          isKitchenUser={isKitchenUser}
         />
 
         {/* COLUMN 3: READY */}
@@ -296,13 +332,14 @@ export default function FoodKitchenDisplay({ token, user }) {
           onTransition={handleTransition}
           updatingId={updatingId}
           actionType="DISPATCH"
+          isKitchenUser={isKitchenUser}
         />
       </div>
     </div>
   );
 }
 
-function KDSColumn({ title, color, orders, selectedOrderId, onSelectOrder, onTransition, updatingId, actionType }) {
+function KDSColumn({ title, color, orders, selectedOrderId, onSelectOrder, onTransition, updatingId, actionType, isKitchenUser }) {
   return (
     <div style={{
       background: 'rgba(15, 23, 42, 0.6)',
@@ -352,6 +389,7 @@ function KDSColumn({ title, color, orders, selectedOrderId, onSelectOrder, onTra
               onTransition={onTransition}
               isUpdating={updatingId === order.order_id}
               actionType={actionType}
+              isKitchenUser={isKitchenUser}
             />
           ))
         )}
@@ -360,7 +398,7 @@ function KDSColumn({ title, color, orders, selectedOrderId, onSelectOrder, onTra
   );
 }
 
-function KDSCard({ order, isSelected, onSelect, onTransition, isUpdating, actionType }) {
+function KDSCard({ order, isSelected, onSelect, onTransition, isUpdating, actionType, isKitchenUser }) {
   const elapsedMin = getElapsedMinutes(order.created_at);
 
   // Urgency colors
@@ -470,7 +508,25 @@ function KDSCard({ order, isSelected, onSelect, onTransition, isUpdating, action
         <span>Items: {order.items?.length || 0}</span>
       </div>
 
-      {/* Action Buttons */}
+      {/* Action Buttons — Kitchen/Chef only. Reception/Admin get a monitoring
+          summary instead; the write path lives only behind isKitchenUser. */}
+      {!isKitchenUser ? (
+        <div style={{ paddingTop: '10px', borderTop: '1px solid rgba(255,255,255,0.06)', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          {order.destination_type === 'ROOM' && order.guest_name && (
+            <div style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.5)' }}>
+              Guest: <strong style={{ color: '#fff' }}>{order.guest_name}</strong>
+            </div>
+          )}
+          <div style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.5)' }}>
+            Created: <strong style={{ color: '#fff' }}>{formatTime(order.created_at)}</strong>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', marginTop: '2px' }}>
+            <KitchenMilestone label="Kitchen Received" done={!!order.kitchen_received_at} />
+            <KitchenMilestone label="Preparing" done={!!order.kitchen_preparing_at} />
+            <KitchenMilestone label="Ready" done={!!order.kitchen_ready_at} />
+          </div>
+        </div>
+      ) : (
       <div style={{ paddingTop: '6px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
         {actionType === 'START_PREPARING' && (
           <div style={{ display: 'flex', gap: '6px' }}>
@@ -565,6 +621,18 @@ function KDSCard({ order, isSelected, onSelect, onTransition, isUpdating, action
           </button>
         )}
       </div>
+      )}
+    </div>
+  );
+}
+
+function KitchenMilestone({ label, done }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '0.75rem' }}>
+      <span style={{ color: 'rgba(255,255,255,0.55)' }}>{label}</span>
+      <span style={{ display: 'inline-flex', alignItems: 'center', color: done ? '#34d399' : 'rgba(255,255,255,0.3)', fontWeight: '800' }}>
+        {done ? <Check size={13} /> : '—'}
+      </span>
     </div>
   );
 }

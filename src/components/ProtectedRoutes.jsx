@@ -55,12 +55,12 @@ function redirectToDashboard(role, navigate) {
       break;
     case 'CHEF':
     case 'KITCHEN_HELPER':
+    case 'PANTRY_BOY':
+    case 'KITCHEN':
       navigate('/kitchen/dashboard');
       break;
-    case 'PANTRY_BOY':
-      navigate('/pantry/dashboard');
-      break;
     case 'CLEANER':
+    case 'HOUSEKEEPING':
       navigate('/housekeeping/dashboard');
       break;
     default:

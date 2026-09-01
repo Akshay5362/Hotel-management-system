@@ -59,10 +59,6 @@ export function ReceptionDashboard() {
   return <BaseDashboard title="Front Office & Reception" icon="🛎️" color="#38bdf8" />;
 }
 
-export function KitchenDashboard() {
-  return <BaseDashboard title="Kitchen Management" icon="🍳" color="#fbbf24" />;
-}
-
 export function PantryDashboard() {
   return <BaseDashboard title="Pantry Operations" icon="☕" color="#f472b6" />;
 }

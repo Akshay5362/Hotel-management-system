@@ -19,7 +19,8 @@ import SettingsModal from './components/SettingsModal';
 import { AdminAuthProvider, AdminAuthContext } from './contexts/AdminAuthContext';
 import { GuestAuthProvider, GuestAuthContext } from './contexts/GuestAuthContext';
 import { AdminProtectedRoute, GuestProtectedRoute, RoleProtectedRoute } from './components/ProtectedRoutes';
-import { ReceptionDashboard, KitchenDashboard, PantryDashboard, HousekeepingDashboard } from './components/StaffDashboards';
+import { ReceptionDashboard, PantryDashboard, HousekeepingDashboard } from './components/StaffDashboards';
+import KitchenDashboard from './components/KitchenDashboard';
 import ReceptionPortal from './components/ReceptionPortal';
 import Sidebar from './components/Sidebar';
 import RoomInspectorDrawer from './components/RoomInspectorDrawer';
@@ -241,10 +242,9 @@ function AppContent() {
           break;
         case 'CHEF':
         case 'KITCHEN_HELPER':
-          navigate('/kitchen/dashboard');
-          break;
         case 'PANTRY_BOY':
-          navigate('/pantry/dashboard');
+        case 'KITCHEN':
+          navigate('/kitchen/dashboard');
           break;
         case 'CLEANER':
           navigate('/housekeeping/dashboard');
@@ -1151,10 +1151,9 @@ function AppContent() {
           break;
         case 'CHEF':
         case 'KITCHEN_HELPER':
-          navigate('/kitchen/dashboard');
-          break;
         case 'PANTRY_BOY':
-          navigate('/pantry/dashboard');
+        case 'KITCHEN':
+          navigate('/kitchen/dashboard');
           break;
         case 'CLEANER':
           navigate('/housekeeping/dashboard');
@@ -1508,7 +1507,7 @@ function AppContent() {
     );
   } else if (currentPath === '/kitchen/dashboard') {
     pageContent = (
-      <RoleProtectedRoute allowedRoles={['CHEF']} navigate={navigate}>
+      <RoleProtectedRoute allowedRoles={['CHEF', 'KITCHEN_HELPER', 'PANTRY_BOY', 'KITCHEN']} navigate={navigate}>
         <KitchenDashboard />
       </RoleProtectedRoute>
     );

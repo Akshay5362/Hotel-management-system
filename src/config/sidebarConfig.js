@@ -43,6 +43,11 @@ export const sidebarConfig = {
     { label: 'Order History',  icon: '📜', tab: 'kitchen_history'     },
     { label: 'Settings',       icon: '⚙️', action: 'settings'         },
   ],
+  KITCHEN: [
+    { label: 'Dashboard',      icon: '📊', path: '/kitchen/dashboard' },
+    { label: 'Kitchen Display', icon: '🍳', tab: 'kitchen'            },
+    { label: 'Settings',       icon: '⚙️', action: 'settings'         },
+  ],
   PANTRY_BOY: [
     { label: 'Dashboard',       icon: '📊', path: '/pantry/dashboard' },
     { label: 'Pantry Orders',   icon: '☕', tab: 'pantry'             },
@@ -60,3 +65,4 @@ export const sidebarConfig = {
 
 // Lowercase aliases
 sidebarConfig.admin = sidebarConfig.ADMIN;
+sidebarConfig.kitchen = sidebarConfig.KITCHEN;

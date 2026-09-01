@@ -38,6 +38,7 @@ import {
 } from '../repositories/firestore/systemSettingsRepository.js';
 import { createAuditLogFirestore } from '../repositories/firestore/auditLogsRepository.js';
 import { RepositoryError } from '../repositories/firestore/firestoreUtils.js';
+import { normalizeUserRole } from './authController.js';
 
 // ── State Machine Mapping ─────────────────────────────────────────────────────
 export const VALID_TRANSITIONS = {
@@ -157,63 +158,101 @@ export async function updateFoodOrderStatus(req, res) {
       });
     }
 
-    // Role-based security check for kitchen
-    const userRole = String(req.user.role || req.user.type || '').toLowerCase();
-    const isKitchenUser = userRole === 'kitchen' || userRole === 'chef';
+    // ── Food-specific authorization: kitchen status transitions are a
+    // KITCHEN-ONLY operational action. Reception/Admin may view the KDS
+    // (see GET /orders/kds) but must never be able to drive it.
+    //
+    // This check is deliberately independent of the global ENABLE_STRICT_RBAC
+    // flag and of the route-level requireRole(...) list — it re-derives the
+    // caller's normalized role itself and enforces the restriction here,
+    // so this endpoint stays kitchen-only regardless of how that flag or
+    // the route's allowed-role list are configured elsewhere in HPMS.
+    const normalizedRole = normalizeUserRole(req.user);
+    const isKitchenUser = normalizedRole === 'kitchen';
 
-    if (isKitchenUser) {
-      const incomingKeys = Object.keys(req.body);
-      const invalidKeys = incomingKeys.filter(k => !KITCHEN_ALLOWED_FIELDS.has(k) && k !== 'next_status');
-      if (invalidKeys.length > 0) {
-        return res.status(403).json({
-          error: `Kitchen users are strictly forbidden from modifying fields: ${invalidKeys.join(', ')}`,
-          code: 'FIELD_FORBIDDEN'
-        });
-      }
-    }
-
-    const orderDoc = await getFoodOrderByIdFirestore(id);
-    if (!orderDoc) {
-      return res.status(404).json({ error: `Food order "${id}" not found`, code: 'ORDER_NOT_FOUND' });
-    }
-
-    const currentStatus = orderDoc.order_status;
-    const allowedNext = VALID_TRANSITIONS[currentStatus] || [];
-
-    if (!allowedNext.includes(next_status)) {
-      return res.status(409).json({
-        error: `Invalid transition from "${currentStatus}" to "${next_status}". Allowed: [${allowedNext.join(', ')}]`,
-        code: 'INVALID_TRANSITION'
+    if (!isKitchenUser) {
+      return res.status(403).json({
+        error: 'Forbidden: Only Kitchen staff may change order status. Reception/Admin have monitoring-only access to the Kitchen Display.',
+        code: 'KITCHEN_ONLY_ACTION'
       });
     }
 
+    // Kitchen users are further restricted to only the fields the kitchen
+    // workflow legitimately needs to touch (unchanged from before).
+    const incomingKeys = Object.keys(req.body);
+    const invalidKeys = incomingKeys.filter(k => !KITCHEN_ALLOWED_FIELDS.has(k) && k !== 'next_status');
+    if (invalidKeys.length > 0) {
+      return res.status(403).json({
+        error: `Kitchen users are strictly forbidden from modifying fields: ${invalidKeys.join(', ')}`,
+        code: 'FIELD_FORBIDDEN'
+      });
+    }
+
+    // Atomic read-validate-write — a plain read-then-write here would let two
+    // near-simultaneous requests (e.g. a double-tap on a kitchen tablet) both
+    // read the same pre-transition status, both pass validation, and then
+    // silently clobber each other's status_history entry on write. Wrapping
+    // in a transaction mirrors the pattern already used by modifyFoodOrder /
+    // processPayNow / cancelFoodOrder elsewhere in this controller.
+    const orderRef = db.collection('food_orders').doc(String(id).startsWith('forder_') ? String(id) : `forder_${id}`);
     const now = new Date().toISOString();
-    const newHistoryEntry = {
-      status:  next_status,
-      by_uid:  String(req.user.uid || req.user.id),
-      by_name: req.user.fullName || req.user.username || 'Staff',
-      ts:      now,
-      note:    notes || `Status transitioned to ${next_status}`
-    };
+    let resultPayload = null;
 
-    const updatePayload = {
-      order_status:   next_status,
-      status_history: [...(orderDoc.status_history || []), newHistoryEntry],
-      updated_at:     now
-    };
+    await db.runTransaction(async (txn) => {
+      const orderSnap = await txn.get(orderRef);
+      if (!orderSnap.exists) {
+        throw new RepositoryError(`Food order "${id}" not found`, 'ORDER_NOT_FOUND', 404);
+      }
+      const orderDoc = orderSnap.data();
 
-    if (next_status === 'RECEIVED') updatePayload.kitchen_received_at = now;
-    if (next_status === 'PREPARING') updatePayload.kitchen_preparing_at = now;
-    if (next_status === 'READY') updatePayload.kitchen_ready_at = now;
-    if (notes) updatePayload.kitchen_notes = notes;
+      const currentStatus = orderDoc.order_status;
+      const allowedNext = VALID_TRANSITIONS[currentStatus] || [];
 
-    await updateFoodOrderFirestore(id, updatePayload);
+      if (!allowedNext.includes(next_status)) {
+        throw new RepositoryError(
+          `Invalid transition from "${currentStatus}" to "${next_status}". Allowed: [${allowedNext.join(', ')}]`,
+          'INVALID_TRANSITION',
+          409
+        );
+      }
+
+      const newHistoryEntry = {
+        status:  next_status,
+        by_uid:  String(req.user.uid || req.user.id),
+        by_name: req.user.fullName || req.user.username || 'Staff',
+        ts:      now,
+        note:    notes || `Status transitioned to ${next_status}`
+      };
+
+      const updatePayload = {
+        order_status:   next_status,
+        status_history: [...(orderDoc.status_history || []), newHistoryEntry],
+        updated_at:     now
+      };
+
+      if (next_status === 'RECEIVED') updatePayload.kitchen_received_at = now;
+      if (next_status === 'PREPARING') updatePayload.kitchen_preparing_at = now;
+      if (next_status === 'READY') updatePayload.kitchen_ready_at = now;
+      if (notes) updatePayload.kitchen_notes = notes;
+
+      txn.update(orderRef, updatePayload);
+
+      resultPayload = {
+        order_id:         orderDoc.order_id,
+        order_number:     orderDoc.order_number,
+        prev_status:      currentStatus,
+        destination_type: orderDoc.destination_type,
+        room_number:      orderDoc.room_number,
+        table_name:       orderDoc.table_name,
+        waiter_name:      orderDoc.waiter_name
+      };
+    });
 
     // Socket.IO Notifications
     req.app.get('io')?.emit('food:status_changed', {
-      order_id:        orderDoc.order_id,
-      order_number:    orderDoc.order_number,
-      prev_status:     currentStatus,
+      order_id:        resultPayload.order_id,
+      order_number:    resultPayload.order_number,
+      prev_status:     resultPayload.prev_status,
       new_status:      next_status,
       changed_by_name: req.user.fullName || req.user.username || 'Staff',
       ts:              now
@@ -221,18 +260,18 @@ export async function updateFoodOrderStatus(req, res) {
 
     if (next_status === 'READY') {
       req.app.get('io')?.emit('food:order_ready', {
-        order_id:         orderDoc.order_id,
-        order_number:     orderDoc.order_number,
-        destination_type: orderDoc.destination_type,
-        room_number:      orderDoc.room_number,
-        table_name:       orderDoc.table_name,
-        waiter_name:      orderDoc.waiter_name
+        order_id:         resultPayload.order_id,
+        order_number:     resultPayload.order_number,
+        destination_type: resultPayload.destination_type,
+        room_number:      resultPayload.room_number,
+        table_name:       resultPayload.table_name,
+        waiter_name:      resultPayload.waiter_name
       });
     }
 
     return res.json({
       success: true,
-      order_id: orderDoc.order_id,
+      order_id: resultPayload.order_id,
       order_status: next_status,
       updated_at: now
     });
