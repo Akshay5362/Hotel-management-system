@@ -14,17 +14,34 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
-dotenv.config({ path: path.join(__dirname, '.env') });
+
+// Same explicit HPMS_ENV selection as backend/config/firebaseAdmin.js — run
+// with HPMS_ENV=development to target sky5-development instead of hpms-sky5.
+// Unset defaults to production, matching this script's prior behavior.
+const HPMS_ENV = process.env.HPMS_ENV || 'production';
+const envFileName = HPMS_ENV === 'development' ? '.env.development' : '.env';
+dotenv.config({ path: path.join(__dirname, envFileName) });
 
 import { initializeApp, cert, getApps, getApp } from 'firebase-admin/app';
+import { isProductionProject } from './config/productionSafetyGuard.js';
 
 const projectId   = process.env.FIREBASE_PROJECT_ID;
 const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
 const rawKey      = process.env.FIREBASE_PRIVATE_KEY;
 const privateKey  = rawKey ? rawKey.replace(/\\n/g, '\n') : undefined;
 
-if (!projectId || !clientEmail || !privateKey) {
-  console.error('[FATAL] Missing Firebase Admin credentials in .env');
+// This script can CREATE a Web App registration — extra reason this guard
+// must run before any credential is used, not just for read-only scripts.
+if (HPMS_ENV === 'development' && isProductionProject()) {
+  console.error(
+    `[DEVELOPMENT SAFETY ERROR] This script was run with HPMS_ENV=development but resolved FIREBASE_PROJECT_ID="${projectId}" (production). ` +
+    `This script can CREATE resources — refusing to run against production. Fix ${envFileName} and retry.`
+  );
+  process.exit(1);
+}
+
+if (!projectId || !clientEmail || !privateKey || String(clientEmail).startsWith('REPLACE_WITH_') || String(rawKey).startsWith('REPLACE_WITH_')) {
+  console.error('[FATAL] Missing or placeholder Firebase Admin credentials — nothing was contacted.');
   process.exit(1);
 }
 

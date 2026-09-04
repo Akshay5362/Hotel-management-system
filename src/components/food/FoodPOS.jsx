@@ -14,9 +14,10 @@
  */
 
 import React, { useState } from 'react';
-import { UtensilsCrossed, BookOpen, ShoppingCart, ClipboardList, Layers, Gift, ChefHat, BarChart3, Users } from 'lucide-react';
+import { UtensilsCrossed, BookOpen, ShoppingCart, ClipboardEdit, ClipboardList, Layers, Gift, ChefHat, BarChart3, Users } from 'lucide-react';
 import FoodMenuManager from './FoodMenuManager';
 import FoodNewOrder from './FoodNewOrder';
+import FoodKOTModification from './FoodKOTModification';
 import FoodKitchenDisplay from './FoodKitchenDisplay';
 import FoodTableManager from './FoodTableManager';
 import FoodWaiterManager from './FoodWaiterManager';
@@ -25,6 +26,11 @@ import FoodOrderHistory from './FoodOrderHistory';
 import FoodReports from './FoodReports';
 
 // ── Tab configuration ─────────────────────────────────────────────────────────
+// `roles` gates which normalized Food role sees this tab. FoodPOS is only ever
+// reached via a RoleProtectedRoute that already limits callers to ADMIN or
+// RECEPTIONIST (see App.jsx's /admin/dashboard and ReceptionPortal.jsx's Food
+// tab) — Chef has its own dedicated KitchenDashboard.jsx and never renders
+// this component, so no 'kitchen' entry is needed here.
 const TABS = [
   {
     key:   'menu',
@@ -32,7 +38,8 @@ const TABS = [
     icon:  BookOpen,
     phase: 1,
     ready: true,
-    desc:  'Categories, items, and tax configuration'
+    desc:  'Categories, items, and tax configuration',
+    roles: ['admin']
   },
   {
     key:   'orders',
@@ -40,7 +47,17 @@ const TABS = [
     icon:  ShoppingCart,
     phase: 2,
     ready: true,
-    desc:  'Create and bill restaurant orders'
+    desc:  'Create and bill restaurant orders',
+    roles: ['admin', 'receptionist']
+  },
+  {
+    key:   'kot-modification',
+    label: 'KOT Modification',
+    icon:  ClipboardEdit,
+    phase: 2,
+    ready: true,
+    desc:  'Change items or quantities on an existing KOT',
+    roles: ['admin', 'receptionist']
   },
   {
     key:   'kds',
@@ -48,7 +65,8 @@ const TABS = [
     icon:  ChefHat,
     phase: 2,
     ready: true,
-    desc:  'Live restaurant kitchen order line'
+    desc:  'Live restaurant kitchen order line',
+    roles: ['admin', 'receptionist']
   },
   {
     key:   'tables',
@@ -56,7 +74,8 @@ const TABS = [
     icon:  Layers,
     phase: 2,
     ready: true,
-    desc:  'Manage dining tables'
+    desc:  'Manage dining tables',
+    roles: ['admin']
   },
   {
     key:   'waiters',
@@ -64,15 +83,8 @@ const TABS = [
     icon:  Users,
     phase: 2,
     ready: true,
-    desc:  'Manage waiters for order assignment'
-  },
-  {
-    key:   'complimentary',
-    label: 'Complimentary Approvals',
-    icon:  Gift,
-    phase: 2,
-    ready: true,
-    desc:  'Authorize complimentary waivers'
+    desc:  'Manage waiters for order assignment',
+    roles: ['admin']
   },
   {
     key:   'history',
@@ -80,7 +92,8 @@ const TABS = [
     icon:  ClipboardList,
     phase: 2,
     ready: true,
-    desc:  'Browse past orders and billing records'
+    desc:  'Browse past orders and billing records',
+    roles: ['admin', 'receptionist']
   },
   {
     key:   'reports',
@@ -88,9 +101,18 @@ const TABS = [
     icon:  BarChart3,
     phase: 2,
     ready: true,
-    desc:  'Sales, tax, and operational breakdowns'
+    desc:  'Sales, tax, and operational breakdowns',
+    roles: ['admin']
   }
 ];
+
+// FoodPOS is only reachable by ADMIN or RECEPTIONIST (enforced by the
+// RoleProtectedRoute wrapping every entry point) — this only decides which
+// tabs render for the two, it is not itself an authorization boundary.
+function getFoodRole(user) {
+  const rawRole = String(user?.role || '').toUpperCase().trim();
+  return rawRole === 'RECEPTIONIST' ? 'receptionist' : 'admin';
+}
 
 function ComingSoonBadge() {
   return (
@@ -111,7 +133,10 @@ function ComingSoonBadge() {
 }
 
 export default function FoodPOS({ token, user }) {
-  const [activeTab, setActiveTab] = useState('menu');
+  const foodRole = getFoodRole(user);
+  const visibleTabs = TABS.filter(tab => tab.roles.includes(foodRole));
+  const [activeTab, setActiveTab] = useState(() => foodRole === 'receptionist' ? 'orders' : 'menu');
+  const [hoveredTab, setHoveredTab] = useState(null);
 
   return (
     <div style={{
@@ -179,40 +204,52 @@ export default function FoodPOS({ token, user }) {
 
       {/* Tab Navigation */}
       <div style={{
-        display:      'flex',
-        gap:          '4px',
-        marginBottom: '20px',
-        borderBottom: '1px solid rgba(255,255,255,0.06)',
+        display:       'flex',
+        alignItems:    'flex-end',
+        gap:           '2px',
+        marginBottom:  '20px',
+        borderBottom:  '1px solid rgba(255,255,255,0.06)',
         paddingBottom: '0',
-        overflowX:    'auto'
+        overflowX:     'auto',
+        scrollBehavior: 'smooth'
       }}>
-        {TABS.map(tab => {
-          const Icon     = tab.icon;
-          const isActive = activeTab === tab.key;
+        {visibleTabs.map(tab => {
+          const Icon      = tab.icon;
+          const isActive  = activeTab === tab.key;
+          const isHovered = hoveredTab === tab.key;
           return (
             <button
               key={tab.key}
               onClick={() => { if (tab.ready) setActiveTab(tab.key); }}
+              onMouseEnter={() => setHoveredTab(tab.key)}
+              onMouseLeave={() => setHoveredTab(null)}
               title={tab.ready ? tab.desc : `${tab.desc} — available in Phase ${tab.phase}`}
               style={{
                 display:      'flex',
                 alignItems:   'center',
-                gap:          '6px',
-                padding:      '10px 18px',
+                gap:          '7px',
+                padding:      '10px 16px',
                 border:       'none',
+                borderRadius: '8px 8px 0 0',
                 borderBottom: isActive ? '2px solid #38bdf8' : '2px solid transparent',
-                background:   'transparent',
+                background:   isActive
+                  ? 'rgba(56,189,248,0.08)'
+                  : isHovered
+                    ? 'rgba(255,255,255,0.04)'
+                    : 'transparent',
                 cursor:       tab.ready ? 'pointer' : 'not-allowed',
                 color:        isActive
                   ? '#38bdf8'
                   : tab.ready
-                    ? 'rgba(255,255,255,0.55)'
+                    ? (isHovered ? 'rgba(255,255,255,0.8)' : 'rgba(255,255,255,0.55)')
                     : 'rgba(255,255,255,0.25)',
-                fontSize:     '0.84rem',
-                fontWeight:   isActive ? '700' : '500',
-                transition:   'all 0.15s ease',
-                fontFamily:   'var(--font-body, Inter, sans-serif)',
-                flexShrink:   0
+                fontSize:      '0.84rem',
+                fontWeight:    isActive ? '700' : '500',
+                letterSpacing: '0.1px',
+                whiteSpace:    'nowrap',
+                transition:    'background 180ms ease, color 180ms ease, border-color 180ms ease',
+                fontFamily:    'var(--font-body, Inter, sans-serif)',
+                flexShrink:    0
               }}
             >
               <Icon size={15} />
@@ -231,6 +268,10 @@ export default function FoodPOS({ token, user }) {
 
         {activeTab === 'orders' && (
           <FoodNewOrder token={token} user={user} />
+        )}
+
+        {activeTab === 'kot-modification' && (
+          <FoodKOTModification token={token} user={user} />
         )}
 
         {activeTab === 'kds' && (

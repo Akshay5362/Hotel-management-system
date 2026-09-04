@@ -34,7 +34,7 @@
 
 import pool from '../db.js';
 import { db } from '../config/firebaseAdmin.js';
-import { isFirebaseOnlyBusinessDateEnabled } from '../config/featureFlags.js';
+import { isFirebaseOnlyBusinessDateEnabled, isMysqlCutoverFallbacksDisabled } from '../config/featureFlags.js';
 import {
   getSystemDateFirestore,
   getSystemDateDetailsFirestore,
@@ -193,6 +193,20 @@ export const BusinessDateService = {
           throw err;
         }
         console.warn('[BusinessDateService] Firestore error reading business date, checking fallback:', err.message);
+      }
+
+      // DEV-ONLY self-init: Firestore has no system_date document yet (fresh
+      // project) and MySQL cutover fallbacks are disabled in this environment
+      // (see db.js's MYSQL_DECOMMISSIONED_GUARD) — falling through to the
+      // MySQL query below would always throw. Return the current OS date
+      // instead, using the same DEV-ONLY OS-date convention resetToSystemDate()
+      // already uses below. Read-only: the Firestore document is NOT created
+      // here. Production is unaffected — NODE_ENV is only 'development' when
+      // launched via HPMS_ENV=development (backend/.env.development).
+      if (process.env.NODE_ENV === 'development' && isMysqlCutoverFallbacksDisabled()) {
+        const devDate = _osDateNow();
+        console.warn(`[BusinessDateService] DEV: Firestore settings/system_date not found and MySQL fallback is disabled — using OS date ${devDate} (not persisted).`);
+        return devDate;
       }
     }
 

@@ -21,7 +21,7 @@ import {
   ChevronDown, ChevronUp, Save, X, AlertTriangle,
   CheckCircle, Layers, Percent, UtensilsCrossed
 } from 'lucide-react';
-import { API_URL, getApiHeaders } from '../../config/apiConfig';
+import { API_URL, getApiHeaders, authenticatedFetch, AuthenticationError } from '../../config/apiConfig';
 import FoodCategoryBar from './FoodCategoryBar';
 import FoodItemCard from './FoodItemCard';
 
@@ -474,14 +474,12 @@ function TaxConfigPanel({ token, showToast }) {
   const [form, setForm]       = useState({ gst_5: null, gst_12: null, gst_18: null, notes: '' });
   const [saving, setSaving]   = useState(false);
 
-  const getHeaders = () => getApiHeaders(
-    token || localStorage.getItem('adminToken') || localStorage.getItem('staffToken'),
-    { 'Content-Type': 'application/json' }
-  );
+  const getCurrentToken = () => token || localStorage.getItem('adminToken') || localStorage.getItem('staffToken');
+  const getHeaders = () => getApiHeaders(getCurrentToken(), { 'Content-Type': 'application/json' });
 
   const fetchConfig = useCallback(async () => {
     try {
-      const res = await fetch(`${FOOD_BASE}/tax-config`, { headers: getHeaders() });
+      const res = await authenticatedFetch(`${FOOD_BASE}/tax-config`, {}, getCurrentToken());
       if (res.ok) {
         const data = await res.json();
         setConfig(data.tax_config);
@@ -578,12 +576,14 @@ function TaxConfigPanel({ token, showToast }) {
 
 export default function FoodMenuManager({ token, user }) {
 
+  const getCurrentToken = useCallback(
+    () => token || localStorage.getItem('adminToken') || localStorage.getItem('staffToken'),
+    [token]
+  );
+
   const getHeaders = useCallback((extraHeaders = {}) =>
-    getApiHeaders(
-      token || localStorage.getItem('adminToken') || localStorage.getItem('staffToken'),
-      { 'Content-Type': 'application/json', ...extraHeaders }
-    ),
-  [token]);
+    getApiHeaders(getCurrentToken(), { 'Content-Type': 'application/json', ...extraHeaders }),
+  [getCurrentToken]);
 
   // ── State ─────────────────────────────────────────────────────────────────
   const [activeView, setActiveView] = useState('items'); // 'items' | 'categories' | 'tax'
@@ -609,7 +609,7 @@ export default function FoodMenuManager({ token, user }) {
   const fetchCategories = useCallback(async () => {
     setLoading(l => ({ ...l, categories: true }));
     try {
-      const res = await fetch(`${FOOD_BASE}/categories`, { headers: getHeaders() });
+      const res = await authenticatedFetch(`${FOOD_BASE}/categories`, {}, getCurrentToken());
       if (res.ok) {
         const data = await res.json();
         setCategories(data.categories || []);
@@ -618,11 +618,11 @@ export default function FoodMenuManager({ token, user }) {
         showToast(err.error || 'Failed to load categories', 'error');
       }
     } catch (e) {
-      showToast('Network error loading categories', 'error');
+      showToast(e instanceof AuthenticationError ? e.message : 'Network error loading categories', 'error');
     } finally {
       setLoading(l => ({ ...l, categories: false }));
     }
-  }, [getHeaders, showToast]);
+  }, [getCurrentToken, showToast]);
 
   // ── Fetch Items ────────────────────────────────────────────────────────────
   const fetchItems = useCallback(async () => {
@@ -631,7 +631,7 @@ export default function FoodMenuManager({ token, user }) {
       const params = new URLSearchParams();
       if (selCategory)   params.set('category_id', selCategory);
       if (!showInactive) params.set('active_only', 'true');
-      const res = await fetch(`${FOOD_BASE}/menu-items?${params}`, { headers: getHeaders() });
+      const res = await authenticatedFetch(`${FOOD_BASE}/menu-items?${params}`, {}, getCurrentToken());
       if (res.ok) {
         const data = await res.json();
         setItems(data.items || []);
@@ -640,17 +640,17 @@ export default function FoodMenuManager({ token, user }) {
         showToast(err.error || 'Failed to load menu items', 'error');
       }
     } catch (e) {
-      showToast('Network error loading menu items', 'error');
+      showToast(e instanceof AuthenticationError ? e.message : 'Network error loading menu items', 'error');
     } finally {
       setLoading(l => ({ ...l, items: false }));
     }
-  }, [getHeaders, showToast, selCategory, showInactive]);
+  }, [getCurrentToken, showToast, selCategory, showInactive]);
 
   // ── Search Items ───────────────────────────────────────────────────────────
   const fetchSearchResults = useCallback(async (q) => {
     setLoading(l => ({ ...l, items: true }));
     try {
-      const res = await fetch(`${FOOD_BASE}/menu-items/search?q=${encodeURIComponent(q)}&active_only=${!showInactive}`, { headers: getHeaders() });
+      const res = await authenticatedFetch(`${FOOD_BASE}/menu-items/search?q=${encodeURIComponent(q)}&active_only=${!showInactive}`, {}, getCurrentToken());
       if (res.ok) {
         const data = await res.json();
         setItems(data.items || []);
@@ -660,7 +660,7 @@ export default function FoodMenuManager({ token, user }) {
     } finally {
       setLoading(l => ({ ...l, items: false }));
     }
-  }, [getHeaders, showInactive]);
+  }, [getCurrentToken, showInactive]);
 
   // ── Effects ───────────────────────────────────────────────────────────────
   useEffect(() => { fetchCategories(); }, [fetchCategories]);

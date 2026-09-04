@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { API_URL, getApiHeaders } from '../config/apiConfig';
+import { API_URL, getApiHeaders, authenticatedFetch, AuthenticationError } from '../config/apiConfig';
 
 /**
  * ReservationModule.jsx
@@ -75,15 +75,13 @@ export default function ReservationModule({ token, user, onNavigate, showAlert, 
       if (fromDateFilter) url += `fromDate=${fromDateFilter}&`;
       if (toDateFilter) url += `toDate=${toDateFilter}&`;
 
-      const res = await fetch(url, {
-        headers: getApiHeaders(token)
-      });
+      const res = await authenticatedFetch(url, {}, token);
       if (!res.ok) throw new Error('Failed to load reservations');
       const data = await res.json();
       setReservations(data.reservations || []);
     } catch (err) {
       console.error('Fetch reservations error:', err);
-      setError(err.message);
+      setError(err instanceof AuthenticationError ? err.message : 'Failed to load reservations');
     } finally {
       setLoading(false);
     }

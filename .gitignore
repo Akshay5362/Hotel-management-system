@@ -19,6 +19,8 @@ build/
 .env.local
 .env.*.local
 backend/.env
+backend/.env.development
+backend/.env.production
 
 # ========================
 # Logs

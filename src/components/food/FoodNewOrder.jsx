@@ -438,7 +438,7 @@ function computeTotals(basket) {
   };
 }
 
-const VIEW = { ORDER: 'order', REVIEW: 'review', BILLING: 'billing' };
+const VIEW = { ORDER: 'order', REVIEW: 'review', BILLING: 'billing', PAY_LATER_DONE: 'pay_later_done' };
 
 export default function FoodNewOrder({ token, user }) {
   const getHeaders = useCallback((extra = {}) =>
@@ -608,9 +608,10 @@ export default function FoodNewOrder({ token, user }) {
     setView(VIEW.REVIEW);
   }, [validateDestination, basket]);
 
-  const handleProceedToBilling = useCallback(async () => {
+  const placeOrder = useCallback(async (payLater) => {
     setPlaceError('');
     setPlacing(true);
+    let createdOrderId = null;
     try {
       const payload = {
         destination_type: destType,
@@ -639,6 +640,7 @@ export default function FoodNewOrder({ token, user }) {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to initialize order');
+      createdOrderId = data.order_id;
 
       // 2. Transition DRAFT -> PLACED with sequential order number
       const placeRes = await fetch(`${FOOD_BASE}/orders/${data.order_id}/place`, {
@@ -653,9 +655,29 @@ export default function FoodNewOrder({ token, user }) {
       if (!placeRes.ok) throw new Error(placeData.error || 'Failed to place order');
 
       setActiveOrder(placeData.order || data);
-      setView(VIEW.BILLING);
+      // Pay Later: the order is already created and sent to Kitchen (steps above) —
+      // do NOT call any payment endpoint. payment_status stays at its existing
+      // default ('PENDING'), which already means "not yet paid" in this schema.
+      // Pay Now: continue into the existing billing screen, unchanged.
+      setView(payLater ? VIEW.PAY_LATER_DONE : VIEW.BILLING);
     } catch (e) {
       setPlaceError(e.message || 'Network error. Please try again.');
+      // The order was created (DRAFT) but placement failed — clean up the
+      // orphan draft so it doesn't sit forever un-placed and un-cancelled.
+      // Best-effort only: this doesn't change the error already shown above,
+      // and the backend independently refuses to touch the order if it
+      // isn't still DRAFT (e.g. placement actually succeeded server-side
+      // despite this client seeing a failure) — see cancelDraftOrder.
+      if (createdOrderId) {
+        try {
+          await fetch(`${FOOD_BASE}/orders/${createdOrderId}/cancel-draft`, {
+            method: 'POST',
+            headers: getHeaders()
+          });
+        } catch (cleanupErr) {
+          console.warn('[FoodNewOrder] Draft cleanup after failed placement also failed (non-fatal):', cleanupErr.message);
+        }
+      }
     } finally {
       setPlacing(false);
     }
@@ -743,12 +765,54 @@ export default function FoodNewOrder({ token, user }) {
 
         <InlineError msg={placeError} />
 
-        <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', paddingTop: '4px' }}>
-          <button style={btnSecondary} onClick={() => setView(VIEW.ORDER)}>
-            <ArrowLeft size={14} /> Back
-          </button>
-          <button style={btnSuccess} onClick={handleProceedToBilling} disabled={placing}>
-            {placing ? <><Loader size={14} className="animate-spin" /> Placing Order…</> : <><DollarSign size={15} /> Confirm & Proceed to Billing</>}
+        <div style={{ ...glass, padding: '14px 20px' }}>
+          <SectionLabel>Payment</SectionLabel>
+          <p style={{ margin: '0 0 12px', fontSize: '0.8rem', color: 'rgba(255,255,255,0.55)' }}>
+            Collect payment now, or place the order and collect payment later from Order History.
+          </p>
+          <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
+            <button style={btnSecondary} onClick={() => setView(VIEW.ORDER)} disabled={placing}>
+              <ArrowLeft size={14} /> Back
+            </button>
+            <button
+              style={{ ...btnSecondary, borderColor: 'rgba(251,191,36,0.4)', color: '#fbbf24' }}
+              onClick={() => placeOrder(true)}
+              disabled={placing}
+            >
+              {placing ? <><Loader size={14} className="animate-spin" /> Placing Order…</> : 'Pay Later'}
+            </button>
+            <button style={btnSuccess} onClick={() => placeOrder(false)} disabled={placing}>
+              {placing ? <><Loader size={14} className="animate-spin" /> Placing Order…</> : <><DollarSign size={15} /> Pay Now</>}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── VIEW: PAY LATER CONFIRMATION ──────────────────────────────────────────
+  if (view === VIEW.PAY_LATER_DONE && activeOrder) {
+    return (
+      <div style={{ maxWidth: '520px', margin: '60px auto', textAlign: 'center' }}>
+        <div style={{
+          ...glass, padding: '28px 24px',
+          border: '1px solid rgba(251,191,36,0.35)', background: 'rgba(251,191,36,0.06)'
+        }}>
+          <div style={{ fontSize: '2.4rem', marginBottom: '8px' }}>🟠</div>
+          <h2 style={{ margin: '0 0 6px', fontSize: '1.2rem', fontWeight: '900', color: '#fbbf24' }}>
+            PAYMENT PENDING
+          </h2>
+          <div style={{ fontSize: '0.95rem', fontWeight: '700', color: '#f1f5f9', marginBottom: '10px' }}>
+            {activeOrder.order_number || activeOrder.order_id}
+          </div>
+          <p style={{ margin: '0 0 4px', fontSize: '0.85rem', color: 'rgba(255,255,255,0.65)', lineHeight: '1.6' }}>
+            Order placed and sent to Kitchen. Bill can be printed now.
+          </p>
+          <p style={{ margin: '0 0 20px', fontSize: '0.85rem', color: 'rgba(255,255,255,0.65)', lineHeight: '1.6' }}>
+            Payment can be collected later from Order History.
+          </p>
+          <button style={{ ...btnPrimary, padding: '10px 24px' }} onClick={handleReset}>
+            Done — New Order
           </button>
         </div>
       </div>

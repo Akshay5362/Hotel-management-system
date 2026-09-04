@@ -18,6 +18,8 @@ import {
   AlertCircle, Loader, Filter, ArrowUpDown, ChevronDown
 } from 'lucide-react';
 import { API_URL, getApiHeaders } from '../../config/apiConfig';
+import FoodBillView from './FoodBillView';
+import FoodOrderBilling from './FoodOrderBilling';
 
 // ── Enums (must mirror backend/controllers/foodReportsController.js) ──────────
 const ORDER_STATUSES = [
@@ -36,6 +38,7 @@ const PAGE_SIZES = [25, 50, 100];
 
 const EMPTY_FILTERS = {
   order_number:     '',
+  guest_name:       '',
   order_status:     '',
   payment_status:   '',
   destination_type: '',
@@ -90,6 +93,16 @@ const PAYMENT_STATUS_COLORS = {
   REFUNDED:      { bg: 'rgba(248,113,113,0.15)',border: 'rgba(248,113,113,0.35)',color: '#f87171' }
 };
 
+// PENDING is the existing canonical "not yet paid" value — displayed as
+// "PAY LATER / UNPAID" for staff clarity without changing the stored value.
+const PAYMENT_STATUS_LABELS = {
+  PENDING: '🟠 PAY LATER',
+  PAID:    '🟢 PAID'
+};
+function paymentStatusLabel(status) {
+  return PAYMENT_STATUS_LABELS[status] || status;
+}
+
 function Badge({ label, palette }) {
   const p = palette || { bg: 'rgba(255,255,255,0.08)', border: 'rgba(255,255,255,0.2)', color: 'rgba(255,255,255,0.7)' };
   return (
@@ -135,7 +148,7 @@ const labelStyle = {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Order Detail Modal (read-only)
 // ═══════════════════════════════════════════════════════════════════════════════
-function OrderDetailModal({ order, onClose }) {
+function OrderDetailModal({ order, onClose, onPrint, onCollectPayment }) {
   if (!order) return null;
   const items = Array.isArray(order.items) ? order.items : [];
   const history = Array.isArray(order.status_history) ? order.status_history : [];
@@ -177,7 +190,7 @@ function OrderDetailModal({ order, onClose }) {
             </div>
             <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
               <Badge label={order.order_status} palette={ORDER_STATUS_COLORS[order.order_status]} />
-              <Badge label={order.payment_status} palette={PAYMENT_STATUS_COLORS[order.payment_status]} />
+              <Badge label={paymentStatusLabel(order.payment_status)} palette={PAYMENT_STATUS_COLORS[order.payment_status]} />
             </div>
           </div>
           <button
@@ -335,6 +348,36 @@ function OrderDetailModal({ order, onClose }) {
               <div style={{ fontSize: '0.82rem', color: 'rgba(255,255,255,0.7)' }}>{order.remarks}</div>
             </div>
           )}
+
+          {/* Actions — printing is read-only and never touches payment state;
+              Collect Payment is only offered while the order is still PENDING. */}
+          <div style={{
+            display: 'flex', gap: '10px', marginTop: '22px', paddingTop: '16px',
+            borderTop: '1px solid rgba(255,255,255,0.08)'
+          }}>
+            <button
+              onClick={() => onPrint(order)}
+              style={{
+                padding: '9px 16px', background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.15)', borderRadius: '8px',
+                color: '#fff', fontWeight: '700', fontSize: '0.82rem', cursor: 'pointer'
+              }}
+            >
+              🖨️ {order.payment_status === 'PENDING' ? 'Print Bill' : 'Reprint Bill'}
+            </button>
+            {order.payment_status === 'PENDING' && (
+              <button
+                onClick={() => onCollectPayment(order)}
+                style={{
+                  padding: '9px 16px', background: 'linear-gradient(135deg, #10b981, #059669)',
+                  border: 'none', borderRadius: '8px', color: '#fff', fontWeight: '800',
+                  fontSize: '0.82rem', cursor: 'pointer'
+                }}
+              >
+                Collect Payment
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -361,6 +404,8 @@ export default function FoodOrderHistory({ token, user }) {
   const [pageNum, setPageNum]         = useState(1);
 
   const [selectedOrder, setSelectedOrder] = useState(null);
+  const [printOrder, setPrintOrder] = useState(null);
+  const [payOrder, setPayOrder] = useState(null);
 
   const [tables, setTables]       = useState([]);
   const [staffList, setStaffList] = useState([]);
@@ -389,6 +434,7 @@ export default function FoodOrderHistory({ token, user }) {
     try {
       const params = new URLSearchParams();
       if (f.order_number.trim())     params.set('order_number', f.order_number.trim());
+      if (f.guest_name.trim())       params.set('guest_name', f.guest_name.trim());
       if (f.order_status)            params.set('order_status', f.order_status);
       if (f.payment_status)          params.set('payment_status', f.payment_status);
       if (f.destination_type)        params.set('destination_type', f.destination_type);
@@ -527,6 +573,17 @@ export default function FoodOrderHistory({ token, user }) {
               type="text" placeholder="e.g. FO-20260829-000123"
               value={filters.order_number}
               onChange={(e) => updateFilter('order_number', e.target.value)}
+              onKeyDown={handleKeyDownSearch}
+              style={inputStyle}
+            />
+          </div>
+
+          <div>
+            <label style={labelStyle}>Guest Name</label>
+            <input
+              type="text" placeholder="e.g. ANCHAL"
+              value={filters.guest_name}
+              onChange={(e) => updateFilter('guest_name', e.target.value)}
               onKeyDown={handleKeyDownSearch}
               style={inputStyle}
             />
@@ -705,7 +762,8 @@ export default function FoodOrderHistory({ token, user }) {
                   <th style={{ textAlign: 'left', padding: '10px 10px', color: 'rgba(255,255,255,0.5)', fontWeight: '700', fontSize: '0.68rem' }}>WAITER</th>
                   <th style={{ textAlign: 'left', padding: '10px 10px', color: 'rgba(255,255,255,0.5)', fontWeight: '700', fontSize: '0.68rem' }}>STATUS</th>
                   <th style={{ textAlign: 'left', padding: '10px 10px', color: 'rgba(255,255,255,0.5)', fontWeight: '700', fontSize: '0.68rem' }}>PAYMENT</th>
-                  <th style={{ textAlign: 'right', padding: '10px 14px', color: 'rgba(255,255,255,0.5)', fontWeight: '700', fontSize: '0.68rem' }}>TOTAL</th>
+                  <th style={{ textAlign: 'right', padding: '10px 10px', color: 'rgba(255,255,255,0.5)', fontWeight: '700', fontSize: '0.68rem' }}>TOTAL</th>
+                  <th style={{ textAlign: 'right', padding: '10px 14px', color: 'rgba(255,255,255,0.5)', fontWeight: '700', fontSize: '0.68rem' }}>ACTIONS</th>
                 </tr>
               </thead>
               <tbody>
@@ -722,8 +780,34 @@ export default function FoodOrderHistory({ token, user }) {
                     <td style={{ padding: '10px 10px', color: 'rgba(255,255,255,0.75)' }}>{destinationLabel(order)}</td>
                     <td style={{ padding: '10px 10px', color: 'rgba(255,255,255,0.6)' }}>{order.waiter_name || '—'}</td>
                     <td style={{ padding: '10px 10px' }}><Badge label={order.order_status} palette={ORDER_STATUS_COLORS[order.order_status]} /></td>
-                    <td style={{ padding: '10px 10px' }}><Badge label={order.payment_status} palette={PAYMENT_STATUS_COLORS[order.payment_status]} /></td>
-                    <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: '800', color: '#34d399' }}>{fmtMoney(order.grand_total)}</td>
+                    <td style={{ padding: '10px 10px' }}><Badge label={paymentStatusLabel(order.payment_status)} palette={PAYMENT_STATUS_COLORS[order.payment_status]} /></td>
+                    <td style={{ padding: '10px 10px', textAlign: 'right', fontWeight: '800', color: '#34d399' }}>{fmtMoney(order.grand_total)}</td>
+                    <td style={{ padding: '10px 14px', textAlign: 'right', whiteSpace: 'nowrap' }} onClick={(e) => e.stopPropagation()}>
+                      <button
+                        onClick={() => setPrintOrder(order)}
+                        title={order.payment_status === 'PENDING' ? 'Print Bill' : 'Reprint Bill'}
+                        style={{
+                          padding: '5px 9px', marginRight: '6px', background: 'rgba(255,255,255,0.06)',
+                          border: '1px solid rgba(255,255,255,0.15)', borderRadius: '6px',
+                          color: 'rgba(255,255,255,0.8)', fontSize: '0.74rem', fontWeight: '700', cursor: 'pointer'
+                        }}
+                      >
+                        🖨️
+                      </button>
+                      {order.payment_status === 'PENDING' && (
+                        <button
+                          onClick={() => setPayOrder(order)}
+                          title="Collect Payment"
+                          style={{
+                            padding: '5px 10px', background: 'rgba(52,211,153,0.15)',
+                            border: '1px solid rgba(52,211,153,0.4)', borderRadius: '6px',
+                            color: '#34d399', fontSize: '0.74rem', fontWeight: '800', cursor: 'pointer'
+                          }}
+                        >
+                          Collect
+                        </button>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -770,7 +854,40 @@ export default function FoodOrderHistory({ token, user }) {
       )}
 
       {selectedOrder && (
-        <OrderDetailModal order={selectedOrder} onClose={() => setSelectedOrder(null)} />
+        <OrderDetailModal
+          order={selectedOrder}
+          onClose={() => setSelectedOrder(null)}
+          onPrint={(o) => { setSelectedOrder(null); setPrintOrder(o); }}
+          onCollectPayment={(o) => { setSelectedOrder(null); setPayOrder(o); }}
+        />
+      )}
+
+      {printOrder && (
+        <FoodBillView order={printOrder} onClose={() => setPrintOrder(null)} />
+      )}
+
+      {payOrder && (
+        <div
+          onClick={() => setPayOrder(null)}
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.72)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            zIndex: 10000, padding: '20px'
+          }}
+        >
+          <div onClick={(e) => e.stopPropagation()}>
+            <FoodOrderBilling
+              order={payOrder}
+              token={token}
+              user={user}
+              onBack={() => setPayOrder(null)}
+              onComplete={() => {
+                setPayOrder(null);
+                handleRetry();
+              }}
+            />
+          </div>
+        </div>
       )}
     </div>
   );

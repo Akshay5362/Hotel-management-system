@@ -48,9 +48,16 @@ export function AdminAuthProvider({ children }) {
           console.warn('[AdminAuthContext] Token refresh failed:', e.message);
         }
       } else {
-        // Firebase user signed out
+        // Firebase user signed out (or was never really signed in on this
+        // profile — e.g. an unresolved/expired persisted session). Clear
+        // BOTH adminToken and adminUser: leaving adminUser behind let
+        // ProtectedRoutes (which only checks adminUser) keep showing an
+        // authenticated dashboard with no usable credential, so every
+        // authenticated request silently had no Authorization header.
         localStorage.removeItem('adminToken');
+        localStorage.removeItem('adminUser');
         setAdminToken('');
+        setAdminUser(null);
       }
     });
     return () => unsubscribe();

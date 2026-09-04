@@ -199,6 +199,27 @@ function AppContent() {
   // Transaction Cash Logs
   const [cashLog, setCashLog] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
+
+  // Safety net: isLoading must never remain true forever, even in a path
+  // that never gets as far as calling fetchStatus() at all (e.g. adminToken
+  // present but adminUser never hydrates). Bounded to 10s — comfortably past
+  // fetchStatus()'s own 5s AbortController timeout plus its 401-retry
+  // round-trip — so it only ever fires as a last resort, never races the
+  // normal resolution path. Does not run more than once and does not mask
+  // real errors: fetchStatus()'s own error/timeout handling still runs and
+  // still sets dataStatus/staleReason as usual when it does execute.
+  useEffect(() => {
+    const safetyTimer = setTimeout(() => {
+      setIsLoading((prev) => {
+        if (prev) {
+          console.warn('[App] isLoading safety-net fired — property status did not resolve within 10s; unblocking UI.');
+        }
+        return false;
+      });
+    }, 10000);
+    return () => clearTimeout(safetyTimer);
+  }, []);
+
   const [isBackendOnline, setIsBackendOnline] = useState(true);
   const [dataStatus, setDataStatus] = useState('fresh'); // 'fresh' | 'stale' | 'degraded'
   const [staleReason, setStaleReason] = useState(null);
@@ -520,15 +541,27 @@ function AppContent() {
   const [lastSynced, setLastSynced] = useState(null);
   const [isSyncing,  setIsSyncing]  = useState(false);
 
+  // Guards a single in-flight poll so a 20s interval tick and a visibility
+  // recovery firing close together never overlap into two concurrent
+  // fetchStatus() calls.
+  const pollInFlightRef = useRef(false);
+
   useEffect(() => {
     if (!adminToken || !adminUser || adminUser.role !== 'admin') return;
 
-    const poll = async () => {
+    // `isInitial` bypasses the document.hidden check — the very first status
+    // fetch must never depend on tab visibility, or a mount/reload while
+    // backgrounded leaves isLoading stuck with nothing left to rescue it.
+    // Periodic background ticks (isInitial=false) still skip while hidden,
+    // to avoid wasted requests; the visibilitychange listener below covers
+    // that gap by firing an immediate fetch the moment the tab is looked at.
+    const poll = async ({ isInitial = false } = {}) => {
       // Don't poll while a modal is open (to avoid data flickering mid-operation)
       if (activeModal) return;
-      // Skip automatic background interval poll if page/tab is currently hidden
-      if (typeof document !== 'undefined' && document.hidden) return;
+      if (!isInitial && typeof document !== 'undefined' && document.hidden) return;
+      if (pollInFlightRef.current) return;
 
+      pollInFlightRef.current = true;
       setIsSyncing(true);
       try {
         await fetchStatus();
@@ -537,14 +570,18 @@ function AppContent() {
         // silent — fetchStatus handles its own error state
       } finally {
         setIsSyncing(false);
+        pollInFlightRef.current = false;
       }
     };
 
-    // Immediate first poll
-    poll();
-    const interval = setInterval(poll, 20000); // every 20 seconds
+    // Initial fetch — always runs regardless of tab visibility.
+    poll({ isInitial: true });
+    // Periodic background refresh — skips a tick while hidden (see poll()).
+    const interval = setInterval(() => poll(), 20000); // every 20 seconds
 
-    // Visibility change listener: refresh immediately upon returning to tab
+    // Visibility change listener: refresh immediately upon returning to tab,
+    // guarded by pollInFlightRef so this can never race the interval or the
+    // initial fetch into a duplicate concurrent request.
     const handleVisibilityChange = () => {
       if (typeof document !== 'undefined' && !document.hidden && !activeModal) {
         poll();
@@ -1295,17 +1332,20 @@ function AppContent() {
             </div>
           </header>
 
-          {/* Action and Filter Toolbar */}
-          <Toolbar 
-            onActionClick={handleActionClick}
-            activeFilter={filter}
-            setFilter={setFilter}
-            roomCounts={roomCounts}
-            searchQuery={searchQuery}
-            setSearchQuery={setSearchQuery}
-            requestCount={requestCount}
-            activeModal={activeModal}
-          />
+          {/* Action and Filter Toolbar — hotel front-desk chrome, not applicable
+              inside the self-contained Food & Beverage workspace */}
+          {adminTab !== 'food' && (
+            <Toolbar
+              onActionClick={handleActionClick}
+              activeFilter={filter}
+              setFilter={setFilter}
+              roomCounts={roomCounts}
+              searchQuery={searchQuery}
+              setSearchQuery={setSearchQuery}
+              requestCount={requestCount}
+              activeModal={activeModal}
+            />
+          )}
 
           {/* Main Workspace Scrollable Body */}
           {adminTab === 'housekeeping' && <AdminHousekeeping onBack={() => setAdminTab('frontdesk')} />}
@@ -1385,13 +1425,16 @@ function AppContent() {
             </div>
           )}
 
-          {/* Bottom Metrics Information Bar */}
-          <MetricsBar 
-            stats={globalStats}
-            systemStatus={isBackendOnline}
-            dataStatus={dataStatus}
-            staleReason={staleReason}
-          />
+          {/* Bottom Metrics Information Bar — room occupancy statistics,
+              not applicable inside the self-contained Food & Beverage workspace */}
+          {adminTab !== 'food' && (
+            <MetricsBar
+              stats={globalStats}
+              systemStatus={isBackendOnline}
+              dataStatus={dataStatus}
+              staleReason={staleReason}
+            />
+          )}
 
           {/* Modals & Dialog Portals */}
           <CheckInModal 

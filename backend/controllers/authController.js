@@ -1095,6 +1095,32 @@ export const hasPermission = async (req, permissionName, {
 };
 
 /**
+ * Housekeeping Room-Ownership Check
+ * ─────────────────────────────────────────────────────────────────────────
+ * Returns true only if this room is currently assigned to `user` — used to
+ * scope a 'housekeeper'-normalized caller (cleaner) to their own assigned
+ * rooms. Admin/receptionist callers should never call this; they remain
+ * unrestricted by design.
+ *
+ * room.housekeeping_assigned_to is written as the Firebase Auth UID string
+ * (e.g. "staff_9") on the live Firestore path (housekeepingCutoverService.js),
+ * but as the numeric MySQL staff.id on the (currently inert in production —
+ * DISABLE_MYSQL_CUTOVER_FALLBACKS=true) MySQL fallback path. Checking both
+ * user.uid and user.id/mysql_id here means callers don't need to know which
+ * representation a given code path is using.
+ */
+export function isRoomAssignedToUser(user, room) {
+  const assignedTo = room?.housekeeping_assigned_to;
+  if (!assignedTo || !user) return false;
+  const assignedStr = String(assignedTo);
+  return (
+    assignedStr === String(user.uid || '') ||
+    assignedStr === String(user.id || '') ||
+    assignedStr === String(user.mysql_id || '')
+  );
+}
+
+/**
  * Role Normalization Helper
  */
 export function normalizeUserRole(user) {

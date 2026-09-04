@@ -133,31 +133,40 @@ export const getStatus = async (req, res) => {
 
   try {
     const systemDate = await BusinessDateService.getBusinessDate();
-    let todayCheckins = 0;
-    let todayCheckouts = 0;
-    let continuedRooms = 0;
 
-    if (isFirebaseOnlyBusinessDateEnabled() || isMysqlCutoverFallbacksDisabled()) {
-      try {
-        const details = await getSystemDateDetailsFirestore();
-        if (details) {
-          todayCheckins = details.today_checkins || 0;
-          todayCheckouts = details.today_checkouts || 0;
-          continuedRooms = details.continued_rooms || 0;
+    // ── Independent reads below — none depends on any other's result, only
+    //    on systemDate above — run concurrently instead of serially. Each
+    //    preserves its exact original branch logic and error handling.
+
+    const fetchCounters = async () => {
+      let todayCheckins = 0;
+      let todayCheckouts = 0;
+      let continuedRooms = 0;
+
+      if (isFirebaseOnlyBusinessDateEnabled() || isMysqlCutoverFallbacksDisabled()) {
+        try {
+          const details = await getSystemDateDetailsFirestore();
+          if (details) {
+            todayCheckins = details.today_checkins || 0;
+            todayCheckouts = details.today_checkouts || 0;
+            continuedRooms = details.continued_rooms || 0;
+          }
+        } catch (e) {
+          console.warn('[getStatus] Failed to read daily counters from Firestore, falling back to 0:', e.message);
         }
-      } catch (e) {
-        console.warn('[getStatus] Failed to read daily counters from Firestore, falling back to 0:', e.message);
+      } else {
+        const [counterRows] = await pool.query(
+          "SELECT key_name, value_val FROM system_settings WHERE key_name IN ('today_checkins','today_checkouts','continued_rooms')"
+        );
+        const counterMap = {};
+        counterRows.forEach(r => { counterMap[r.key_name] = r.value_val; });
+        todayCheckins  = parseInt(counterMap['today_checkins']  || '0', 10);
+        todayCheckouts = parseInt(counterMap['today_checkouts'] || '0', 10);
+        continuedRooms = parseInt(counterMap['continued_rooms'] || '0', 10);
       }
-    } else {
-      const [counterRows] = await pool.query(
-        "SELECT key_name, value_val FROM system_settings WHERE key_name IN ('today_checkins','today_checkouts','continued_rooms')"
-      );
-      const counterMap = {};
-      counterRows.forEach(r => { counterMap[r.key_name] = r.value_val; });
-      todayCheckins  = parseInt(counterMap['today_checkins']  || '0', 10);
-      todayCheckouts = parseInt(counterMap['today_checkouts'] || '0', 10);
-      continuedRooms = parseInt(counterMap['continued_rooms'] || '0', 10);
-    }
+
+      return { todayCheckins, todayCheckouts, continuedRooms };
+    };
 
     // Helper function to fetch authoritative MySQL room status data
     const fetchMysqlProcessedRooms = async () => {
@@ -226,7 +235,7 @@ export const getStatus = async (req, res) => {
     };
 
     // Controlled Cutover: Primary Firestore Serving with Emergency MySQL Fallback
-    const processedRooms = await SafeCutoverFallbackService.executeWithFallback({
+    const fetchProcessedRooms = () => SafeCutoverFallbackService.executeWithFallback({
       domain: 'room_status',
       servingEnabled: isFirestoreRoomStatusServingEnabled(),
       firestoreOp: () => FirestoreRoomStatusService.getRoomStatuses(systemDate),
@@ -240,46 +249,50 @@ export const getStatus = async (req, res) => {
       context: { endpoint: 'GET /api/status', systemDate }
     });
 
-    let cashLog = [];
-    let upcomingReservations = [];
-
-    if (isMysqlCutoverFallbacksDisabled()) {
-      try {
-        cashLog = await getAllCashLogsFirestore({ filters: [{ field: 'business_date', op: '==', value: systemDate }], orderBy: [] }) || [];
-      } catch (e) {
-        console.warn('[getStatus] Failed to read cash logs from Firestore:', e.message);
+    const fetchCashLog = async () => {
+      if (isMysqlCutoverFallbacksDisabled()) {
+        try {
+          return await getAllCashLogsFirestore({ filters: [{ field: 'business_date', op: '==', value: systemDate }], orderBy: [] }) || [];
+        } catch (e) {
+          console.warn('[getStatus] Failed to read cash logs from Firestore:', e.message);
+          return [];
+        }
       }
-
-      try {
-        const fsReservations = await getAllReservationsFirestore({ filters: [{ field: 'check_in_date', op: '>=', value: systemDate }] }) || [];
-        upcomingReservations = (fsReservations || [])
-          .filter(r => r.status === 'Confirmed' || r.status === 'Reserved')
-          .map(r => ({
-            reservation_id: r.id || r.reservation_number,
-            booking_id: r.booking_id || r.id,
-            booking_number: r.reservation_number || r.booking_number,
-            reservation_number: r.reservation_number,
-            room_id: r.room_id,
-            checkInDate: r.check_in_date || r.arrival_date,
-            expectedCheckOutDate: r.check_out_date || r.departure_date,
-            status: r.status,
-            guestName: r.guest_name,
-            phone: r.phone,
-            adults: r.adults || 1,
-            totalAmount: r.advance_payment || r.total_amount || 0,
-            roomNumber: r.room_number || '',
-            roomType: r.room_type || ''
-          }));
-      } catch (e) {
-        console.warn('[getStatus] Failed to read upcoming reservations from Firestore:', e.message);
-      }
-    } else {
       const [dbCashLog] = await pool.query('SELECT * FROM cash_logs WHERE business_date = ?', [systemDate]);
-      cashLog = dbCashLog;
+      return dbCashLog;
+    };
+
+    const fetchUpcomingReservations = async () => {
+      if (isMysqlCutoverFallbacksDisabled()) {
+        try {
+          const fsReservations = await getAllReservationsFirestore({ filters: [{ field: 'check_in_date', op: '>=', value: systemDate }] }) || [];
+          return (fsReservations || [])
+            .filter(r => r.status === 'Confirmed' || r.status === 'Reserved')
+            .map(r => ({
+              reservation_id: r.id || r.reservation_number,
+              booking_id: r.booking_id || r.id,
+              booking_number: r.reservation_number || r.booking_number,
+              reservation_number: r.reservation_number,
+              room_id: r.room_id,
+              checkInDate: r.check_in_date || r.arrival_date,
+              expectedCheckOutDate: r.check_out_date || r.departure_date,
+              status: r.status,
+              guestName: r.guest_name,
+              phone: r.phone,
+              adults: r.adults || 1,
+              totalAmount: r.advance_payment || r.total_amount || 0,
+              roomNumber: r.room_number || '',
+              roomType: r.room_type || ''
+            }));
+        } catch (e) {
+          console.warn('[getStatus] Failed to read upcoming reservations from Firestore:', e.message);
+          return [];
+        }
+      }
 
       // Query upcoming future reservations for the side panel component
       const [futureBookings] = await pool.query(`
-        SELECT 
+        SELECT
           b.id as booking_id,
           b.booking_number,
           b.room_id,
@@ -299,7 +312,7 @@ export const getStatus = async (req, res) => {
       `, [systemDate]);
 
       const [futureResTable] = await pool.query(`
-        SELECT 
+        SELECT
           res.id as reservation_id,
           res.id as booking_id,
           res.reservation_number as booking_number,
@@ -322,8 +335,20 @@ export const getStatus = async (req, res) => {
         ORDER BY res.arrival_date ASC
       `, [systemDate]);
 
-      upcomingReservations = [...futureBookings, ...futureResTable];
-    }
+      return [...futureBookings, ...futureResTable];
+    };
+
+    const [
+      { todayCheckins, todayCheckouts, continuedRooms },
+      processedRooms,
+      cashLog,
+      upcomingReservations
+    ] = await Promise.all([
+      fetchCounters(),
+      fetchProcessedRooms(),
+      fetchCashLog(),
+      fetchUpcomingReservations()
+    ]);
 
     const responsePayload = {
       systemDate,

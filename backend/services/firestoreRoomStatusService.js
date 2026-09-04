@@ -103,22 +103,24 @@ export class FirestoreRoomStatusService {
 
     try {
 
-    // ── 1. Batch fetch rooms (finite inventory) ──────────────────────────────
-    const allRooms = await listDocs(ROOMS_COLLECTION, { transaction });
+    // ── 1-3. Batch fetch rooms, active bookings, and active reservations —
+    //         three fully independent collections/queries with no data
+    //         dependency between them, run concurrently instead of serially.
+    const [allRooms, activeBookings, activeReservations] = await Promise.all([
+      listDocs(ROOMS_COLLECTION, { transaction }),
+      listDocs(BOOKINGS_COLLECTION, {
+        filters: [{ field: 'booking_status', op: 'in', value: ['Checked In', 'Reserved'] }],
+        transaction
+      }),
+      listDocs(RESERVATIONS_COLLECTION, {
+        filters: [{ field: 'status', op: 'in', value: ['Reserved', 'Confirmed'] }],
+        transaction
+      })
+    ]);
 
-    // ── 2. Query ONLY active bookings (Checked In / Reserved) ────────────────
-    const activeBookings = await listDocs(BOOKINGS_COLLECTION, {
-      filters: [{ field: 'booking_status', op: 'in', value: ['Checked In', 'Reserved'] }],
-      transaction
-    });
-
-    // ── 3. Query ONLY active reservations (Reserved / Confirmed) ─────────────
-    const activeReservations = await listDocs(RESERVATIONS_COLLECTION, {
-      filters: [{ field: 'status', op: 'in', value: ['Reserved', 'Confirmed'] }],
-      transaction
-    });
-
-    // ── 4. Batch fetch ONLY required guest profiles by ID ────────────────────
+    // ── 4 & 5. Guest profiles and ledger items both depend only on
+    //           activeBookings above — not on each other — so they run
+    //           concurrently with each other via Promise.all below.
     const guestIdsNeeded = new Set();
     activeBookings.forEach(b => {
       if (b.guest_id) {
@@ -131,111 +133,123 @@ export class FirestoreRoomStatusService {
       }
     });
 
-    let guestsMap = new Map();
-    if (guestIdsNeeded.size > 0) {
-      const activeGuests = await getDocsByIds(GUESTS_COLLECTION, Array.from(guestIdsNeeded), { transaction });
-      activeGuests.forEach(g => {
-        if (!g) return;
-        if (g.id) guestsMap.set(String(g.id), g);
-        if (g.doc_id) guestsMap.set(String(g.doc_id), g);
-        if (g.mysql_guest_id) guestsMap.set(String(g.mysql_guest_id), g);
-        if (g.mysql_id) guestsMap.set(String(g.mysql_id), g);
-        if (g.user_id) guestsMap.set(String(g.user_id), g);
-        if (g.phone) guestsMap.set(String(g.phone), g);
-      });
-    }
+    // ── 4. Batch fetch ONLY required guest profiles by ID ────────────────────
+    const fetchGuestsMap = async () => {
+      const guestsMap = new Map();
+      if (guestIdsNeeded.size > 0) {
+        const activeGuests = await getDocsByIds(GUESTS_COLLECTION, Array.from(guestIdsNeeded), { transaction });
+        activeGuests.forEach(g => {
+          if (!g) return;
+          if (g.id) guestsMap.set(String(g.id), g);
+          if (g.doc_id) guestsMap.set(String(g.doc_id), g);
+          if (g.mysql_guest_id) guestsMap.set(String(g.mysql_guest_id), g);
+          if (g.mysql_id) guestsMap.set(String(g.mysql_id), g);
+          if (g.user_id) guestsMap.set(String(g.user_id), g);
+          if (g.phone) guestsMap.set(String(g.phone), g);
+        });
+      }
+      return guestsMap;
+    };
 
     // ── 5. Query ONLY relevant ledger items for active bookings ───────────────
-    let ledgerByBookingMap = new Map();
-    let ledgerByRoomMap = new Map();
-    if (includeLedger && activeBookings.length > 0) {
-      const targetBkgKeys = new Set();
-      const targetRoomNumbers = new Set();
+    const fetchLedgerMaps = async () => {
+      const ledgerByBookingMap = new Map();
+      const ledgerByRoomMap = new Map();
+      if (includeLedger && activeBookings.length > 0) {
+        const targetBkgKeys = new Set();
+        const targetRoomNumbers = new Set();
 
-      activeBookings.forEach(b => {
-        if (b.id) targetBkgKeys.add(String(b.id));
-        if (b.docId) targetBkgKeys.add(String(b.docId));
-        if (b.booking_id) targetBkgKeys.add(String(b.booking_id));
-        if (b.mysql_booking_id) {
-          targetBkgKeys.add(String(b.mysql_booking_id));
-          targetBkgKeys.add(`bkg_${b.mysql_booking_id}`);
-        }
-        if (b.booking_number) {
-          targetBkgKeys.add(String(b.booking_number));
-          targetBkgKeys.add(`bkg_${b.booking_number}`);
-        }
-        if (b.room_number) {
-          targetRoomNumbers.add(String(b.room_number));
-        }
-      });
+        activeBookings.forEach(b => {
+          if (b.id) targetBkgKeys.add(String(b.id));
+          if (b.docId) targetBkgKeys.add(String(b.docId));
+          if (b.booking_id) targetBkgKeys.add(String(b.booking_id));
+          if (b.mysql_booking_id) {
+            targetBkgKeys.add(String(b.mysql_booking_id));
+            targetBkgKeys.add(`bkg_${b.mysql_booking_id}`);
+          }
+          if (b.booking_number) {
+            targetBkgKeys.add(String(b.booking_number));
+            targetBkgKeys.add(`bkg_${b.booking_number}`);
+          }
+          if (b.room_number) {
+            targetRoomNumbers.add(String(b.room_number));
+          }
+        });
 
-      const bkgKeyList = Array.from(targetBkgKeys).filter(Boolean);
-      let allLedgerItems = [];
+        const bkgKeyList = Array.from(targetBkgKeys).filter(Boolean);
+        let allLedgerItems = [];
 
-      if (bkgKeyList.length > 0) {
-        // Chunk booking IDs into batches of up to 30 for Firestore 'in' query
-        const chunkSize = 30;
-        for (let i = 0; i < bkgKeyList.length; i += chunkSize) {
-          const chunk = bkgKeyList.slice(i, i + chunkSize);
-          const chunkItems = await listDocs(LEDGER_COLLECTION, {
-            filters: [{ field: 'booking_id', op: 'in', value: chunk }],
-            transaction
-          });
-          allLedgerItems.push(...chunkItems);
-        }
-      }
-
-      // Also fetch any room-level ledger items for active occupied rooms
-      const roomNumList = Array.from(targetRoomNumbers).filter(Boolean);
-      if (roomNumList.length > 0) {
-        const chunkSize = 30;
-        for (let i = 0; i < roomNumList.length; i += chunkSize) {
-          const chunk = roomNumList.slice(i, i + chunkSize);
-          const chunkItems = await listDocs(LEDGER_COLLECTION, {
-            filters: [{ field: 'room_number', op: 'in', value: chunk }],
-            transaction
-          });
-          allLedgerItems.push(...chunkItems);
-        }
-      }
-
-      // Deduplicate fetched ledger items by ID
-      const seenLedgerIds = new Set();
-      allLedgerItems.forEach(item => {
-        if (!item) return;
-        const itemId = item.id || item.doc_id || item.mysql_ledger_id;
-        if (itemId && seenLedgerIds.has(String(itemId))) return;
-        if (itemId) seenLedgerIds.add(String(itemId));
-
-        const bkgKey = item.booking_id ? String(item.booking_id) : null;
-        const roomKey = item.room_number ? String(item.room_number) : (item.room_id ? String(item.room_id).replace(/^room_/, '') : null);
-
-        const cleanItem = {
-          id: item.mysql_ledger_id || item.id || item.doc_id,
-          desc: item.desc || item.description || '',
-          qty: Number(item.qty || 1),
-          amount: Number(item.amount || item.debit_amount || 0),
-          transaction_type: item.transaction_type || 'DEBIT',
-          payment_mode: item.payment_mode || null,
-          time: item.time || null,
-          business_date: item.business_date || sysComp
-        };
-
-        if (bkgKey) {
-          if (!ledgerByBookingMap.has(bkgKey)) ledgerByBookingMap.set(bkgKey, []);
-          ledgerByBookingMap.get(bkgKey).push(cleanItem);
-          const rawBkgKey = bkgKey.replace(/^bkg_/, '');
-          if (rawBkgKey !== bkgKey) {
-            if (!ledgerByBookingMap.has(rawBkgKey)) ledgerByBookingMap.set(rawBkgKey, []);
-            ledgerByBookingMap.get(rawBkgKey).push(cleanItem);
+        if (bkgKeyList.length > 0) {
+          // Chunk booking IDs into batches of up to 30 for Firestore 'in' query
+          const chunkSize = 30;
+          for (let i = 0; i < bkgKeyList.length; i += chunkSize) {
+            const chunk = bkgKeyList.slice(i, i + chunkSize);
+            const chunkItems = await listDocs(LEDGER_COLLECTION, {
+              filters: [{ field: 'booking_id', op: 'in', value: chunk }],
+              transaction
+            });
+            allLedgerItems.push(...chunkItems);
           }
         }
-        if (roomKey) {
-          if (!ledgerByRoomMap.has(roomKey)) ledgerByRoomMap.set(roomKey, []);
-          ledgerByRoomMap.get(roomKey).push(cleanItem);
+
+        // Also fetch any room-level ledger items for active occupied rooms
+        const roomNumList = Array.from(targetRoomNumbers).filter(Boolean);
+        if (roomNumList.length > 0) {
+          const chunkSize = 30;
+          for (let i = 0; i < roomNumList.length; i += chunkSize) {
+            const chunk = roomNumList.slice(i, i + chunkSize);
+            const chunkItems = await listDocs(LEDGER_COLLECTION, {
+              filters: [{ field: 'room_number', op: 'in', value: chunk }],
+              transaction
+            });
+            allLedgerItems.push(...chunkItems);
+          }
         }
-      });
-    }
+
+        // Deduplicate fetched ledger items by ID
+        const seenLedgerIds = new Set();
+        allLedgerItems.forEach(item => {
+          if (!item) return;
+          const itemId = item.id || item.doc_id || item.mysql_ledger_id;
+          if (itemId && seenLedgerIds.has(String(itemId))) return;
+          if (itemId) seenLedgerIds.add(String(itemId));
+
+          const bkgKey = item.booking_id ? String(item.booking_id) : null;
+          const roomKey = item.room_number ? String(item.room_number) : (item.room_id ? String(item.room_id).replace(/^room_/, '') : null);
+
+          const cleanItem = {
+            id: item.mysql_ledger_id || item.id || item.doc_id,
+            desc: item.desc || item.description || '',
+            qty: Number(item.qty || 1),
+            amount: Number(item.amount || item.debit_amount || 0),
+            transaction_type: item.transaction_type || 'DEBIT',
+            payment_mode: item.payment_mode || null,
+            time: item.time || null,
+            business_date: item.business_date || sysComp
+          };
+
+          if (bkgKey) {
+            if (!ledgerByBookingMap.has(bkgKey)) ledgerByBookingMap.set(bkgKey, []);
+            ledgerByBookingMap.get(bkgKey).push(cleanItem);
+            const rawBkgKey = bkgKey.replace(/^bkg_/, '');
+            if (rawBkgKey !== bkgKey) {
+              if (!ledgerByBookingMap.has(rawBkgKey)) ledgerByBookingMap.set(rawBkgKey, []);
+              ledgerByBookingMap.get(rawBkgKey).push(cleanItem);
+            }
+          }
+          if (roomKey) {
+            if (!ledgerByRoomMap.has(roomKey)) ledgerByRoomMap.set(roomKey, []);
+            ledgerByRoomMap.get(roomKey).push(cleanItem);
+          }
+        });
+      }
+      return { ledgerByBookingMap, ledgerByRoomMap };
+    };
+
+    const [guestsMap, { ledgerByBookingMap, ledgerByRoomMap }] = await Promise.all([
+      fetchGuestsMap(),
+      fetchLedgerMaps()
+    ]);
 
     // ── 6. Deterministically calculate room status & merge guest data ─────────
     const processedRooms = allRooms.map(r => {

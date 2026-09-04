@@ -80,7 +80,9 @@ function rowsForReportType(type, data) {
     case 'byOrderStatus':
       return (data.byOrderStatus || []).map(r => [r.status, r.count, fmtMoney(r.sales)]);
     case 'byPaymentStatus':
-      return (data.byPaymentStatus || []).map(r => [r.status, r.count, fmtMoney(r.sales)]);
+      // PENDING is the existing canonical "not yet paid" value — labeled for
+      // staff clarity without changing the stored value.
+      return (data.byPaymentStatus || []).map(r => [r.status === 'PENDING' ? 'PENDING (Pay Later)' : r.status, r.count, fmtMoney(r.sales)]);
     case 'byDestination':
       return (data.byDestination || []).map(r => [r.destination, r.count, fmtMoney(r.sales)]);
     case 'byWaiter':

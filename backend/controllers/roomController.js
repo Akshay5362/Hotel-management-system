@@ -20,6 +20,7 @@ import { FirestoreLedgerService } from '../services/firestoreLedgerService.js';
 import { AuditHistoryCutoverService } from '../services/auditHistoryCutoverService.js';
 import { validateCheckInPayload } from '../validators/checkInValidator.js';
 import { invalidateGuestRequestsCache } from '../services/guestRequestsService.js';
+import { normalizeUserRole, isRoomAssignedToUser } from './authController.js';
 
 // ── Phase 3 Step 3D-4: Guest Booking Ownership Helper ─────────────────────────
 /**
@@ -235,6 +236,12 @@ export const clean = async (req, res) => {
       return res.status(404).json({ error: `Room ${number} not found` });
     }
 
+    // L3: a housekeeper (cleaner) may only clean a room currently assigned
+    // to them; admin/receptionist are unrestricted (unchanged).
+    if (normalizeUserRole(req.user) === 'housekeeper' && !isRoomAssignedToUser(req.user, room)) {
+      return res.status(403).json({ error: 'Forbidden: This room is not assigned to you.', code: 'HOUSEKEEPING_NOT_ASSIGNED' });
+    }
+
     const isDirtyByStatus = String(room.status || '').toLowerCase() === 'dirty';
     const isDirtyByHK     = String(room.housekeeping_status || '').toLowerCase() === 'dirty';
 
@@ -281,12 +288,17 @@ export const clean = async (req, res) => {
       console.warn('[clean] Audit/history log non-fatal error:', auditErr.message);
     }
 
+    // L3: emit the same 'housekeeping_update' event the dedicated
+    // /housekeeping/* routes already emit, so this endpoint's changes are
+    // also reflected in real time on Admin/Housekeeping dashboards.
+    req.app.get('io')?.emit('housekeeping_update', { roomId: room.id || number, status: 'Clean' });
+
     res.json({ message: `Room ${number} marked as CLEAN and vacant` });
   } catch (error) {
     console.error('Error during cleaning controller (Firestore), attempting fallback:', error);
     try {
       const [roomRows] = await pool.query(`
-        SELECT r.id, r.status, r.housekeeping_status
+        SELECT r.id, r.status, r.housekeeping_status, r.housekeeping_assigned_to
         FROM rooms r
         JOIN room_types rt ON r.room_type_id = rt.id
         WHERE r.number = ?
@@ -296,6 +308,11 @@ export const clean = async (req, res) => {
       }
 
       const room = roomRows[0];
+
+      if (normalizeUserRole(req.user) === 'housekeeper' && !isRoomAssignedToUser(req.user, room)) {
+        return res.status(403).json({ error: 'Forbidden: This room is not assigned to you.', code: 'HOUSEKEEPING_NOT_ASSIGNED' });
+      }
+
       const isDirtyByStatus = room.status === 'dirty';
       const isDirtyByHK     = room.housekeeping_status === 'Dirty';
 
@@ -330,6 +347,8 @@ export const clean = async (req, res) => {
           [room.id]
         );
       }
+
+      req.app.get('io')?.emit('housekeeping_update', { roomId: room.id || number, status: 'Clean' });
 
       return res.json({ message: `Room ${number} marked as CLEAN and vacant` });
     } catch (mysqlErr) {
@@ -2633,6 +2652,12 @@ export const updateRoomStatus = async (req, res) => {
       return res.status(404).json({ error: 'Room not found' });
     }
 
+    // L3: a housekeeper (cleaner) may only update a room currently assigned
+    // to them; admin/receptionist are unrestricted (unchanged).
+    if (normalizeUserRole(req.user) === 'housekeeper' && !isRoomAssignedToUser(req.user, room)) {
+      return res.status(403).json({ error: 'Forbidden: This room is not assigned to you.', code: 'HOUSEKEEPING_NOT_ASSIGNED' });
+    }
+
     const businessDate = await BusinessDateService.getBusinessDate();
     let performerName = req.user?.username || req.user?.fullName || 'System';
 
@@ -2721,6 +2746,11 @@ export const updateRoomStatus = async (req, res) => {
     const { invalidateRoomStatusCache } = await import('../services/firestoreRoomStatusService.js');
     invalidateRoomStatusCache();
 
+    // L3: emit the same 'housekeeping_update' event the dedicated
+    // /housekeeping/* routes already emit, so this endpoint's changes are
+    // also reflected in real time on Admin/Housekeeping dashboards.
+    req.app.get('io')?.emit('housekeeping_update', { roomId: room.id || number, status: newHkStatus });
+
     const updatedRoomData = await getRoomByNumberFirestore(number);
     return res.json({
       success: true,
@@ -2744,6 +2774,11 @@ export const updateRoomStatus = async (req, res) => {
         return res.status(404).json({ error: 'Room not found' });
       }
       const room = roomRows[0];
+
+      if (normalizeUserRole(req.user) === 'housekeeper' && !isRoomAssignedToUser(req.user, room)) {
+        await connection.rollback();
+        return res.status(403).json({ error: 'Forbidden: This room is not assigned to you.', code: 'HOUSEKEEPING_NOT_ASSIGNED' });
+      }
 
       const businessDate = await BusinessDateService.getBusinessDate(connection);
 
@@ -2822,6 +2857,7 @@ export const updateRoomStatus = async (req, res) => {
       }
 
       await connection.commit();
+      req.app.get('io')?.emit('housekeeping_update', { roomId: room.id || number, status: newHkStatus });
       res.json({ message: logDetail });
     } catch (mysqlErr) {
       if (connection) await connection.rollback();

@@ -15,7 +15,7 @@
  */
 
 import express from 'express';
-import { authenticate, requireAdmin, requireRole } from '../controllers/authController.js';
+import { authenticate, requireRole } from '../controllers/authController.js';
 import {
   getFoodCategories,
   getFoodCategoryById,
@@ -48,7 +48,9 @@ import { getOrderHistory, getFoodReportsSummary } from '../controllers/foodRepor
 
 import {
   placeFoodOrder,
+  cancelDraftOrder,
   updateFoodOrderStatus,
+  modifyFoodOrder,
   processPayNow,
   processRoomBill,
   cancelFoodOrder,
@@ -90,39 +92,39 @@ router.get('/meta', getFoodMeta);
 // ── Food Categories (Phase 1) ─────────────────────────────────────────────────
 router.get('/categories', getFoodCategories);
 router.get('/categories/:id', getFoodCategoryById);
-router.post('/categories', requireAdmin, createFoodCategory);
-router.put('/categories/:id', requireAdmin, updateFoodCategory);
-router.delete('/categories/:id', requireAdmin, deleteFoodCategory);
+router.post('/categories', requireRole('admin'), createFoodCategory);
+router.put('/categories/:id', requireRole('admin'), updateFoodCategory);
+router.delete('/categories/:id', requireRole('admin'), deleteFoodCategory);
 
 // ── Food Menu Items (Phase 1) ─────────────────────────────────────────────────
 router.get('/menu-items/search', searchFoodMenuItems);
 router.get('/menu-items', getFoodMenuItems);
 router.get('/menu-items/:id', getFoodMenuItemById);
-router.post('/menu-items', requireAdmin, createFoodMenuItem);
-router.put('/menu-items/:id', requireAdmin, updateFoodMenuItem);
-router.delete('/menu-items/:id', requireAdmin, deleteFoodMenuItem);
+router.post('/menu-items', requireRole('admin'), createFoodMenuItem);
+router.put('/menu-items/:id', requireRole('admin'), updateFoodMenuItem);
+router.delete('/menu-items/:id', requireRole('admin'), deleteFoodMenuItem);
 
 // ── Food Tax Configuration (Phase 1) ──────────────────────────────────────────
 router.get('/tax-config', getFoodTaxConfig);
-router.put('/tax-config', requireAdmin, updateFoodTaxConfig);
+router.put('/tax-config', requireRole('admin'), updateFoodTaxConfig);
 
 // ── Food Tables Master (Phase 2B) ─────────────────────────────────────────────
 router.get('/tables', getFoodTables);
 router.get('/tables/:id', getFoodTableById);
-router.post('/tables', requireAdmin, createFoodTable);
-router.put('/tables/:id', requireAdmin, updateFoodTable);
-router.delete('/tables/:id', requireAdmin, deleteFoodTable);
+router.post('/tables', requireRole('admin'), createFoodTable);
+router.put('/tables/:id', requireRole('admin'), updateFoodTable);
+router.delete('/tables/:id', requireRole('admin'), deleteFoodTable);
 
 // ── Food Waiters Master ────────────────────────────────────────────────────────
 router.get('/waiters', getFoodWaiters);
 router.get('/waiters/:id', getFoodWaiterById);
-router.post('/waiters', requireAdmin, createFoodWaiter);
-router.put('/waiters/:id', requireAdmin, updateFoodWaiter);
-router.delete('/waiters/:id', requireAdmin, deleteFoodWaiter);
+router.post('/waiters', requireRole('admin'), createFoodWaiter);
+router.put('/waiters/:id', requireRole('admin'), updateFoodWaiter);
+router.delete('/waiters/:id', requireRole('admin'), deleteFoodWaiter);
 
 // ── Food Context & Creation (Phase 2A & 2B) ───────────────────────────────────
-router.get('/context/rooms', requireAdmin, getFoodOrderRoomContext);
-router.get('/context/staff', requireAdmin, getFoodOrderStaffContext);
+router.get('/context/rooms', requireRole('admin', 'receptionist'), getFoodOrderRoomContext);
+router.get('/context/staff', requireRole('admin', 'receptionist'), getFoodOrderStaffContext);
 router.post('/orders', requireRole('admin', 'receptionist'), createFoodOrder);
 
 // ── Food Order Lifecycle & Billing (Phase 2B & 2C) ────────────────────────────
@@ -133,11 +135,13 @@ router.get('/orders/kds',     requireRole('admin', 'receptionist', 'kitchen', 'c
 router.get('/orders/history', requireRole('admin', 'receptionist', 'manager'),         getOrderHistory);
 
 // ── Phase 2D-C: Reports ────────────────────────────────────────────────────────
-router.get('/reports/summary', requireRole('admin', 'receptionist', 'manager'),        getFoodReportsSummary);
+router.get('/reports/summary', requireRole('admin', 'manager'),        getFoodReportsSummary);
 
 router.get('/orders',         requireRole('admin', 'receptionist', 'kitchen', 'chef'), listFoodOrders);
 router.get('/orders/:id',     requireRole('admin', 'receptionist', 'kitchen', 'chef'), getFoodOrderById);
 router.put('/orders/:id/place', requireRole('admin', 'receptionist'), placeFoodOrder);
+router.post('/orders/:id/cancel-draft', requireRole('admin', 'receptionist'), cancelDraftOrder);
+router.put('/orders/:id/modify', requireRole('admin', 'receptionist'), modifyFoodOrder);
 router.put('/orders/:id/status', requireRole('admin', 'receptionist', 'kitchen', 'chef'), updateFoodOrderStatus);
 router.post('/orders/:id/pay-now', requireRole('admin', 'receptionist'), processPayNow);
 router.post('/orders/:id/room-bill', requireRole('admin', 'receptionist'), processRoomBill);

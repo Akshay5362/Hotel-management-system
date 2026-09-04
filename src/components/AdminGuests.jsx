@@ -3,15 +3,12 @@ import { exportToExcel } from '../utils/exportUtils';
 import { formatDateOnly } from '../utils/dateFormatter';
 import MasterBillModal from './MasterBillModal';
 
-import { API_URL as API_BASE, getApiHeaders } from '../config/apiConfig';
+import { API_URL as API_BASE, authenticatedFetch, AuthenticationError } from '../config/apiConfig';
 
 async function apiCall(method, endpoint, body, token) {
-  const opts = {
-    method,
-    headers: getApiHeaders(token, { 'Content-Type': 'application/json' }),
-  };
+  const opts = { method };
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(`${API_BASE}${endpoint}`, opts);
+  const res = await authenticatedFetch(`${API_BASE}${endpoint}`, opts, token, { 'Content-Type': 'application/json' });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.error || err.message || `HTTP ${res.status}`);
@@ -603,9 +600,11 @@ export default function AdminGuests({ token }) {
     { id: 'blacklisted', label: '🚫 Blacklisted'  },
   ];
 
+  const [authError, setAuthError] = useState(false);
+
   const fetchGuests = useCallback(async (page, q, f) => {
-    if (!token) return;
     setLoading(true);
+    setAuthError(false);
     try {
       const params = new URLSearchParams({ page: String(page), limit: '25', filter: f });
       if (q && q.trim().length >= 2) params.set('q', q.trim());
@@ -615,6 +614,7 @@ export default function AdminGuests({ token }) {
       setPagination(data.pagination || { total: 0, page: 1, pages: 1 });
     } catch (e) {
       console.error('AdminGuests fetch error:', e);
+      if (e instanceof AuthenticationError) setAuthError(true);
     } finally {
       setLoading(false);
     }
@@ -745,7 +745,9 @@ export default function AdminGuests({ token }) {
 
       {/* Table */}
       <div style={{ flex: 1, overflowY: 'auto' }}>
-        {loading ? (
+        {authError ? (
+          <EmptyState icon="🔒" msg="Your session has expired" sub="Please sign in again to view guests." />
+        ) : loading ? (
           <div style={{ textAlign: 'center', padding: '80px 20px', color: 'var(--text-muted)' }}>
             <div style={{ width: '32px', height: '32px', border: '3px solid rgba(56,189,248,0.1)', borderTopColor: '#38bdf8', borderRadius: '50%', animation: 'spin 1s linear infinite', margin: '0 auto 14px' }} />
             Loading guests...

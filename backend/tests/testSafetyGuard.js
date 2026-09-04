@@ -5,8 +5,19 @@
  *
  * Prevents automated test scripts from executing destructive write operations
  * directly against the live Google Cloud Firestore project (hpms-sky5).
+ *
+ * isProductionProject() now lives in ../config/productionSafetyGuard.js and is
+ * re-exported here for backward compatibility — it moved because a production
+ * runtime file (config/firebaseAdmin.js) needs it, and backend/tests/ is
+ * excluded from the packaged Electron production build (package.json's
+ * extraResources filter), which made that a static import into a file the
+ * packaged app never ships.
  * ─────────────────────────────────────────────────────────────────────────────
  */
+
+import { isProductionProject } from '../config/productionSafetyGuard.js';
+
+export { isProductionProject };
 
 export function assertSafeTestEnvironment(suiteName = 'Test Suite') {
   const projectId = process.env.FIREBASE_PROJECT_ID || 'hpms-sky5';
@@ -22,10 +33,6 @@ export function assertSafeTestEnvironment(suiteName = 'Test Suite') {
     err.code = 'PROD_TEST_MUTATION_BLOCKED';
     throw err;
   }
-}
-
-export function isProductionProject() {
-  return process.env.FIREBASE_PROJECT_ID === 'hpms-sky5' && !process.env.FIRESTORE_EMULATOR_HOST;
 }
 
 export default {

@@ -31,6 +31,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AdminAuthContext } from '../contexts/AdminAuthContext';
 import ReservationModule from './ReservationModule';
 import LedgerPanel from './LedgerPanel';
+import FoodPOS from './food/FoodPOS';
 import { getDefaultExpectedCheckoutInput, formatDateOnly, formatExpectedCheckout } from '../utils/dateFormatter';
 
 import { API_URL as API, getApiHeaders } from '../config/apiConfig';
@@ -50,6 +51,7 @@ const SIDEBAR_ITEMS = [
   { id: 'reservations', icon: '📅', label: 'Reservations'       },
   { id: 'guests',       icon: '🔍', label: 'Guest Search'       },
   { id: 'requests',     icon: '📩', label: 'Guest Requests'     },
+  { id: 'food',         icon: '🍽️', label: 'Food & Beverage'    },
   { id: 'cash',         icon: '💵', label: 'Cash Handover'      },
 ];
 
@@ -1956,6 +1958,13 @@ export default function ReceptionPortal() {
               <h2 style={{ fontSize: '1.1rem', fontWeight: 700, marginBottom: '16px' }}>📩 Guest Requests</h2>
               <GuestRequestsPanel token={adminToken} />
             </div>
+          </div>
+        )}
+
+        {/* ── Tab: Food & Beverage ─────────────────────────────────────── */}
+        {activeTab === 'food' && (
+          <div className="dashboard-body">
+            <FoodPOS token={adminToken} user={adminUser} />
           </div>
         )}
 

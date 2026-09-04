@@ -22,15 +22,22 @@ import {
   updateRoomFirestore
 } from '../repositories/firestore/roomsRepository.js';
 import { getStaffByIdFirestore } from '../repositories/firestore/staffRepository.js';
+import { isRoomAssignedToUser } from '../controllers/authController.js';
 
 export class HousekeepingCutoverService {
 
-  static async getHousekeepingRooms() {
+  // L2: `caller` scopes the result — a 'housekeeper' (cleaner) caller only
+  // ever receives rooms currently assigned to them; admin/receptionist
+  // (or an omitted caller, preserving prior behavior for any internal
+  // caller that doesn't pass one) continue to see every room, unfiltered.
+  static async getHousekeepingRooms(caller = {}) {
+    const isHousekeeper = caller.role === 'housekeeper';
+
     if (isFirestoreHousekeepingEnabled()) {
       try {
         const rooms = await getAllRoomsFirestore();
         if (Array.isArray(rooms)) {
-          const formatted = rooms.map(r => ({
+          let formatted = rooms.map(r => ({
             id: r.id || r.mysql_room_id || r.docId,
             number: String(
               r.number ||
@@ -50,6 +57,9 @@ export class HousekeepingCutoverService {
             assigned_to_name: r.assigned_to_name || null,
             guest_name: r.guest_name || null
           }));
+          if (isHousekeeper) {
+            formatted = formatted.filter(r => isRoomAssignedToUser(caller, r));
+          }
           formatted.sort((a, b) => parseInt(a.number, 10) - parseInt(b.number, 10));
           return formatted;
         }
@@ -61,7 +71,7 @@ export class HousekeepingCutoverService {
 
     // Authoritative MySQL Path (when flag disabled)
     const query = `
-      SELECT 
+      SELECT
         r.id, r.number, COALESCE(rt.code, 'DELUXE') as type, r.status as occupancy_status,
         r.housekeeping_status, r.housekeeping_priority, r.last_cleaned_at,
         r.housekeeping_assigned_to, s.full_name as assigned_to_name,
@@ -72,7 +82,7 @@ export class HousekeepingCutoverService {
       ORDER BY CAST(r.number AS UNSIGNED) ASC
     `;
     const [rows] = await pool.query(query);
-    return rows;
+    return isHousekeeper ? rows.filter(r => isRoomAssignedToUser(caller, r)) : rows;
   }
 
   static async assignHousekeeper({ roomId, userId, priority, performedBy, io }) {
@@ -209,7 +219,14 @@ export class HousekeepingCutoverService {
     }
   }
 
-  static async updateHousekeepingStatus({ roomId, status, notes, performedBy, io }) {
+  // L1: `caller` is required to enforce that a 'housekeeper' (cleaner) may
+  // only update a room currently assigned to them. The ownership check is
+  // performed immediately against the same room read this function already
+  // does for oldStatus/oldHkStatus — not a separate earlier read — so there
+  // is no added read-then-wait-then-write gap beyond what already existed
+  // structurally in this (non-transactional) update path. Admin/receptionist
+  // remain unrestricted, matching prior behavior exactly.
+  static async updateHousekeepingStatus({ roomId, status, notes, performedBy, io, caller }) {
     if (isFirestoreHousekeepingEnabled()) {
       try {
         const room = await getRoomByIdFirestore(roomId);
@@ -217,6 +234,13 @@ export class HousekeepingCutoverService {
           const notFoundErr = new Error('Room not found');
           notFoundErr.status = 404;
           throw notFoundErr;
+        }
+
+        if (caller?.role === 'housekeeper' && !isRoomAssignedToUser(caller, room)) {
+          const forbiddenErr = new Error('Forbidden: This room is not assigned to you.');
+          forbiddenErr.status = 403;
+          forbiddenErr.code = 'HOUSEKEEPING_NOT_ASSIGNED';
+          throw forbiddenErr;
         }
 
         const roomNumber = String(room.number);
@@ -250,7 +274,7 @@ export class HousekeepingCutoverService {
 
         return { success: true, message: 'Status updated successfully' };
       } catch (err) {
-        if (err.status === 404 || err.status === 400) throw err;
+        if (err.status === 404 || err.status === 400 || err.status === 403) throw err;
         console.error(`[FAIL_CLOSED:HOUSEKEEPING] Firestore updateHousekeepingStatus failed for ${roomId}:`, err.message);
         throw err;
       }
@@ -263,7 +287,7 @@ export class HousekeepingCutoverService {
       await connection.beginTransaction();
 
       const [roomRows] = await connection.query(
-        'SELECT r.id, r.number, r.housekeeping_status FROM rooms r WHERE r.id = ? OR r.number = ?',
+        'SELECT r.id, r.number, r.housekeeping_status, r.housekeeping_assigned_to FROM rooms r WHERE r.id = ? OR r.number = ?',
         [roomId, roomId]
       );
       if (roomRows.length === 0) {
@@ -275,6 +299,14 @@ export class HousekeepingCutoverService {
       const actualRoomId = roomRows[0].id;
       const oldHkStatus = roomRows[0].housekeeping_status;
       const roomNumber  = roomRows[0].number;
+
+      if (caller?.role === 'housekeeper' && !isRoomAssignedToUser(caller, roomRows[0])) {
+        await connection.rollback();
+        const forbiddenErr = new Error('Forbidden: This room is not assigned to you.');
+        forbiddenErr.status = 403;
+        forbiddenErr.code = 'HOUSEKEEPING_NOT_ASSIGNED';
+        throw forbiddenErr;
+      }
 
       let performerName = 'System';
       let actualPerformedBy = null;

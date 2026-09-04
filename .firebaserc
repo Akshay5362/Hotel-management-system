@@ -1,5 +1,6 @@
 {
   "projects": {
-    "default": "hpms-sky5"
+    "default": "hpms-sky5",
+    "development": "sky5-development"
   }
 }

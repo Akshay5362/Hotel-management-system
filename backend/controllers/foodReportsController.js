@@ -194,6 +194,7 @@ export async function getOrderHistory(req, res) {
       from_date:        rawFrom,
       to_date:          rawTo,
       order_number:     rawOrderNum,
+      guest_name:       rawGuestName,
       order_status:     rawOrderStatus,
       payment_status:   rawPaymentStatus,
       destination_type: rawDestType,
@@ -372,7 +373,7 @@ export async function getOrderHistory(req, res) {
     // Time sorts + no secondary filters: tight limit (pageSize+1 for has_more probe).
     // ------------------------------------------------------------------
     const hasSecondaryInMemoryFilters = Boolean(
-      rawOrderNum || rawDestType || rawRoomNum || rawWaiterUid || rawTableId ||
+      rawOrderNum || rawGuestName || rawDestType || rawRoomNum || rawWaiterUid || rawTableId ||
       (rawOrderStatus   && primaryFilter !== 'order_status')  ||
       (rawPaymentStatus && primaryFilter !== 'payment_status')
     );
@@ -429,6 +430,13 @@ export async function getOrderHistory(req, res) {
       const searchStr = String(rawOrderNum).toUpperCase().trim();
       docs = docs.filter(d =>
         d.order_number && String(d.order_number).toUpperCase().includes(searchStr)
+      );
+    }
+    if (rawGuestName) {
+      // Same in-memory substring limitation as order_number above.
+      const searchStr = String(rawGuestName).toUpperCase().trim();
+      docs = docs.filter(d =>
+        d.guest_name && String(d.guest_name).toUpperCase().includes(searchStr)
       );
     }
 
@@ -493,6 +501,12 @@ export async function getOrderHistory(req, res) {
     if (rawOrderNum && !useSingleDate && !useDateRange) {
       warnings.push(
         'order_number search is performed in-memory and is bounded by the ' +
+        '500-document fetch cap. Add a business_date or date range filter for complete results.'
+      );
+    }
+    if (rawGuestName && !useSingleDate && !useDateRange) {
+      warnings.push(
+        'guest_name search is performed in-memory and is bounded by the ' +
         '500-document fetch cap. Add a business_date or date range filter for complete results.'
       );
     }

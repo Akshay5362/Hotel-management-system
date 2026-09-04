@@ -88,13 +88,33 @@ let prematureExitError = null;
  *    - If the PID belongs to an HPMS process (HPMS.exe or contains server.js), terminates it safely.
  *    - If the PID belongs to another unrelated application, DOES NOT kill it and throws a descriptive error.
  */
+// A single 1.5s health-check attempt can race a cold Docker start: on boot,
+// the hotel_pms_backend container may still be starting when Electron
+// launches, so one quick check can wrongly conclude the port is free —
+// leading the embedded backend to spawn and immediately lose an EADDRINUSE
+// race once Docker finishes binding the port. Retrying the health check a
+// few times over a short window (bounded, not an arbitrary long delay) gives
+// Docker room to come up before falling through to the port-ownership
+// inspection / embedded-backend fallback below.
+const PORT_HEALTH_RETRY_ATTEMPTS   = 5;
+const PORT_HEALTH_RETRY_DELAY_MS   = 1000;
+const PORT_HEALTH_CHECK_TIMEOUT_MS = 1500;
+
 async function inspectAndHandlePortConflict(port = 5000) {
   blog('PORT', `Inspecting port ${port} status...`);
-  const isHealthy = await checkHealthOnce(port, 1500);
-  if (isHealthy) {
-    blog('PORT', `✓ Existing healthy HPMS backend detected on port ${port}. Reusing instance.`);
-    return { canReuse: true };
+
+  for (let attempt = 1; attempt <= PORT_HEALTH_RETRY_ATTEMPTS; attempt++) {
+    const isHealthy = await checkHealthOnce(port, PORT_HEALTH_CHECK_TIMEOUT_MS);
+    if (isHealthy) {
+      blog('PORT', `✓ Existing healthy HPMS backend detected on port ${port} (attempt ${attempt}/${PORT_HEALTH_RETRY_ATTEMPTS}). Reusing instance.`);
+      return { canReuse: true };
+    }
+    if (attempt < PORT_HEALTH_RETRY_ATTEMPTS) {
+      blog('PORT', `Port ${port} not healthy yet (attempt ${attempt}/${PORT_HEALTH_RETRY_ATTEMPTS}) — retrying in ${PORT_HEALTH_RETRY_DELAY_MS}ms (allowing for a cold Docker start)...`);
+      await new Promise((resolve) => setTimeout(resolve, PORT_HEALTH_RETRY_DELAY_MS));
+    }
   }
+  blog('PORT', `Port ${port} did not become healthy after ${PORT_HEALTH_RETRY_ATTEMPTS} attempts — proceeding to port-ownership inspection.`);
 
   if (process.platform !== 'win32') {
     return { canReuse: false };
@@ -354,9 +374,16 @@ export async function launchBackend(appRoot) {
   blog('NODE', `useRunAsNode     : ${nodeConfig.useRunAsNode}`);
 
   // 4. Build Clean Production Environment
+  // HPMS_ENV is set explicitly here (not merely inherited via ...process.env)
+  // because launchBackend() is only ever invoked for the packaged/production
+  // Electron path (SPAWNS_BACKEND is true only for ELECTRON_MODE 'production',
+  // or an explicit SPAWNS_BACKEND=true override) — this guarantees the spawned
+  // backend always resolves to the production Firebase project (hpms-sky5)
+  // regardless of whatever HPMS_ENV happened to be in the parent process.
   const env = {
     ...process.env,
     NODE_ENV: 'production',
+    HPMS_ENV: 'production',
     PORT: '5000',
   };
 

@@ -3,7 +3,14 @@ import { normalizeUserRole } from './authController.js';
 
 export const getHousekeepingRooms = async (req, res) => {
   try {
-    const rows = await HousekeepingCutoverService.getHousekeepingRooms();
+    // L2: scope the result server-side for a housekeeper (cleaner) caller —
+    // previously every role received the full hotel room list and the
+    // frontend filtered to "my rooms" client-side only.
+    const rows = await HousekeepingCutoverService.getHousekeepingRooms({
+      role: normalizeUserRole(req.user),
+      uid: req.user?.uid,
+      id: req.user?.id
+    });
     res.json(rows);
   } catch (error) {
     console.error('Error fetching housekeeping rooms:', error);
@@ -46,7 +53,7 @@ export const assignHousekeeper = async (req, res) => {
 export const updateHousekeepingStatus = async (req, res) => {
   const { roomId, status, notes } = req.body;
   const performedBy = req.user?.id || null;
-  
+
   if (!roomId || !status) return res.status(400).json({ error: 'Room ID and status are required' });
 
   try {
@@ -55,11 +62,16 @@ export const updateHousekeepingStatus = async (req, res) => {
       status,
       notes,
       performedBy,
-      io: req.app.get('io')
+      io: req.app.get('io'),
+      // L1: the service enforces that a 'housekeeper' caller may only
+      // update a room currently assigned to them (403 otherwise).
+      // Admin/receptionist are unrestricted.
+      caller: req.user
     });
     res.json(result);
   } catch (error) {
     if (error.status === 404) return res.status(404).json({ error: 'Room not found' });
+    if (error.status === 403) return res.status(403).json({ error: error.message, code: error.code });
     console.error('Error updating status:', error);
     res.status(500).json({ error: 'Failed to update status' });
   }

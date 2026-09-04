@@ -1,12 +1,13 @@
-import dotenv from 'dotenv';
+// MUST be the first import in this file — see backend/config/loadEnv.js for
+// why import order (not source-line order relative to this file's own code)
+// is what determines whether the correct .env* file wins.
+import './config/loadEnv.js';
+
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Ensure backend .env is loaded immediately
-dotenv.config({ path: path.join(__dirname, '.env') });
 
 import express from 'express';
 import cors from 'cors';

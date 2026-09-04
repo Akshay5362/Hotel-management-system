@@ -54,8 +54,20 @@ function isKitchenRole(user) {
   return isStaffUser && ['CHEF', 'KITCHEN_HELPER', 'PANTRY_BOY', 'KITCHEN'].includes(rawRole);
 }
 
+// Same mirroring pattern as isKitchenRole() above — Reception is now the
+// sole authorized actor for the READY -> OUT_FOR_DELIVERY handoff. The
+// backend (updateFoodOrderStatus) re-derives and enforces this independently
+// via normalizeUserRole(); this only decides which controls this screen
+// renders for a Reception viewer.
+function isReceptionRole(user) {
+  const isStaffUser = user?.type === 'staff' || user?.user_type === 'staff';
+  const rawRole = String(user?.role || '').toUpperCase().trim();
+  return isStaffUser && rawRole === 'RECEPTIONIST';
+}
+
 export default function FoodKitchenDisplay({ token, user }) {
   const isKitchenUser = isKitchenRole(user);
+  const isReceptionUser = isReceptionRole(user);
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -63,6 +75,8 @@ export default function FoodKitchenDisplay({ token, user }) {
   const [selectedOrderId, setSelectedOrderId] = useState(null);
   const [updatingId, setUpdatingId] = useState(null);
   const [now, setNow] = useState(Date.now());
+  // order_id -> { changes, ts } for orders modified since kitchen last acknowledged
+  const [modifiedBanners, setModifiedBanners] = useState({});
 
   const socketRef = useRef(null);
 
@@ -130,6 +144,15 @@ export default function FoodKitchenDisplay({ token, user }) {
       }
     });
 
+    // Event 3: An already-placed order's items changed (KOT Modification) —
+    // re-fetch server-authoritative data and flag the card so kitchen sees
+    // exactly what changed, without comparing two full order screens.
+    socket.on('food:order_modified', ({ order_id, changes }) => {
+      console.log('[KDS] Received food:order_modified:', order_id, changes);
+      setModifiedBanners(prev => ({ ...prev, [order_id]: { changes: changes || [], ts: Date.now() } }));
+      fetchActiveQueue();
+    });
+
     return () => {
       socket.disconnect();
     };
@@ -174,7 +197,7 @@ export default function FoodKitchenDisplay({ token, user }) {
 
       if (e.key === '1' && targetOrder.order_status === 'PLACED') {
         handleTransition(selectedOrderId, 'RECEIVED');
-      } else if (e.key === '2' && ['PLACED', 'RECEIVED'].includes(targetOrder.order_status)) {
+      } else if (e.key === '2' && targetOrder.order_status === 'RECEIVED') {
         handleTransition(selectedOrderId, 'PREPARING');
       } else if (e.key === '3' && targetOrder.order_status === 'PREPARING') {
         handleTransition(selectedOrderId, 'READY');
@@ -184,6 +207,16 @@ export default function FoodKitchenDisplay({ token, user }) {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isKitchenUser, selectedOrderId, orders]);
+
+  // Dismiss the "KOT Modified" banner on a card — purely a local UI
+  // acknowledgment, no write; the kitchen lifecycle itself is unaffected.
+  const dismissBanner = (orderId) => {
+    setModifiedBanners(prev => {
+      const next = { ...prev };
+      delete next[orderId];
+      return next;
+    });
+  };
 
   // Filter columns
   const receivedOrders = orders.filter(o => ['PLACED', 'RECEIVED'].includes(o.order_status));
@@ -307,6 +340,9 @@ export default function FoodKitchenDisplay({ token, user }) {
           updatingId={updatingId}
           actionType="START_PREPARING"
           isKitchenUser={isKitchenUser}
+          isReceptionUser={isReceptionUser}
+          modifiedBanners={modifiedBanners}
+          onDismissBanner={dismissBanner}
         />
 
         {/* COLUMN 2: PREPARING */}
@@ -320,6 +356,9 @@ export default function FoodKitchenDisplay({ token, user }) {
           updatingId={updatingId}
           actionType="MARK_READY"
           isKitchenUser={isKitchenUser}
+          isReceptionUser={isReceptionUser}
+          modifiedBanners={modifiedBanners}
+          onDismissBanner={dismissBanner}
         />
 
         {/* COLUMN 3: READY */}
@@ -333,13 +372,16 @@ export default function FoodKitchenDisplay({ token, user }) {
           updatingId={updatingId}
           actionType="DISPATCH"
           isKitchenUser={isKitchenUser}
+          isReceptionUser={isReceptionUser}
+          modifiedBanners={modifiedBanners}
+          onDismissBanner={dismissBanner}
         />
       </div>
     </div>
   );
 }
 
-function KDSColumn({ title, color, orders, selectedOrderId, onSelectOrder, onTransition, updatingId, actionType, isKitchenUser }) {
+function KDSColumn({ title, color, orders, selectedOrderId, onSelectOrder, onTransition, updatingId, actionType, isKitchenUser, isReceptionUser, modifiedBanners, onDismissBanner }) {
   return (
     <div style={{
       background: 'rgba(15, 23, 42, 0.6)',
@@ -390,6 +432,9 @@ function KDSColumn({ title, color, orders, selectedOrderId, onSelectOrder, onTra
               isUpdating={updatingId === order.order_id}
               actionType={actionType}
               isKitchenUser={isKitchenUser}
+              isReceptionUser={isReceptionUser}
+              modifiedBanner={modifiedBanners?.[order.order_id]}
+              onDismissBanner={onDismissBanner}
             />
           ))
         )}
@@ -398,7 +443,7 @@ function KDSColumn({ title, color, orders, selectedOrderId, onSelectOrder, onTra
   );
 }
 
-function KDSCard({ order, isSelected, onSelect, onTransition, isUpdating, actionType, isKitchenUser }) {
+function KDSCard({ order, isSelected, onSelect, onTransition, isUpdating, actionType, isKitchenUser, isReceptionUser, modifiedBanner, onDismissBanner }) {
   const elapsedMin = getElapsedMinutes(order.created_at);
 
   // Urgency colors
@@ -431,6 +476,54 @@ function KDSCard({ order, isSelected, onSelect, onTransition, isUpdating, action
         transition: 'all 0.15s ease'
       }}
     >
+      {/* KOT Modified banner — shown to everyone viewing the board until
+          dismissed; dismissing is local-only, it never touches the order. */}
+      {modifiedBanner && (
+        <div style={{
+          background: 'rgba(251,191,36,0.12)',
+          border: '1px solid rgba(251,191,36,0.4)',
+          borderRadius: '8px',
+          padding: '8px 10px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '4px'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.78rem', fontWeight: '800', color: '#fbbf24' }}>
+            <AlertTriangle size={13} /> KOT MODIFIED
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+            {(modifiedBanner.changes || []).map((c, idx) => (
+              <span key={idx} style={{
+                fontSize: '0.76rem',
+                fontWeight: '600',
+                color: c.type === 'ADDED' ? '#4ade80' : c.type === 'REMOVED' ? '#f87171' : '#fbbf24'
+              }}>
+                {c.type === 'ADDED' && `+ ${c.item_name} × ${c.new_qty}`}
+                {c.type === 'REMOVED' && `− ${c.item_name} × ${c.prev_qty}`}
+                {c.type === 'QTY_CHANGED' && `${c.item_name} ${c.prev_qty} → ${c.new_qty}`}
+              </span>
+            ))}
+          </div>
+          <button
+            onClick={(e) => { e.stopPropagation(); onDismissBanner?.(order.order_id); }}
+            style={{
+              alignSelf: 'flex-start',
+              marginTop: '2px',
+              padding: '3px 10px',
+              background: 'rgba(251,191,36,0.15)',
+              border: '1px solid rgba(251,191,36,0.4)',
+              borderRadius: '5px',
+              color: '#fbbf24',
+              fontWeight: '700',
+              fontSize: '0.7rem',
+              cursor: 'pointer'
+            }}
+          >
+            Got it
+          </button>
+        </div>
+      )}
+
       {/* Top Card Row */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div>
@@ -508,25 +601,16 @@ function KDSCard({ order, isSelected, onSelect, onTransition, isUpdating, action
         <span>Items: {order.items?.length || 0}</span>
       </div>
 
-      {/* Action Buttons — Kitchen/Chef only. Reception/Admin get a monitoring
-          summary instead; the write path lives only behind isKitchenUser. */}
-      {!isKitchenUser ? (
-        <div style={{ paddingTop: '10px', borderTop: '1px solid rgba(255,255,255,0.06)', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-          {order.destination_type === 'ROOM' && order.guest_name && (
-            <div style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.5)' }}>
-              Guest: <strong style={{ color: '#fff' }}>{order.guest_name}</strong>
-            </div>
-          )}
-          <div style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.5)' }}>
-            Created: <strong style={{ color: '#fff' }}>{formatTime(order.created_at)}</strong>
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', marginTop: '2px' }}>
-            <KitchenMilestone label="Kitchen Received" done={!!order.kitchen_received_at} />
-            <KitchenMilestone label="Preparing" done={!!order.kitchen_preparing_at} />
-            <KitchenMilestone label="Ready" done={!!order.kitchen_ready_at} />
-          </div>
-        </div>
-      ) : (
+      {/* Action area — role and column dependent:
+          - Kitchen: preparation-stage buttons only (Receive/Start Preparing,
+            Mark Ready). Kitchen is never shown a dispatch action here —
+            Reception is the sole authorized actor for READY -> OUT_FOR_DELIVERY
+            (backend-enforced independently in updateFoodOrderStatus).
+          - Reception on a READY-column card: monitoring context plus the
+            "Mark Out for Delivery" action.
+          - Everyone else (Admin always; Reception on non-READY columns):
+            read-only monitoring summary, no button. */}
+      {isKitchenUser ? (
       <div style={{ paddingTop: '6px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
         {actionType === 'START_PREPARING' && (
           <div style={{ display: 'flex', gap: '6px' }}>
@@ -549,27 +633,29 @@ function KDSCard({ order, isSelected, onSelect, onTransition, isUpdating, action
                 Acknowledge
               </button>
             )}
-            <button
-              onClick={(e) => { e.stopPropagation(); onTransition(order.order_id, 'PREPARING'); }}
-              disabled={isUpdating}
-              style={{
-                flex: 1,
-                padding: '8px',
-                background: 'linear-gradient(135deg, #f59e0b, #d97706)',
-                border: 'none',
-                borderRadius: '6px',
-                color: '#fff',
-                fontWeight: '800',
-                fontSize: '0.82rem',
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '4px'
-              }}
-            >
-              <Flame size={14} /> Start Preparing
-            </button>
+            {order.order_status === 'RECEIVED' && (
+              <button
+                onClick={(e) => { e.stopPropagation(); onTransition(order.order_id, 'PREPARING'); }}
+                disabled={isUpdating}
+                style={{
+                  flex: 1,
+                  padding: '8px',
+                  background: 'linear-gradient(135deg, #f59e0b, #d97706)',
+                  border: 'none',
+                  borderRadius: '6px',
+                  color: '#fff',
+                  fontWeight: '800',
+                  fontSize: '0.82rem',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '4px'
+                }}
+              >
+                <Flame size={14} /> Start Preparing
+              </button>
+            )}
           </div>
         )}
 
@@ -596,31 +682,52 @@ function KDSCard({ order, isSelected, onSelect, onTransition, isUpdating, action
             <CheckCircle size={16} /> Mark Order Ready (Notify Front Desk)
           </button>
         )}
-
-        {actionType === 'DISPATCH' && (
-          <button
-            onClick={(e) => { e.stopPropagation(); onTransition(order.order_id, 'OUT_FOR_DELIVERY'); }}
-            disabled={isUpdating}
-            style={{
-              width: '100%',
-              padding: '8px',
-              background: 'rgba(52,211,153,0.15)',
-              border: '1px solid #34d399',
-              borderRadius: '6px',
-              color: '#34d399',
-              fontWeight: '700',
-              fontSize: '0.8rem',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              gap: '4px'
-            }}
-          >
-            <ArrowRight size={14} /> Handed to Server ({order.waiter_name || 'Staff'})
-          </button>
-        )}
+        {/* No DISPATCH branch here — Kitchen is not authorized for
+            READY -> OUT_FOR_DELIVERY; that action only ever renders for
+            Reception, below. */}
       </div>
+      ) : (
+        <div style={{ paddingTop: '10px', borderTop: '1px solid rgba(255,255,255,0.06)', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          {order.destination_type === 'ROOM' && order.guest_name && (
+            <div style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.5)' }}>
+              Guest: <strong style={{ color: '#fff' }}>{order.guest_name}</strong>
+            </div>
+          )}
+          <div style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.5)' }}>
+            Created: <strong style={{ color: '#fff' }}>{formatTime(order.created_at)}</strong>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', marginTop: '2px' }}>
+            <KitchenMilestone label="Kitchen Received" done={!!order.kitchen_received_at} />
+            <KitchenMilestone label="Preparing" done={!!order.kitchen_preparing_at} />
+            <KitchenMilestone label="Ready" done={!!order.kitchen_ready_at} />
+          </div>
+
+          {/* Reception-only: the sole authorized handoff action, READY column only. */}
+          {isReceptionUser && actionType === 'DISPATCH' && (
+            <button
+              onClick={(e) => { e.stopPropagation(); onTransition(order.order_id, 'OUT_FOR_DELIVERY'); }}
+              disabled={isUpdating}
+              style={{
+                marginTop: '4px',
+                width: '100%',
+                padding: '8px',
+                background: 'rgba(52,211,153,0.15)',
+                border: '1px solid #34d399',
+                borderRadius: '6px',
+                color: '#34d399',
+                fontWeight: '700',
+                fontSize: '0.8rem',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '4px'
+              }}
+            >
+              <ArrowRight size={14} /> Mark Out for Delivery
+            </button>
+          )}
+        </div>
       )}
     </div>
   );
