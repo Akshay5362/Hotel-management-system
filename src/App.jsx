@@ -18,6 +18,9 @@ import AnalyticsModal from './components/AnalyticsModal';
 import SettingsModal from './components/SettingsModal';
 import { AdminAuthProvider, AdminAuthContext } from './contexts/AdminAuthContext';
 import { GuestAuthProvider, GuestAuthContext } from './contexts/GuestAuthContext';
+import { NotificationProvider, NotificationContext } from './contexts/NotificationContext';
+import NotificationBell from './components/NotificationBell';
+import NotificationToasts from './components/NotificationToasts';
 import { AdminProtectedRoute, GuestProtectedRoute, RoleProtectedRoute } from './components/ProtectedRoutes';
 import { ReceptionDashboard, PantryDashboard } from './components/StaffDashboards';
 import KitchenDashboard from './components/KitchenDashboard';
@@ -155,6 +158,16 @@ import ReservationModule from './components/ReservationModule.jsx';
 
 function AppContent() {
   const [adminTab, setAdminTab] = useState('frontdesk');
+
+  // Notification click → switch the admin workspace to the Food & Beverage
+  // tab; FoodPOS then consumes the intent to open the requested sub-tab (KDS).
+  const notificationCtx = React.useContext(NotificationContext);
+  const notificationNavIntent = notificationCtx?.navigationIntent || null;
+  useEffect(() => {
+    if (notificationNavIntent && notificationNavIntent.module === 'food') {
+      setAdminTab('food');
+    }
+  }, [notificationNavIntent]);
   const [rooms, setRooms] = useState([]);
   const [filter, setFilter] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -523,12 +536,10 @@ function AppContent() {
       document.dispatchEvent(new CustomEvent('guest-request-refresh'));
     });
 
-    socket.on('food:order_ready', (data) => {
-      if (data && data.order_number) {
-        const dest = data.destination_type === 'ROOM' ? `Room ${data.room_number}` : (data.table_name || 'Restaurant');
-        showAlert(`Food Order ${data.order_number} is READY for dispatch to ${dest} (Server: ${data.waiter_name || 'Staff'})`, 'Kitchen Alert — Order Ready');
-      }
-    });
+    // NOTE: 'food:order_ready' is now handled app-wide by NotificationProvider
+    // (src/contexts/NotificationContext.jsx) as a non-blocking toast + bell
+    // entry for Admin and Reception — the former blocking showAlert here was
+    // removed so Admin does not get a duplicate modal on top of the toast.
 
     return () => {
       if (fallbackInterval) clearInterval(fallbackInterval);
@@ -1320,6 +1331,7 @@ function AppContent() {
                   ? `Synced ${Math.round((Date.now() - lastSynced) / 1000)}s ago`
                   : 'Connecting...'}
               </div>
+              <NotificationBell />
               <div className="user-badge" data-tooltip={isBackendOnline ? "System Sync Active (MySQL Connected)" : "Demo Mode (MySQL Disconnected)"}>
                 <span className="user-indicator" style={{ background: isBackendOnline ? 'var(--color-booked)' : 'var(--color-occupied)', boxShadow: isBackendOnline ? '0 0 8px var(--color-booked)' : '0 0 8px var(--color-occupied)' }}></span>
                 <span style={{ fontSize: '0.8rem', fontWeight: '600' }}>
@@ -1641,9 +1653,13 @@ function AppContent() {
 export default function App() {
   return (
     <AdminAuthProvider>
-      <GuestAuthProvider>
-        <AppContent />
-      </GuestAuthProvider>
+      <NotificationProvider>
+        <GuestAuthProvider>
+          <AppContent />
+          {/* App-wide, non-blocking real-time toasts (Admin / Reception recipients only) */}
+          <NotificationToasts />
+        </GuestAuthProvider>
+      </NotificationProvider>
     </AdminAuthProvider>
   );
 }

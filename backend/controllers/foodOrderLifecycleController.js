@@ -345,7 +345,14 @@ export async function updateFoodOrderStatus(req, res) {
         destination_type: orderDoc.destination_type,
         room_number:      orderDoc.room_number,
         table_name:       orderDoc.table_name,
-        waiter_name:      orderDoc.waiter_name
+        waiter_name:      orderDoc.waiter_name,
+        // Additive, display-only fields for the dashboard notification layer.
+        // Name + quantity only — no prices, payment, or identity data.
+        guest_name:       orderDoc.guest_name || null,
+        items:            (orderDoc.items || []).map(it => ({
+          item_name: it.item_name,
+          quantity:  it.quantity
+        }))
       };
     });
 
@@ -366,7 +373,10 @@ export async function updateFoodOrderStatus(req, res) {
         destination_type: resultPayload.destination_type,
         room_number:      resultPayload.room_number,
         table_name:       resultPayload.table_name,
-        waiter_name:      resultPayload.waiter_name
+        waiter_name:      resultPayload.waiter_name,
+        // Additive fields (dashboard notifications). Existing consumers unaffected.
+        guest_name:       resultPayload.guest_name,
+        items:            resultPayload.items
       });
     }
 

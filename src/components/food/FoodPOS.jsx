@@ -13,7 +13,8 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { useNotifications } from '../../contexts/NotificationContext';
 import { UtensilsCrossed, BookOpen, ShoppingCart, ClipboardEdit, ClipboardList, Layers, Gift, ChefHat, BarChart3, Users } from 'lucide-react';
 import FoodMenuManager from './FoodMenuManager';
 import FoodNewOrder from './FoodNewOrder';
@@ -137,6 +138,20 @@ export default function FoodPOS({ token, user }) {
   const visibleTabs = TABS.filter(tab => tab.roles.includes(foodRole));
   const [activeTab, setActiveTab] = useState(() => foodRole === 'receptionist' ? 'orders' : 'menu');
   const [hoveredTab, setHoveredTab] = useState(null);
+
+  // Notification click → open the requested Food sub-tab (e.g. 'kds').
+  // The intent is set by NotificationContext; the host dashboard switches to
+  // its Food tab, then this consumes (and clears) the intent. Only tabs this
+  // role can already see are honoured — no new access is granted here.
+  const notificationCtx = useNotifications();
+  const navigationIntent = notificationCtx?.navigationIntent || null;
+  const clearNavigationIntent = notificationCtx?.clearNavigationIntent;
+  useEffect(() => {
+    if (!navigationIntent || navigationIntent.module !== 'food') return;
+    const allowed = TABS.some(t => t.key === navigationIntent.tab && t.roles.includes(foodRole));
+    if (allowed) setActiveTab(navigationIntent.tab);
+    if (clearNavigationIntent) clearNavigationIntent();
+  }, [navigationIntent, clearNavigationIntent, foodRole]);
 
   return (
     <div style={{

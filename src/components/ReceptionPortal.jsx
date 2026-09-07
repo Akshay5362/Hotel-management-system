@@ -28,6 +28,8 @@
  */
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import NotificationBell from './NotificationBell';
+import { useNotifications } from '../contexts/NotificationContext';
 import { AdminAuthContext } from '../contexts/AdminAuthContext';
 import ReservationModule from './ReservationModule';
 import LedgerPanel from './LedgerPanel';
@@ -1649,6 +1651,16 @@ export default function ReceptionPortal() {
   const { adminUser, adminToken, logout } = React.useContext(AdminAuthContext);
   const time = useTime();
   const [activeTab, setActiveTab] = useState('frontdesk');
+
+  // Notification click → switch to the Food & Beverage tab; FoodPOS then
+  // consumes the intent to open the requested sub-tab (e.g. KDS).
+  const notificationCtx = useNotifications();
+  const navigationIntent = notificationCtx?.navigationIntent || null;
+  useEffect(() => {
+    if (navigationIntent && navigationIntent.module === 'food') {
+      setActiveTab('food');
+    }
+  }, [navigationIntent]);
   const [rooms, setRooms] = useState([]);
   const [reservations, setReservations] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -1844,6 +1856,7 @@ export default function ReceptionPortal() {
                 Syncing...
               </div>
             )}
+            <NotificationBell />
             <div className="user-badge">
               <span className="user-indicator" style={{ background: '#38bdf8', boxShadow: '0 0 8px #38bdf8' }} />
               <span style={{ fontSize: '0.8rem', fontWeight: 600 }}>{(adminUser?.fullName || adminUser?.full_name || '').toUpperCase()}</span>
