@@ -32,6 +32,82 @@
  */
 
 import { app } from 'electron';
+import fs from 'fs';
+import path from 'path';
+
+// ─── Backend mode + runtime API configuration ────────────────────────────────
+//
+//  BACKEND_MODE
+//    central  → Electron connects to a central HPMS backend on the hotel LAN.
+//               It NEVER spawns a local backend and NEVER probes/kills :5000.
+//    local    → existing behaviour: local/Docker/embedded backend on :5000.
+//
+//  The mode is derived from a runtime configuration file (never from source):
+//    1. <userData>/hpms-config.json           (per Windows user / per PC)
+//    2. <machineConfigDir>/hpms-config.json   (machine-wide, e.g. %ProgramData%\HPMS)
+//    3. VITE_API_BASE_URL in the process environment (local mode)
+//    4. DEFAULT_LOCAL_API_BASE                (local mode)
+//
+//  File format (deployment-time value, never hardcoded here):
+//    { "apiBaseUrl": "http://<CENTRAL-SERVER>:5000" }
+//    optional: "backendMode": "central" | "local"   (default: "central" when
+//              apiBaseUrl is present)
+//
+export const BACKEND_MODES = Object.freeze({ CENTRAL: 'central', LOCAL: 'local' });
+export const RUNTIME_CONFIG_FILENAME = 'hpms-config.json';
+export const DEFAULT_LOCAL_API_BASE = 'http://127.0.0.1:5000';
+
+/** Accepts only absolute http(s) origins/bases; returns the normalized base (no trailing slash) or null. */
+export function normalizeApiBase(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().replace(/\/+$/, '');
+  if (!/^https?:\/\/[^\s/]+/i.test(trimmed)) return null;
+  try { new URL(trimmed); } catch { return null; }
+  return trimmed;
+}
+
+function readJsonFile(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return null;
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the runtime backend configuration. Pure: no Electron state, no
+ * network, no writes. Safe to call before app.whenReady() as long as the
+ * directories are passed in.
+ *
+ * @returns {{ apiBaseUrl: string, backendMode: 'central'|'local', source: string, configPath: string|null }}
+ */
+export function resolveRuntimeConfig({ userDataDir = null, machineConfigDir = null, env = process.env } = {}) {
+  const candidates = [
+    { source: 'userData', dir: userDataDir },
+    { source: 'machine',  dir: machineConfigDir },
+  ];
+
+  for (const { source, dir } of candidates) {
+    if (!dir) continue;
+    const configPath = path.join(dir, RUNTIME_CONFIG_FILENAME);
+    const cfg = readJsonFile(configPath);
+    if (!cfg) continue;
+    const apiBaseUrl = normalizeApiBase(cfg.apiBaseUrl);
+    if (!apiBaseUrl) continue; // present but invalid → ignore this file, keep looking
+    const backendMode = cfg.backendMode === BACKEND_MODES.LOCAL ? BACKEND_MODES.LOCAL : BACKEND_MODES.CENTRAL;
+    return { apiBaseUrl, backendMode, source: `${source}:${configPath}`, configPath };
+  }
+
+  const envBase = normalizeApiBase(env.VITE_API_BASE_URL);
+  return {
+    apiBaseUrl:  envBase || DEFAULT_LOCAL_API_BASE,
+    backendMode: BACKEND_MODES.LOCAL,
+    source:      envBase ? 'env:VITE_API_BASE_URL' : 'default',
+    configPath:  null,
+  };
+}
 
 // ─── Mode detection ───────────────────────────────────────────────────────────
 // In packaged mode (app.isPackaged === true), ALWAYS force 'production'.

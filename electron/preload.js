@@ -37,6 +37,35 @@
 
 import { contextBridge, ipcRenderer } from 'electron';
 
+// ─── Runtime backend configuration (central-backend support) ─────────────────
+// main.js passes the resolved API base to this renderer via
+// webPreferences.additionalArguments ONLY when running in central mode. The
+// value is read synchronously here so window.HPMS_RUNTIME exists BEFORE any
+// renderer module (src/config/apiConfig.js) evaluates — no async race.
+// In local/DEV mode no argument is passed and apiBaseUrl stays null, so the
+// renderer keeps using its build-time / .env value exactly as before.
+
+function readArg(prefix) {
+  const hit = process.argv.find((a) => typeof a === 'string' && a.startsWith(prefix));
+  return hit ? hit.slice(prefix.length) : null;
+}
+
+function safeHttpBase(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().replace(/\/+$/, '');
+  if (!/^https?:\/\/[^\s/]+/i.test(trimmed)) return null;
+  try { new URL(trimmed); } catch { return null; }
+  return trimmed;
+}
+
+const runtimeApiBaseUrl  = safeHttpBase(readArg('--hpms-api-base='));
+const runtimeBackendMode = readArg('--hpms-backend-mode=') === 'central' && runtimeApiBaseUrl ? 'central' : 'local';
+
+contextBridge.exposeInMainWorld('HPMS_RUNTIME', Object.freeze({
+  apiBaseUrl:  runtimeApiBaseUrl,   // string in central mode, null otherwise
+  backendMode: runtimeBackendMode,  // 'central' | 'local'
+}));
+
 // ─── Allowed IPC channels (whitelist) ────────────────────────────────────────
 // Only channels listed here can be used. The renderer cannot invent new channels.
 

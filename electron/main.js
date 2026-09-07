@@ -20,9 +20,11 @@ import { app, BrowserWindow, ipcMain, shell, Menu, dialog, screen } from 'electr
 import path   from 'path';
 import fs     from 'fs';
 import http   from 'http';
+import https  from 'https';
 import os     from 'os';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
+import { resolveRuntimeConfig, BACKEND_MODES, DEFAULT_LOCAL_API_BASE } from './config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
@@ -129,6 +131,45 @@ L('ENV', `ELECTRON_MODE  = ${ELECTRON_MODE}`);
 L('ENV', `USES_VITE      = ${USES_VITE}   (true → load http://localhost:5173)`);
 L('ENV', `SPAWNS_BACKEND = ${SPAWNS_BACKEND}  (true → Electron automatically spawns backend)`);
 
+// ─── Runtime backend configuration (central vs local) ────────────────────────
+// Resolved once in app.whenReady() via electron/config.js:
+//   central → connect to the configured API base; never spawn/probe :5000
+//   local   → existing behaviour above (SPAWNS_BACKEND / :5000) unchanged
+let RUNTIME = { apiBaseUrl: DEFAULT_LOCAL_API_BASE, backendMode: BACKEND_MODES.LOCAL, source: 'default', configPath: null };
+const isCentralMode = () => RUNTIME.backendMode === BACKEND_MODES.CENTRAL;
+
+function machineConfigDir() {
+  if (process.platform === 'win32') {
+    return process.env.ProgramData ? path.join(process.env.ProgramData, 'HPMS') : null;
+  }
+  return '/etc/hpms';
+}
+
+/** One GET <base>/api/health with a timeout; resolves true on HTTP 200 (no body assumptions). */
+function checkRemoteHealthOnce(apiBaseUrl, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    let url;
+    try { url = new URL('/api/health', apiBaseUrl); } catch { return resolve(false); }
+    const client = url.protocol === 'https:' ? https : http;
+    const req = client.get(url, { timeout: timeoutMs }, (res) => {
+      res.resume();
+      resolve(res.statusCode === 200);
+    });
+    req.on('timeout', () => { req.destroy(new Error('timeout')); });
+    req.on('error', () => resolve(false));
+  });
+}
+
+/** Poll the configured central backend until healthy or maxWaitMs elapses (central mode only). */
+async function waitForRemoteHealth(apiBaseUrl, maxWaitMs = 30000, intervalMs = 500) {
+  const started = Date.now();
+  while (Date.now() - started < maxWaitMs) {
+    if (await checkRemoteHealthOnce(apiBaseUrl)) return true;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error(`Central HPMS backend at ${apiBaseUrl} did not become healthy within ${maxWaitMs}ms`);
+}
+
 // ─── Path placeholders ────────────────────────────────────────────────────────
 const DEV_URL = 'http://localhost:5173';
 let PRELOAD_PATH, SPLASH_PATH, PROD_ENTRY;
@@ -223,8 +264,9 @@ if (ENABLE_LOCK) {
 app.on('before-quit', () => {
   L('QUIT', 'before-quit fired');
   if (killBackend) {
-    // Only kill the backend Electron itself spawned (production installer only)
-    try { if (SPAWNS_BACKEND) killBackend(); } catch (e) { LERR('QUIT', 'killBackend failed', e); }
+    // Only kill the backend Electron itself spawned (production installer only).
+    // In central mode nothing was spawned, so there is nothing to kill.
+    try { if (SPAWNS_BACKEND && !isCentralMode()) killBackend(); } catch (e) { LERR('QUIT', 'killBackend failed', e); }
   }
 });
 
@@ -299,9 +341,16 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
-      webSecurity: false,    // Required: file:// → localhost:5000 fetch
+      webSecurity: false,    // Required: file:// → backend fetch (localhost:5000 or central server)
       devTools: true,
       preload: PRELOAD_PATH,
+      // Central mode only: hand the resolved API base to preload.js synchronously
+      // (read from process.argv there) so window.HPMS_RUNTIME exists before any
+      // renderer module evaluates. Local/DEV mode passes nothing → renderer keeps
+      // its build-time / .env API base exactly as before.
+      additionalArguments: isCentralMode()
+        ? [`--hpms-api-base=${RUNTIME.apiBaseUrl}`, `--hpms-backend-mode=${RUNTIME.backendMode}`]
+        : [],
     },
   };
 
@@ -388,15 +437,22 @@ function createWindow() {
     });
   }
 
-  const targetApiBase = (process.env.VITE_API_BASE_URL || 'http://127.0.0.1:5000').replace(/\/+$/, '');
+  // Allowed origins: the existing local rules PLUS the exact origin of the
+  // resolved runtime API base (central server in central mode; the local
+  // default / VITE_API_BASE_URL otherwise). Exact-origin match — never a
+  // wildcard. Unknown targets still open externally, exactly as before.
+  const targetApiBase = RUNTIME.apiBaseUrl || (process.env.VITE_API_BASE_URL || DEFAULT_LOCAL_API_BASE).replace(/\/+$/, '');
+  let targetApiOrigin = null;
+  try { targetApiOrigin = new URL(targetApiBase).origin; } catch {}
   const isAllowedOrigin = (testUrl) => {
     if (!testUrl) return false;
     // Allow both localhost and 127.0.0.1 variants — macOS may resolve one or the other
     if (testUrl.startsWith('http://localhost:5000') || testUrl.startsWith('http://127.0.0.1:5000')) return true;
     if (testUrl.startsWith('http://localhost:5173') || testUrl.startsWith('http://127.0.0.1:5173')) return true;
-    if (testUrl.startsWith(targetApiBase)) return true;
     try {
-      const hostname = new URL(testUrl).hostname;
+      const parsed = new URL(testUrl);
+      if (targetApiOrigin && parsed.origin === targetApiOrigin) return true;
+      const hostname = parsed.hostname;
       if (hostname.endsWith('.ngrok-free.dev') || hostname.endsWith('.ngrok.io')) return true;
     } catch {}
     return false;
@@ -545,6 +601,25 @@ app.whenReady().then(async () => {
     return;
   }
 
+  // ── Runtime backend configuration (central vs local) ───────────────────────
+  // Read-only resolution of <userData>/hpms-config.json → machine-wide file →
+  // env → default. No file present = local mode = existing behaviour.
+  try {
+    RUNTIME = resolveRuntimeConfig({
+      userDataDir: app.getPath('userData'),
+      machineConfigDir: machineConfigDir(),
+    });
+  } catch (err) {
+    LERR('CONFIG', 'Runtime config resolution threw — falling back to local mode', err);
+    RUNTIME = { apiBaseUrl: DEFAULT_LOCAL_API_BASE, backendMode: BACKEND_MODES.LOCAL, source: 'default', configPath: null };
+  }
+  L('CONFIG', `BACKEND_MODE   = ${RUNTIME.backendMode}`);
+  L('CONFIG', `API_BASE_URL   = ${RUNTIME.apiBaseUrl}`);
+  L('CONFIG', `source         = ${RUNTIME.source}`);
+  if (isCentralMode()) {
+    L('CONFIG', 'central mode → local backend will NOT be spawned and :5000 will NOT be probed');
+  }
+
   // Load app-specific modules (dynamic, so failures are caught)
   await loadModules(APP_ROOT);
 
@@ -553,7 +628,7 @@ app.whenReady().then(async () => {
   try { createSplashWindow(); } catch (e) { LERR('SPLASH', 'createSplashWindow threw', e); }
 
   // ── Mode-specific startup — reads ELECTRON_MODE constants set at top of file ─
-  L('MODE', `Startup mode: ${ELECTRON_MODE}  USES_VITE=${USES_VITE}`);
+  L('MODE', `Startup mode: ${ELECTRON_MODE}  USES_VITE=${USES_VITE}  BACKEND_MODE=${RUNTIME.backendMode}`);
 
   if (USES_VITE) {
     // ── LOCAL / DOCKER-DEV: Vite dev server verification ─────────────────────
@@ -567,7 +642,11 @@ app.whenReady().then(async () => {
   }
 
   // ── Universal Backend Health Verification ──────────────────────────────────
-  if (SPAWNS_BACKEND && launchBackend) {
+  // central mode: never spawn a local backend, never touch :5000 (the
+  // backend-launcher's port inspection/kill-stale logic is not invoked at all).
+  if (isCentralMode()) {
+    L('BACKEND', `[central] Local backend spawn SKIPPED — using central backend at ${RUNTIME.apiBaseUrl}`);
+  } else if (SPAWNS_BACKEND && launchBackend) {
     L('BACKEND', `[${ELECTRON_MODE}] Spawning background backend process from ${APP_ROOT}...`);
     try {
       await launchBackend(APP_ROOT);
@@ -577,31 +656,38 @@ app.whenReady().then(async () => {
     }
   }
 
+  const backendLabel = isCentralMode() ? RUNTIME.apiBaseUrl : ':5000';
   let backendReady = false;
   while (!backendReady) {
-    L('BACKEND', `[${ELECTRON_MODE}] Verifying backend health on :5000...`);
+    L('BACKEND', `[${ELECTRON_MODE}] Verifying backend health on ${backendLabel}...`);
     try {
-      if (waitForBackend) {
+      if (isCentralMode()) {
+        await waitForRemoteHealth(RUNTIME.apiBaseUrl, 30000);
+      } else if (waitForBackend) {
         await waitForBackend(5000, 30000);
       }
-      L('BACKEND', 'Backend :5000 health confirmed ✓');
+      L('BACKEND', `Backend ${backendLabel} health confirmed ✓`);
       backendReady = true;
     } catch (err) {
       LERR('BACKEND', 'Backend health check failed', err);
       closeSplash();
 
       const backendLogPath = path.join(app.getPath('userData'), 'logs', 'backend.log');
-      const hint = SPAWNS_BACKEND
-        ? `The HPMS backend service could not be started automatically.\n\nBackend log:\n${backendLogPath}`
-        : (USES_VITE && ELECTRON_MODE === 'local'
-            ? 'Please run "npm run backend:dev" in a separate terminal.'
-            : 'Please ensure the HPMS backend service is running at http://localhost:5000.');
+      const hint = isCentralMode()
+        ? `Please ensure the central HPMS backend is reachable at ${RUNTIME.apiBaseUrl}\n(check the server, the network connection and the firewall).\n\nConfiguration source:\n${RUNTIME.source}`
+        : SPAWNS_BACKEND
+          ? `The HPMS backend service could not be started automatically.\n\nBackend log:\n${backendLogPath}`
+          : (USES_VITE && ELECTRON_MODE === 'local'
+              ? 'Please run "npm run backend:dev" in a separate terminal.'
+              : 'Please ensure the HPMS backend service is running at http://localhost:5000.');
 
       try {
         const { response } = await dialog.showMessageBox({
           type: 'error',
           title: 'HPMS Backend Unavailable',
-          message: 'Could not connect to the HPMS backend service on port 5000.',
+          message: isCentralMode()
+            ? `Could not connect to the central HPMS backend at ${RUNTIME.apiBaseUrl}.`
+            : 'Could not connect to the HPMS backend service on port 5000.',
           detail: `${hint}\n\nError details:\n${err.message}\n\nClick "Retry" once services are running, or "Exit" to close.`,
           buttons: ['Retry', 'Exit'],
           defaultId: 0,

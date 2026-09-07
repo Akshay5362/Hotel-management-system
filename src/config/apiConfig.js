@@ -7,11 +7,34 @@
  * (e.g. ngrok: https://quarters-frugality-revolving.ngrok-free.dev) cleanly.
  */
 
+// ─── Runtime override (Electron central-backend mode) ────────────────────────
+// electron/preload.js exposes window.HPMS_RUNTIME synchronously, BEFORE this
+// module evaluates, and sets apiBaseUrl only when Electron is running in
+// central mode (from hpms-config.json). In the browser (DEV on :5173) and in
+// Electron local mode it is null/undefined, so the existing build-time /
+// .env value below is used unchanged.
+function readRuntimeApiBase() {
+  try {
+    if (typeof window === 'undefined' || !window.HPMS_RUNTIME) return null;
+    const value = window.HPMS_RUNTIME.apiBaseUrl;
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim().replace(/\/+$/, '');
+    return /^https?:\/\/[^\s/]+/i.test(trimmed) ? trimmed : null;
+  } catch {
+    return null;
+  }
+}
+
+const runtimeApiUrl = readRuntimeApiBase();
+
 // Primary Backend Origin (No trailing slash)
-const envApiUrl = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_BASE_URL) 
+const envApiUrl = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_BASE_URL)
   || (typeof process !== 'undefined' && process.env && process.env.VITE_API_BASE_URL);
 
-export const API_BASE_URL = (envApiUrl || 'http://localhost:5000').replace(/\/+$/, '');
+export const API_BASE_URL = (runtimeApiUrl || envApiUrl || 'http://localhost:5000').replace(/\/+$/, '');
+
+/** Where API_BASE_URL came from: 'electron-runtime' | 'build-env' | 'default' (diagnostics only). */
+export const API_BASE_SOURCE = runtimeApiUrl ? 'electron-runtime' : (envApiUrl ? 'build-env' : 'default');
 
 
 // Express API Router Base URL
