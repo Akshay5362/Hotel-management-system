@@ -44,24 +44,6 @@
       "package.json",
       "!node_modules/**"
     ],
-    "extraResources": [
-      {
-        "from": "backend",
-        "to": "backend",
-        "filter": [
-          "**/*",
-          "!db_data/**",
-          "!tests/**",
-          "!scratch/**",
-          "!*.md",
-          "!test-data-cleanup-backup/**"
-        ]
-      },
-      {
-        "from": "backend/node_modules",
-        "to": "backend/node_modules"
-      }
-    ],
     "win": {
       "target": "nsis",
       "artifactName": "HPMS Setup ${version}.${ext}"
