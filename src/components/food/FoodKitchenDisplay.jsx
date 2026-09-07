@@ -18,9 +18,10 @@ import { io } from 'socket.io-client';
 import {
   Clock, Flame, CheckCircle, ChefHat, RefreshCw,
   AlertTriangle, Volume2, Wifi, WifiOff, ArrowRight,
-  Utensils, Hash, User, Home, Layers, Check
+  Utensils, Hash, User, Home, Layers, Check, Printer
 } from 'lucide-react';
 import { API_URL, SOCKET_URL, getApiHeaders } from '../../config/apiConfig';
+import FoodKOTView from './FoodKOTView';
 
 const COLUMNS = [
   { key: 'RECEIVED',  label: 'New & Received', color: '#38bdf8', icon: ChefHat },
@@ -74,6 +75,8 @@ export default function FoodKitchenDisplay({ token, user }) {
   const [connected, setConnected] = useState(false);
   const [selectedOrderId, setSelectedOrderId] = useState(null);
   const [updatingId, setUpdatingId] = useState(null);
+  // Manual KOT print — read-only preview of an order already on screen.
+  const [printOrder, setPrintOrder] = useState(null);
   const [now, setNow] = useState(Date.now());
   // order_id -> { changes, ts } for orders modified since kitchen last acknowledged
   const [modifiedBanners, setModifiedBanners] = useState({});
@@ -343,6 +346,7 @@ export default function FoodKitchenDisplay({ token, user }) {
           isReceptionUser={isReceptionUser}
           modifiedBanners={modifiedBanners}
           onDismissBanner={dismissBanner}
+          onPrint={setPrintOrder}
         />
 
         {/* COLUMN 2: PREPARING */}
@@ -359,6 +363,7 @@ export default function FoodKitchenDisplay({ token, user }) {
           isReceptionUser={isReceptionUser}
           modifiedBanners={modifiedBanners}
           onDismissBanner={dismissBanner}
+          onPrint={setPrintOrder}
         />
 
         {/* COLUMN 3: READY */}
@@ -375,13 +380,19 @@ export default function FoodKitchenDisplay({ token, user }) {
           isReceptionUser={isReceptionUser}
           modifiedBanners={modifiedBanners}
           onDismissBanner={dismissBanner}
+          onPrint={setPrintOrder}
         />
       </div>
+
+      {/* Manual KOT print preview — read-only, native window.print() */}
+      {printOrder && (
+        <FoodKOTView order={printOrder} onClose={() => setPrintOrder(null)} />
+      )}
     </div>
   );
 }
 
-function KDSColumn({ title, color, orders, selectedOrderId, onSelectOrder, onTransition, updatingId, actionType, isKitchenUser, isReceptionUser, modifiedBanners, onDismissBanner }) {
+function KDSColumn({ title, color, orders, selectedOrderId, onSelectOrder, onTransition, updatingId, actionType, isKitchenUser, isReceptionUser, modifiedBanners, onDismissBanner, onPrint }) {
   return (
     <div style={{
       background: 'rgba(15, 23, 42, 0.6)',
@@ -435,6 +446,7 @@ function KDSColumn({ title, color, orders, selectedOrderId, onSelectOrder, onTra
               isReceptionUser={isReceptionUser}
               modifiedBanner={modifiedBanners?.[order.order_id]}
               onDismissBanner={onDismissBanner}
+              onPrint={onPrint}
             />
           ))
         )}
@@ -443,8 +455,9 @@ function KDSColumn({ title, color, orders, selectedOrderId, onSelectOrder, onTra
   );
 }
 
-function KDSCard({ order, isSelected, onSelect, onTransition, isUpdating, actionType, isKitchenUser, isReceptionUser, modifiedBanner, onDismissBanner }) {
+function KDSCard({ order, isSelected, onSelect, onTransition, isUpdating, actionType, isKitchenUser, isReceptionUser, modifiedBanner, onDismissBanner, onPrint }) {
   const elapsedMin = getElapsedMinutes(order.created_at);
+  const canPrint = Array.isArray(order.items) && order.items.length > 0;
 
   // Urgency colors
   let urgencyBg = 'rgba(255,255,255,0.03)';
@@ -729,6 +742,33 @@ function KDSCard({ order, isSelected, onSelect, onTransition, isUpdating, action
           )}
         </div>
       )}
+
+      {/* Manual KOT print — independent, read-only action available to every
+          viewer of the card (kitchen and monitoring branches alike). Never
+          touches order status; existing transition buttons above are untouched. */}
+      <button
+        type="button"
+        onClick={(e) => { e.stopPropagation(); if (canPrint && onPrint) onPrint(order); }}
+        disabled={!canPrint}
+        title={canPrint ? 'Print Kitchen Order Ticket' : 'No items to print'}
+        style={{
+          width: '100%',
+          padding: '7px',
+          background: 'rgba(255,255,255,0.04)',
+          border: '1px solid rgba(255,255,255,0.14)',
+          borderRadius: '6px',
+          color: canPrint ? '#e2e8f0' : 'rgba(255,255,255,0.3)',
+          fontWeight: '700',
+          fontSize: '0.76rem',
+          cursor: canPrint ? 'pointer' : 'not-allowed',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: '6px'
+        }}
+      >
+        <Printer size={13} /> Print KOT
+      </button>
     </div>
   );
 }

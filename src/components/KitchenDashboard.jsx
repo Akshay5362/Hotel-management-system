@@ -32,10 +32,11 @@ import { io } from 'socket.io-client';
 import {
   Clock, Flame, CheckCircle, ChefHat, RefreshCw,
   AlertTriangle, Wifi, WifiOff, Inbox, Search, X,
-  Volume2, VolumeX, Bell, RotateCcw
+  Volume2, VolumeX, Bell, RotateCcw, Printer
 } from 'lucide-react';
 import { AdminAuthContext } from '../contexts/AdminAuthContext';
 import { API_URL, SOCKET_URL, getApiHeaders } from '../config/apiConfig';
+import FoodKOTView from './food/FoodKOTView';
 
 function getElapsedSeconds(isoString) {
   if (!isoString) return 0;
@@ -174,6 +175,8 @@ export default function KitchenDashboard() {
   const [, setNowTick] = useState(Date.now()); // forces elapsed-time re-render
   const [modifiedBanners, setModifiedBanners] = useState({});
   const [selectedOrderId, setSelectedOrderId] = useState(null);
+  // Manual KOT print — read-only preview of an order already on screen.
+  const [printOrder, setPrintOrder] = useState(null);
 
   // ── K2: search + filters (frontend-only; never mutates `orders`) ─────────
   const [search, setSearch] = useState('');
@@ -650,6 +653,7 @@ export default function KitchenDashboard() {
           onDismissBanner={dismissBanner}
           selectedOrderId={selectedOrderId}
           onSelectOrder={setSelectedOrderId}
+          onPrint={setPrintOrder}
         />
         <KitchenColumn
           title="Preparing"
@@ -664,6 +668,7 @@ export default function KitchenDashboard() {
           onDismissBanner={dismissBanner}
           selectedOrderId={selectedOrderId}
           onSelectOrder={setSelectedOrderId}
+          onPrint={setPrintOrder}
         />
         <KitchenColumn
           title="Ready"
@@ -678,8 +683,14 @@ export default function KitchenDashboard() {
           onDismissBanner={dismissBanner}
           selectedOrderId={selectedOrderId}
           onSelectOrder={setSelectedOrderId}
+          onPrint={setPrintOrder}
         />
       </div>
+
+      {/* Manual KOT print preview — read-only, native window.print() */}
+      {printOrder && (
+        <FoodKOTView order={printOrder} onClose={() => setPrintOrder(null)} />
+      )}
     </div>
   );
 }
@@ -720,7 +731,7 @@ function ConnectionPill({ state }) {
   );
 }
 
-function KitchenColumn({ title, color, orders, hasUnfiltered, emptyLabel, onTransition, updatingId, stage, modifiedBanners, onDismissBanner, selectedOrderId, onSelectOrder }) {
+function KitchenColumn({ title, color, orders, hasUnfiltered, emptyLabel, onTransition, updatingId, stage, modifiedBanners, onDismissBanner, selectedOrderId, onSelectOrder, onPrint }) {
   return (
     <div style={{
       background: 'rgba(15,23,42,0.6)', border: `1px solid ${color}33`,
@@ -761,6 +772,7 @@ function KitchenColumn({ title, color, orders, hasUnfiltered, emptyLabel, onTran
               onDismissBanner={onDismissBanner}
               isSelected={selectedOrderId === order.order_id}
               onSelect={() => onSelectOrder(order.order_id)}
+              onPrint={onPrint}
             />
           ))
         )}
@@ -776,8 +788,9 @@ const STATUS_BADGE = {
   READY:     { label: '🟢 READY',  color: '#34d399' }
 };
 
-function KitchenCard({ order, onTransition, isUpdating, stage, modifiedBanner, onDismissBanner, isSelected, onSelect }) {
+function KitchenCard({ order, onTransition, isUpdating, stage, modifiedBanner, onDismissBanner, isSelected, onSelect, onPrint }) {
   const isPlaced = order.order_status === 'PLACED';
+  const canPrint = Array.isArray(order.items) && order.items.length > 0;
   const waitingSec = getElapsedSeconds(isPlaced ? order.created_at : order.kitchen_received_at || order.created_at);
   const preparingSec = getElapsedSeconds(order.kitchen_preparing_at);
   const readyDurationSec = (order.kitchen_ready_at && order.kitchen_preparing_at)
@@ -941,6 +954,30 @@ function KitchenCard({ order, onTransition, isUpdating, stage, modifiedBanner, o
             onClick={() => onTransition(order.order_id, 'READY')}
           />
         )}
+
+        {/* Manual KOT print — secondary, independent, read-only. Rendered on
+            every stage BELOW the state-transition action; never replaces it
+            and never changes order status. */}
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); if (canPrint && onPrint) onPrint(order); }}
+          disabled={!canPrint}
+          title={canPrint ? 'Print Kitchen Order Ticket' : 'No items to print'}
+          style={{
+            marginTop: '8px',
+            width: '100%', padding: '10px',
+            background: 'rgba(255,255,255,0.04)',
+            border: '1px solid rgba(255,255,255,0.14)',
+            borderRadius: '10px',
+            color: canPrint ? '#e2e8f0' : 'rgba(255,255,255,0.3)',
+            fontWeight: '800', fontSize: '0.85rem',
+            cursor: canPrint ? 'pointer' : 'not-allowed',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
+            letterSpacing: '0.3px'
+          }}
+        >
+          <Printer size={16} /> PRINT KOT
+        </button>
       </div>
     </div>
   );
