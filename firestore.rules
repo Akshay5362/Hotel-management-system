@@ -130,15 +130,109 @@ service cloud.firestore {
     }
 
     match /inventory_categories/{categoryId} {
+      // Server-only writes. Categories are master data mutated exclusively
+      // through the Express API (Admin SDK), which enforces MANAGE-role
+      // authorization; a client SDK may only read.
       allow read: if isStaff();
-      allow create, delete: if isAdmin();
-      allow update: if isStaff();
+      allow write: if false;
     }
 
     match /inventory_products/{productId} {
+      // Server-only writes. Since Phase A this document carries the
+      // AUTHORITATIVE stock balance — current_stock, stock_by_location,
+      // stock_quantity and last_movement_at are written only by the
+      // transactional ledger core, paired with an inventory_stock_movements
+      // entry. A direct client write would move stock without a ledger row,
+      // so it is denied outright rather than restricted by role.
       allow read: if isStaff();
-      allow create, delete: if isAdmin();
-      allow update: if isStaff();
+      allow write: if false;
+    }
+
+    // Phase A additions. All Inventory writes go through the Express API using
+    // the Firebase Admin SDK, which is not subject to these rules — this block
+    // only bounds direct client-SDK access as defense in depth.
+    match /inventory_units/{unitId} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+
+    match /inventory_locations/{locationId} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+
+    match /inventory_suppliers/{supplierId} {
+      // Supplier contact details stay admin-only to READ, per Phase A scope;
+      // writes go through the API like every other master.
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /inventory_stock_movements/{movementId} {
+      // Append-only ledger: readable by staff, never writable from a client —
+      // every movement is written server-side inside a Firestore transaction.
+      allow read: if isStaff();
+      allow write: if false;
+    }
+
+    // Phase B — purchase requests. A request to BUY: never an order, a
+    // receipt, a stock change or a payment. Writes go exclusively through the
+    // Express API (Admin SDK), which enforces the DRAFT/PENDING_APPROVAL state
+    // machine and per-request ownership; a client SDK may only read.
+    match /purchase_requests/{requestId} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+
+    match /purchase_request_items/{requestItemId} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+
+    // Phase E — purchase orders. The formal document issued to a supplier:
+    // created from exactly one approved request, immutable once ISSUED, and it
+    // never changes stock. Writes go exclusively through the Express API
+    // (Admin SDK), which enforces the DRAFT→ISSUED machine and MANAGE-only
+    // authorization; a client SDK may only read.
+    match /purchase_orders/{orderId} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+
+    match /purchase_order_items/{orderItemId} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+
+    // Phase F — goods receipts. The only purchasing document accompanied by a
+    // real stock increase: the receipt, its lines, the purchase-order state and
+    // the stock ledger all commit in ONE server-side transaction. Receipts are
+    // immutable once written, so a client SDK may only read them.
+    match /goods_receipts/{receiptId} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+
+    match /goods_receipt_items/{receiptItemId} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+
+    // Phase G — goods receipt reversals. An immutable correction record
+    // proving who reversed which receipt, why, when, and which compensating
+    // stock movements cancelled it. The original receipt is never deleted or
+    // edited, so this collection is the only place a reversal is recorded —
+    // making it client-writable would let a client forge or erase a correction
+    // to the stock ledger. Server-only writes, exactly like the ledger itself.
+    match /goods_receipt_reversals/{reversalId} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+
+    // Document-number counters (PR-YYYYMMDD-NNNNNN). Server-only: a client
+    // must never be able to read or advance a sequence.
+    match /inventory_counters/{counterId} {
+      allow read, write: if false;
     }
 
     match /cash_logs/{logId} {

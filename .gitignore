@@ -89,3 +89,8 @@ backend/tests/output/
 
 
 .env.production
+
+# Inventory product photos — runtime upload directory (Phase A).
+# The directory is created on first upload and its contents are business
+# data, never source. Ignore the contents, not the feature.
+backend/inventory-photos/

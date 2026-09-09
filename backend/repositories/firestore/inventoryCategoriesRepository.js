@@ -1,3 +1,18 @@
+/**
+ * inventoryCategoriesRepository.js
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Firestore access for `inventory_categories`.
+ *
+ * Document id: cat_<name-slug> (unchanged from the original implementation so
+ * existing documents keep working).
+ * Fields (Phase A normalised):
+ *   name, department, description, is_active, mysql_category_id (legacy),
+ *   created_by, updated_by, created_at, updated_at
+ *
+ * Deactivation is the only "delete" offered through the API. A hard delete
+ * remains available for tooling but is never wired to a route.
+ */
+
 import {
   getDoc,
   listDocs,
@@ -38,23 +53,26 @@ export async function getInventoryCategoryByIdFirestore(catId, options = {}) {
 }
 
 export async function getAllInventoryCategoriesFirestore(options = {}) {
-  const { filters = [], orderBy = [{ field: 'name', direction: 'asc' }], limit = 100, cursor = null, transaction = null, skipCache = false } = options;
+  const { filters = [], orderBy = [{ field: 'name', direction: 'asc' }], limit = 500, cursor = null, transaction = null, skipCache = false, includeInactive = true } = options;
 
-  if (transaction || cursor || filters.length > 0 || limit !== 100 || skipCache) {
-    return await listDocs(COLLECTION, {
+  let docs;
+  if (transaction || cursor || filters.length > 0 || limit !== 500 || skipCache) {
+    docs = await listDocs(COLLECTION, {
       filters,
       orderBy,
       limit,
       startAfterDoc: cursor,
       transaction
     });
+  } else {
+    docs = await globalTtlCache.getOrSet(
+      'inventory_categories_all',
+      () => listDocs(COLLECTION, { filters, orderBy, limit, startAfterDoc: cursor, transaction }),
+      600000 // 10 minutes TTL
+    );
   }
-
-  return await globalTtlCache.getOrSet(
-    'inventory_categories_all',
-    () => listDocs(COLLECTION, { filters, orderBy, limit, startAfterDoc: cursor, transaction }),
-    600000 // 10 minutes TTL
-  );
+  // Legacy documents have no is_active field → treat as active.
+  return includeInactive ? docs : docs.filter(c => c.is_active !== false);
 }
 
 /**
@@ -75,7 +93,7 @@ export async function createInventoryCategoryFirestore(catData, options = {}) {
 
   const existing = await getDoc(COLLECTION, docId, options);
   if (existing) {
-    throw new RepositoryError(`Category '${catData.name}' already exists`, 'DUPLICATE_KEY', 400);
+    throw new RepositoryError(`Category '${catData.name}' already exists`, 'DUPLICATE_KEY', 409);
   }
 
   const nowIso = catData.updated_at || catData.created_at || new Date().toISOString();
@@ -84,7 +102,10 @@ export async function createInventoryCategoryFirestore(catData, options = {}) {
     name: String(catData.name).trim(),
     department: catData.department || 'General',
     description: catData.description || '',
+    is_active: catData.is_active === undefined ? true : Boolean(catData.is_active),
     mysql_category_id: catData.mysql_category_id || catData.id || null,
+    created_by: catData.created_by || null,
+    updated_by: catData.updated_by || catData.created_by || null,
     created_at: nowIso,
     updated_at: nowIso
   };
@@ -104,6 +125,7 @@ export async function updateInventoryCategoryFirestore(catId, catData, options =
     const res = await setDoc(COLLECTION, docId, {
       name: String(catData.name || catId).trim(),
       department: catData.department || 'General',
+      is_active: true,
       ...catData,
       updated_at: catData.updated_at || new Date().toISOString()
     }, { ...options, merge: true });
@@ -123,9 +145,14 @@ export async function updateInventoryCategoryFirestore(catId, catData, options =
 
   const result = await updateDoc(COLLECTION, docId, updatePayload, options);
   invalidateInventoryCategoriesCache();
-  return result;
+  return { ...existing, ...result };
 }
 
+export async function deactivateInventoryCategoryFirestore(catId, actor = null, options = {}) {
+  return await updateInventoryCategoryFirestore(catId, { is_active: false, updated_by: actor }, options);
+}
+
+/** Hard delete — tooling only, never routed. */
 export async function deleteInventoryCategoryFirestore(catId, options = {}) {
   if (!catId) throw new RepositoryError('Category ID is required for deletion', 'VALIDATION_ERROR', 400);
   const docId = String(catId).startsWith('cat_') ? String(catId) : formatCategoryDocId(catId);

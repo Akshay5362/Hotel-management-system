@@ -17,12 +17,15 @@ import {
 } from 'lucide-react';
 
 import { API_URL as API_BASE, getAssetUrl, getApiHeaders } from '../config/apiConfig';
-const VALID_UNITS = ['Kg', 'Gram', 'Liter', 'Ml', 'Packet', 'Piece', 'Dozen', 'Box', 'Other'];
-
 
 export default function InventoryModule({ token: tokenProp }) {
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState([]);
+  // Phase A: units and locations are real master data (backend/repositories/
+  // firestore/inventoryUnitsRepository.js, inventoryLocationsRepository.js),
+  // no longer a hardcoded list — create them under the Units / Locations tabs.
+  const [units, setUnits] = useState([]);
+  const [locations, setLocations] = useState([]);
   const [metrics, setMetrics] = useState({
     totalProducts: 0,
     activeProducts: 0,
@@ -39,6 +42,11 @@ export default function InventoryModule({ token: tokenProp }) {
   const [selectedStatus, setSelectedStatus] = useState('');
   const [onlyLowStock, setOnlyLowStock] = useState(false);
 
+  // Pagination (GET /inventory/products is paginated server-side — Phase A)
+  const [page, setPage] = useState(1);
+  const [pageInfo, setPageInfo] = useState({ total: 0, total_pages: 1 });
+  const PAGE_SIZE = 100;
+
   // Modal States
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingProduct, setEditingProduct] = useState(null);
@@ -50,9 +58,10 @@ export default function InventoryModule({ token: tokenProp }) {
     sku: '',
     name: '',
     category_id: '',
-    unit_of_measure: 'Kg',
+    unit_of_measure: '',
     minimum_stock_level: '0',
     current_stock: '0',
+    opening_location_id: '',
     unit_price: '0',
     status: 'Active',
     photo: null
@@ -85,12 +94,38 @@ export default function InventoryModule({ token: tokenProp }) {
     }
   }, [tokenProp]);
 
-  // Fetch Products & Metrics
+  // Fetch Units (Phase A master data — see Units tab)
+  const fetchUnits = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/inventory/units`, { headers: getAuthHeader() });
+      if (res.ok) {
+        const data = await res.json();
+        setUnits((data.units || []).filter(u => u.is_active !== false));
+      }
+    } catch (err) {
+      console.error('Failed to fetch units:', err);
+    }
+  }, [tokenProp]);
+
+  // Fetch Locations (needed to record WHERE opening stock is held)
+  const fetchLocations = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/inventory/locations`, { headers: getAuthHeader() });
+      if (res.ok) {
+        const data = await res.json();
+        setLocations((data.locations || []).filter(l => l.is_active !== false));
+      }
+    } catch (err) {
+      console.error('Failed to fetch locations:', err);
+    }
+  }, [tokenProp]);
+
+  // Fetch Products & Metrics (paginated — see PAGE_SIZE above)
   const fetchProducts = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
-      const params = new URLSearchParams();
+      const params = new URLSearchParams({ page: String(page), page_size: String(PAGE_SIZE) });
       if (searchTerm) params.append('search', searchTerm);
       if (selectedCategory) params.append('category_id', selectedCategory);
       if (selectedStatus) params.append('status', selectedStatus);
@@ -109,34 +144,43 @@ export default function InventoryModule({ token: tokenProp }) {
       if (data.metrics) {
         setMetrics(data.metrics);
       }
+      setPageInfo({ total: data.total || 0, total_pages: data.total_pages || 1 });
     } catch (err) {
       setError(err.message || 'Error loading inventory.');
     } finally {
       setLoading(false);
     }
-  }, [searchTerm, selectedCategory, selectedStatus, onlyLowStock, tokenProp]);
+  }, [searchTerm, selectedCategory, selectedStatus, onlyLowStock, page, tokenProp]);
 
 
   useEffect(() => {
     fetchCategories();
-  }, [fetchCategories]);
+    fetchUnits();
+    fetchLocations();
+  }, [fetchCategories, fetchUnits, fetchLocations]);
 
   useEffect(() => {
     fetchProducts();
   }, [fetchProducts]);
 
+  useEffect(() => {
+    setPage(1);
+  }, [searchTerm, selectedCategory, selectedStatus, onlyLowStock]);
+
   // Open Modal for Create or Edit
   const openModal = (product = null) => {
     setFormErrors({});
+    const defaultLocationId = locations.find(l => l.is_default)?.id || locations[0]?.id || '';
     if (product) {
       setEditingProduct(product);
       setFormData({
         sku: product.sku || '',
         name: product.name || '',
         category_id: product.category_id || '',
-        unit_of_measure: product.unit_of_measure || 'Kg',
+        unit_of_measure: product.unit_of_measure || units[0]?.code || '',
         minimum_stock_level: product.minimum_stock_level ?? '0',
         current_stock: product.current_stock ?? '0',
+        opening_location_id: defaultLocationId,
         unit_price: product.unit_price ?? '0',
         status: product.status || 'Active',
         photo: null
@@ -148,9 +192,10 @@ export default function InventoryModule({ token: tokenProp }) {
         sku: '',
         name: '',
         category_id: categories[0]?.id || '',
-        unit_of_measure: 'Kg',
+        unit_of_measure: units[0]?.code || '',
         minimum_stock_level: '0',
         current_stock: '0',
+        opening_location_id: defaultLocationId,
         unit_price: '0',
         status: 'Active',
         photo: null
@@ -199,8 +244,11 @@ export default function InventoryModule({ token: tokenProp }) {
     }
 
     if (!editingProduct) {
-      if (isNaN(parseFloat(formData.current_stock)) || parseFloat(formData.current_stock) < 0) {
+      const opening = parseFloat(formData.current_stock);
+      if (isNaN(opening) || opening < 0) {
         errors.current_stock = 'Initial stock cannot be negative.';
+      } else if (opening > 0 && !formData.opening_location_id) {
+        errors.opening_location_id = 'Select where this opening stock is held.';
       }
     }
 
@@ -228,9 +276,14 @@ export default function InventoryModule({ token: tokenProp }) {
       payload.append('unit_price', formData.unit_price);
       payload.append('status', formData.status);
 
-      // Only set initial current_stock on CREATE
+      // Only set initial current_stock on CREATE — recorded as a real OPENING
+      // stock movement server-side (backend/services/inventoryStockService.js),
+      // not a raw balance write.
       if (!editingProduct) {
         payload.append('current_stock', formData.current_stock);
+        if (parseFloat(formData.current_stock) > 0 && formData.opening_location_id) {
+          payload.append('opening_location_id', formData.opening_location_id);
+        }
       }
 
       if (formData.photo) {
@@ -600,6 +653,26 @@ export default function InventoryModule({ token: tokenProp }) {
         )}
       </div>
 
+      {pageInfo.total_pages > 1 && (
+        <div style={{ display: 'flex', justifyContent: 'center', gap: '8px', marginTop: '16px', alignItems: 'center', color: '#94a3b8', fontSize: '0.85rem' }}>
+          <button
+            disabled={page <= 1}
+            onClick={() => setPage(p => p - 1)}
+            style={{ padding: '6px 14px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.12)', background: page <= 1 ? 'rgba(255,255,255,0.02)' : 'rgba(15,23,42,0.6)', color: page <= 1 ? '#475569' : '#fff', cursor: page <= 1 ? 'not-allowed' : 'pointer' }}
+          >
+            Previous
+          </button>
+          <span>Page {page} of {pageInfo.total_pages} ({pageInfo.total} items)</span>
+          <button
+            disabled={page >= pageInfo.total_pages}
+            onClick={() => setPage(p => p + 1)}
+            style={{ padding: '6px 14px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.12)', background: page >= pageInfo.total_pages ? 'rgba(255,255,255,0.02)' : 'rgba(15,23,42,0.6)', color: page >= pageInfo.total_pages ? '#475569' : '#fff', cursor: page >= pageInfo.total_pages ? 'not-allowed' : 'pointer' }}
+          >
+            Next
+          </button>
+        </div>
+      )}
+
       {/* Add / Edit Product Modal */}
       {isModalOpen && (
         <div style={{
@@ -704,24 +777,25 @@ export default function InventoryModule({ token: tokenProp }) {
                     onChange={(e) => setFormData({ ...formData, unit_of_measure: e.target.value })}
                     style={{ width: '100%', padding: '8px 12px', borderRadius: '6px', background: '#020617', border: formErrors.unit_of_measure ? '1px solid #ef4444' : '1px solid rgba(255,255,255,0.12)', color: '#fff' }}
                   >
-                    {VALID_UNITS.map(u => (
-                      <option key={u} value={u}>{u}</option>
+                    {units.length === 0 && <option value="">No units yet — create one under Units</option>}
+                    {units.map(u => (
+                      <option key={u.id} value={u.code}>{u.code} — {u.name}</option>
                     ))}
                   </select>
                 </div>
               </div>
 
               {/* Current Stock vs Minimum Stock Level (CRITICAL ADJUSTMENT 3) */}
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: editingProduct ? '1fr 1fr' : '1fr 1fr 1fr', gap: '12px' }}>
                 <div>
                   <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, color: '#94a3b8', marginBottom: '4px' }}>
                     {editingProduct ? 'Current Stock (Read-only)' : 'Initial Opening Stock *'}
                   </label>
-                  <input 
-                    type="number" 
+                  <input
+                    type="number"
                     step="0.01"
                     min="0"
-                    value={formData.current_stock} 
+                    value={formData.current_stock}
                     onChange={(e) => setFormData({ ...formData, current_stock: e.target.value })}
                     disabled={!!editingProduct}
                     style={{
@@ -736,12 +810,29 @@ export default function InventoryModule({ token: tokenProp }) {
                   />
                   {editingProduct ? (
                     <span style={{ fontSize: '0.7rem', color: '#64748b', display: 'block', marginTop: '2px' }}>
-                      Managed via Stock Movements in Phase 8
+                      Managed via Stock Movements (Adjust / Transfer tab)
                     </span>
                   ) : (
                     formErrors.current_stock && <span style={{ color: '#ef4444', fontSize: '0.75rem' }}>{formErrors.current_stock}</span>
                   )}
                 </div>
+
+                {!editingProduct && (
+                  <div>
+                    <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, color: '#94a3b8', marginBottom: '4px' }}>Opening Stock Location{parseFloat(formData.current_stock) > 0 ? ' *' : ''}</label>
+                    <select
+                      value={formData.opening_location_id}
+                      onChange={(e) => setFormData({ ...formData, opening_location_id: e.target.value })}
+                      style={{ width: '100%', padding: '8px 12px', borderRadius: '6px', background: '#020617', border: formErrors.opening_location_id ? '1px solid #ef4444' : '1px solid rgba(255,255,255,0.12)', color: '#fff' }}
+                    >
+                      <option value="">{locations.length === 0 ? 'No locations yet — create one under Locations' : 'Select location'}</option>
+                      {locations.map(l => (
+                        <option key={l.id} value={l.id}>{l.name}{l.is_default ? ' (default)' : ''}</option>
+                      ))}
+                    </select>
+                    {formErrors.opening_location_id && <span style={{ color: '#ef4444', fontSize: '0.75rem' }}>{formErrors.opening_location_id}</span>}
+                  </div>
+                )}
 
                 <div>
                   <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, color: '#94a3b8', marginBottom: '4px' }}>Minimum Stock Warning Level *</label>

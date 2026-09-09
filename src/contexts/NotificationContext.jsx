@@ -36,6 +36,28 @@ export function getNormalizedRole(user) {
   return raw;
 }
 
+/**
+ * Mirrors backend/controllers/authController.js normalizeUserRole EXACTLY.
+ * The bell's own vocabulary is the raw uppercase role, but the inventory
+ * approval configuration stores backend-normalized lowercase names, so a
+ * notification targeted by that configuration must be compared in the same
+ * vocabulary.
+ */
+export function getBackendNormalizedRole(user) {
+  if (!user) return null;
+  const raw = String(user.role || '').toUpperCase().trim();
+  const isStaff = user.type === 'staff' || user.user_type === 'staff';
+  if (!isStaff && raw === 'ADMIN') return 'super_admin';
+  if (isStaff) {
+    if (raw === 'ADMIN') return 'admin';
+    if (raw === 'RECEPTIONIST') return 'receptionist';
+    if (raw === 'CLEANER') return 'housekeeper';
+    if (['CHEF', 'KITCHEN_HELPER', 'PANTRY_BOY'].includes(raw)) return 'kitchen';
+    return raw.toLowerCase();
+  }
+  return raw.toLowerCase();
+}
+
 // ── Notification type registry ───────────────────────────────────────────────
 // Each entry fully describes one server event → one notification kind.
 const NOTIFICATION_TYPES = {
@@ -86,6 +108,71 @@ const NOTIFICATION_TYPES = {
         !!n.metadata &&
         String(n.metadata.orderId) === String(payload.order_id)
     }
+  },
+
+  // ── Inventory: a purchase request is waiting for a decision ────────────────
+  INVENTORY_PURCHASE_REQUEST_PENDING: {
+    event:    'inventory:purchase_request_submitted',
+    icon:     '📝',
+    title:    'Purchase Request Pending Approval',
+    severity: 'warning',
+    // `recipients` only decides who SUBSCRIBES. Because approvers are
+    // configurable at runtime, every role that could ever be configured must
+    // subscribe; the real per-event filter is `eligible` below, which reads
+    // the approver list the server sends with each event.
+    recipients: ['ADMIN', 'SUPER_ADMIN', 'RECEPTIONIST', 'CHEF', 'KITCHEN_HELPER', 'PANTRY_BOY', 'CLEANER'],
+    /**
+     * Config-driven targeting. The server sends approver_roles from
+     * settings/inventory_pr_approval — the SAME document Phase C authorizes
+     * against — so there is a single source of truth. A requester never
+     * receives the approval notification for their own request, even when
+     * their own role is an approver role.
+     */
+    eligible: (p, ctx) => {
+      if (!p || !p.request_id) return false;
+      const roles = Array.isArray(p.approver_roles) ? p.approver_roles : [];
+      if (roles.length === 0) return false;
+      if (!ctx.backendRole || !roles.includes(ctx.backendRole)) return false;
+      if (p.requested_by_uid && ctx.uid && String(p.requested_by_uid) === String(ctx.uid)) return false;
+      return true;
+    },
+    // Stable id → reconnects and repeated deliveries collapse onto one entry.
+    buildId: (p) => (p && p.request_id ? `INVENTORY_PURCHASE_REQUEST_PENDING:${p.request_id}` : null),
+    buildMessage: (p) => `${p.request_number || p.request_id} requires approval.`,
+    buildLines: (p) => {
+      const lines = [];
+      if (p.requested_by_name) lines.push(`Raised by ${p.requested_by_name}`);
+      const where = [p.department, p.location_name].filter(Boolean).join(' · ');
+      if (where) lines.push(where);
+      const count = Number(p.item_count) || 0;
+      const value = Number(p.estimated_total) || 0;
+      lines.push(`${count} item${count === 1 ? '' : 's'}${value > 0 ? ` · est. ₹${value.toLocaleString('en-IN')}` : ''}`);
+      if (p.priority && p.priority !== 'NORMAL') lines.push(`Priority: ${p.priority}`);
+      return lines;
+    },
+    buildMetadata: (p) => ({
+      requestId:     p.request_id,
+      requestNumber: p.request_number || null,
+      department:    p.department || null,
+      locationId:    p.location_id || null,
+      priority:      p.priority || null,
+      itemCount:     p.item_count ?? null,
+      requestedBy:   p.requested_by_name || null,
+      status:        'PENDING_APPROVAL'
+    }),
+    // Opens Inventory → Purchase Requests → THIS request's detail view.
+    // State-only navigation (no window.location / pushState), so it behaves
+    // identically in the browser and under Electron's file:// origin.
+    buildNavigation: (p) => ({ module: 'inventory', tab: 'purchase-requests', requestId: p.request_id }),
+    // Once ANY approver decides, the pending item retires itself.
+    removeOn: {
+      event: 'inventory:purchase_request_decided',
+      matches: (payload, n) =>
+        !!payload &&
+        payload.request_id != null &&
+        !!n.metadata &&
+        String(n.metadata.requestId) === String(payload.request_id)
+    }
   }
 
   // ── Future (NOT implemented / NOT emitted yet) ─────────────────────────────
@@ -127,6 +214,9 @@ export function NotificationProvider({ children }) {
 
   const uid = adminUser?.uid || adminUser?.username || null;
   const normalizedRole = getNormalizedRole(adminUser);
+  // Same user, expressed in the backend's role vocabulary — used by
+  // config-driven notification targeting (see `eligible` in the registry).
+  const backendRole = getBackendNormalizedRole(adminUser);
 
   // Which registry entries this user should receive at all.
   const subscribedTypes = useMemo(() => {
@@ -181,6 +271,13 @@ export function NotificationProvider({ children }) {
 
   // Core ingest: event payload → notification (deduped) → list + toast.
   const ingest = useCallback((def, payload) => {
+    // Optional per-event recipient filter. Entries without one behave exactly
+    // as before (static `recipients` only) — this is additive. Entries with
+    // one use it for runtime-configurable targeting, e.g. the inventory
+    // approver list, and to exclude the actor who caused the event.
+    if (typeof def.eligible === 'function' && !def.eligible(payload, { uid, role: normalizedRole, backendRole })) {
+      return;
+    }
     const id = def.buildId(payload);
     if (!id) return;
     if (knownIdsRef.current.has(id)) return; // duplicate delivery / replay / re-render — ignore
@@ -197,12 +294,14 @@ export function NotificationProvider({ children }) {
       read:      false,
       severity:  def.severity || 'info',
       metadata:  def.buildMetadata ? def.buildMetadata(payload) : {},
-      navigation: def.navigation || null
+      // Static `navigation` still works; `buildNavigation` lets an entry point
+      // at the specific record the event refers to.
+      navigation: def.buildNavigation ? def.buildNavigation(payload) : (def.navigation || null)
     };
 
     setNotifications(prev => [notification, ...prev].slice(0, MAX_NOTIFICATIONS));
     pushToast(notification);
-  }, [pushToast]);
+  }, [pushToast, uid, normalizedRole, backendRole]);
 
   // Lifecycle removal: drop ONLY the notifications of `def.type` that match the
   // incoming payload (per def.removeOn.matches). Idempotent — a repeated or

@@ -29,7 +29,7 @@ import ReceptionPortal from './components/ReceptionPortal';
 import Sidebar from './components/Sidebar';
 import RoomInspectorDrawer from './components/RoomInspectorDrawer';
 import { auth } from './config/firebaseClient';
-import InventoryModule from './components/InventoryModule';
+import InventoryHub from './components/inventory/InventoryHub';
 import FoodPOS from './components/food/FoodPOS';           // Food POS Phase 1 — Menu Master
 import { io } from 'socket.io-client';
 import { API_URL, SOCKET_URL, getApiHeaders } from './config/apiConfig';
@@ -159,14 +159,16 @@ import ReservationModule from './components/ReservationModule.jsx';
 function AppContent() {
   const [adminTab, setAdminTab] = useState('frontdesk');
 
-  // Notification click → switch the admin workspace to the Food & Beverage
-  // tab; FoodPOS then consumes the intent to open the requested sub-tab (KDS).
+  // Notification click → switch the admin workspace to the owning module's
+  // tab; that module then consumes the intent to open the requested sub-tab
+  // (FoodPOS → KDS, InventoryHub → Purchase Requests). State-only navigation,
+  // so it stays correct under Electron's file:// origin.
   const notificationCtx = React.useContext(NotificationContext);
   const notificationNavIntent = notificationCtx?.navigationIntent || null;
   useEffect(() => {
-    if (notificationNavIntent && notificationNavIntent.module === 'food') {
-      setAdminTab('food');
-    }
+    if (!notificationNavIntent) return;
+    if (notificationNavIntent.module === 'food') setAdminTab('food');
+    else if (notificationNavIntent.module === 'inventory') setAdminTab('inventory');
   }, [notificationNavIntent]);
   const [rooms, setRooms] = useState([]);
   const [filter, setFilter] = useState('all');
@@ -1363,7 +1365,7 @@ function AppContent() {
           {adminTab === 'housekeeping' && <AdminHousekeeping onBack={() => setAdminTab('frontdesk')} />}
           {adminTab === 'inventory' && (
             <div className="dashboard-body">
-              <InventoryModule />
+              <InventoryHub token={adminToken} user={adminUser} />
             </div>
           )}
           {/* ── Food / Restaurant POS — Phase 1 Menu Master ───────────────────── */}
