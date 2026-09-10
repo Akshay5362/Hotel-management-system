@@ -1,32 +1,64 @@
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+/** OCR worker execution limits. */
+export const OCR_TIMEOUT_MS = 30000;          // unchanged: preprocessing + 2 OCR passes
+const OCR_MAX_BUFFER = 8 * 1024 * 1024;       // was Node's 1 MB default
+
 /**
  * Run OCR on an image file using a child worker process.
  * Returns raw text, preprocessed text, and Tesseract confidence score.
+ *
+ * SECURITY (Phase H2, narrowly scoped): this previously used `exec`, which
+ * builds a SHELL command string with the file path interpolated into it. A
+ * stored filename can contain a double quote — `path.extname('x.jp"g')` returns
+ * `.jp"g`, and backend/middleware/uploadMiddleware.js takes a guest identity
+ * document's extension straight from the client-supplied `originalname` — so a
+ * crafted upload could break out of the quoting and execute arbitrary commands.
+ *
+ * `execFile` passes the arguments as an array and spawns the binary directly
+ * with no shell, which removes that entire class of injection for every caller.
+ * `process.execPath` is used instead of the string "node" so the worker always
+ * runs on the same interpreter as the server rather than whatever is on PATH.
+ *
+ * The failure contract is unchanged: any error resolves to empty text with zero
+ * confidence, so callers never have to distinguish failure modes.
+ *
+ * Pixel-bomb protection is NOT weakened here. ocrWorker.js calls sharp without
+ * `limitInputPixels`, so sharp's ~268 MP default guard stays active, and the
+ * Phase H1 upload ceiling (12000px per side, ~50 MP) is stricter still.
  */
 export const extractOCRData = (filePath, mimeType) => {
   return new Promise((resolve) => {
     const workerPath = path.join(__dirname, 'ocrWorker.js');
-    
-    // Increased timeout to 30s to allow for preprocessing and 2 OCR passes
-    exec(`node "${workerPath}" "${filePath}" "${mimeType}"`, { timeout: 30000 }, (error, stdout, stderr) => {
-      if (error) {
-        console.error('OCR Worker Error:', error.message);
-        resolve({ rawText: '', preprocessedText: '', confidence: 0 });
-        return;
+
+    execFile(
+      process.execPath,
+      [workerPath, String(filePath), String(mimeType)],
+      {
+        timeout: OCR_TIMEOUT_MS,
+        killSignal: 'SIGKILL',   // a wedged tesseract must not survive SIGTERM
+        maxBuffer: OCR_MAX_BUFFER,
+        windowsHide: true
+      },
+      (error, stdout) => {
+        if (error) {
+          console.error('OCR Worker Error:', error.message);
+          resolve({ rawText: '', preprocessedText: '', confidence: 0 });
+          return;
+        }
+        try {
+          const data = JSON.parse(stdout);
+          resolve(data);
+        } catch (e) {
+          resolve({ rawText: stdout, preprocessedText: stdout, confidence: 0 });
+        }
       }
-      try {
-        const data = JSON.parse(stdout);
-        resolve(data);
-      } catch (e) {
-        resolve({ rawText: stdout, preprocessedText: stdout, confidence: 0 });
-      }
-    });
+    );
   });
 };
 
