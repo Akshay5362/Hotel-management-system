@@ -14,26 +14,24 @@
  * Every control here is UX only. Approval rights come from the server's
  * settings-driven config, a requester can never approve their own request, and
  * both rules are re-enforced server-side on every call.
+ *
+ * Batch 5: presentation only. Every request, payload, guard and message is the
+ * Phase B/C/E one. Two additive props: `openCreateNonce` (a parent asks for
+ * the create form to open) and `embedded` (the parent already provides the
+ * page frame).
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ClipboardList, Plus, Search, RefreshCw, Send, XCircle, ArrowLeft, Trash2, Save,
-  CheckCircle2, ThumbsDown
+  CheckCircle2, ThumbsDown, ArrowRight
 } from 'lucide-react';
 import { inventoryFetch, formatQty } from './inventoryApi';
+import { Alert, Button, Card, EmptyState, Field, LoadingRows, Pager, StatusBadge, Table, Toolbar, humanError, money, fmtDateTime, PageHeader } from './ui';
+import { PR_STATUS, statusOf } from './statusMaps';
 
-const STATUS_STYLES = {
-  DRAFT: { bg: 'rgba(148,163,184,0.15)', fg: '#94a3b8', label: 'Draft' },
-  PENDING_APPROVAL: { bg: 'rgba(245,158,11,0.15)', fg: '#f59e0b', label: 'Pending Approval' },
-  CANCELLED: { bg: 'rgba(239,68,68,0.15)', fg: '#ef4444', label: 'Cancelled' },
-  APPROVED: { bg: 'rgba(16,185,129,0.15)', fg: '#10b981', label: 'Approved' },
-  REJECTED: { bg: 'rgba(239,68,68,0.2)', fg: '#f87171', label: 'Rejected' }
-};
 const PRIORITIES = ['LOW', 'NORMAL', 'HIGH', 'URGENT'];
 
-const money = (n) => `₹${(Number(n) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-
-export default function InventoryPurchaseRequests({ token, currentUserUid, openRequestId, onDeepLinkHandled, canManageOrders, onOpenPurchaseOrder }) {
+export default function InventoryPurchaseRequests({ token, currentUserUid, openRequestId, onDeepLinkHandled, canManageOrders, onOpenPurchaseOrder, openCreateNonce = 0, presetProductId = null, embedded = false }) {
   const [view, setView] = useState('list');       // 'list' | 'create' | 'detail'
   const [detailId, setDetailId] = useState(null);
 
@@ -47,20 +45,36 @@ export default function InventoryPurchaseRequests({ token, currentUserUid, openR
     if (onDeepLinkHandled) onDeepLinkHandled();
   }, [openRequestId, onDeepLinkHandled]);
 
+  // A parent (Overview's "+ Purchase Request", the workspace header) asks for
+  // the create form. A counter rather than a boolean, so asking twice works.
+  useEffect(() => { if (openCreateNonce > 0) setView('create'); }, [openCreateNonce]);
+
   return view === 'create'
-    ? <CreateRequest token={token} onDone={() => setView('list')} onCancel={() => setView('list')} />
+    ? <CreateRequest token={token} presetProductId={presetProductId} onDone={() => setView('list')} onCancel={() => setView('list')} embedded={embedded} />
     : view === 'detail'
       ? <RequestDetail token={token} requestId={detailId} currentUserUid={currentUserUid} onBack={() => setView('list')}
-          canManageOrders={canManageOrders} onOpenPurchaseOrder={onOpenPurchaseOrder} />
+          canManageOrders={canManageOrders} onOpenPurchaseOrder={onOpenPurchaseOrder} embedded={embedded} />
       : <RequestList
           token={token}
+          embedded={embedded}
           onCreate={() => setView('create')}
           onOpen={(id) => { setDetailId(id); setView('detail'); }}
         />;
 }
 
 /* ── List ─────────────────────────────────────────────────────────────────── */
-function RequestList({ token, onCreate, onOpen }) {
+const LIST_COLS = [
+  { key: 'no', label: 'Request' },
+  { key: 'dept', label: 'Department / location' },
+  { key: 'items', label: 'Items', className: 'num' },
+  { key: 'val', label: 'Estimated', className: 'num' },
+  { key: 'by', label: 'Requested by' },
+  { key: 'date', label: 'Date' },
+  { key: 'st', label: 'Status' },
+  { key: 'a', label: '', className: 'action' }
+];
+
+function RequestList({ token, onCreate, onOpen, embedded }) {
   const [requests, setRequests] = useState([]);
   const [locations, setLocations] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -95,7 +109,7 @@ function RequestList({ token, onCreate, onOpen }) {
       setRequests(data.requests || []);
       setNextCursor(data.next_cursor || null);
     } catch (err) {
-      setError(err.message);
+      setError(humanError(err, 'Unable to load purchase requests right now. Please try again.'));
     } finally {
       setLoading(false);
     }
@@ -103,93 +117,79 @@ function RequestList({ token, onCreate, onOpen }) {
 
   useEffect(() => { setCursor(null); setCursorStack([]); load(null); }, [load]);
 
-  return (
-    <div style={{ padding: 24, color: '#fff', maxWidth: 1300, margin: '0 auto' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
-        <h2 style={{ margin: 0, fontSize: '1.3rem', fontWeight: 800, display: 'flex', alignItems: 'center', gap: 8 }}>
-          <ClipboardList size={20} /> Purchase Requests
-        </h2>
-        <button onClick={onCreate} style={primaryBtn}><Plus size={16} /> New Request</button>
-      </div>
+  const hasFilters = Boolean(status || locationId || requestNumber || from || to);
 
-      <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center', border: '1px solid rgba(255,255,255,0.08)' }}>
-        <div style={{ position: 'relative' }}>
-          <Search size={15} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: '#64748b' }} />
-          <input value={requestNumber} onChange={e => setRequestNumber(e.target.value)} placeholder="PR-20260908-000001"
-            style={{ padding: '8px 12px 8px 32px', borderRadius: 6, background: 'rgba(15,23,42,0.6)', border: '1px solid rgba(255,255,255,0.12)', color: '#fff' }} />
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      {!embedded ? (
+        <PageHeader icon={ClipboardList} title="Purchase Requests" subtitle="Ask for stock to be bought. A request never changes stock."
+          actions={<Button variant="primary" icon={Plus} onClick={onCreate}>New Request</Button>} />
+      ) : null}
+
+      <Toolbar>
+        <div className="inv-search" style={{ flex: '0 1 220px' }}>
+          <Search size={14} />
+          <input className="inv-input" value={requestNumber} onChange={e => setRequestNumber(e.target.value)} placeholder="Request number" aria-label="Request number" />
         </div>
-        <select value={status} onChange={e => setStatus(e.target.value)} style={selectStyle}>
-          <option value="">All Statuses</option>
+        <select className="inv-select" value={status} onChange={e => setStatus(e.target.value)} aria-label="Status">
+          <option value="">Status</option>
           <option value="DRAFT">Draft</option>
-          <option value="PENDING_APPROVAL">Pending Approval</option>
+          <option value="PENDING_APPROVAL">Pending approval</option>
           <option value="APPROVED">Approved</option>
           <option value="REJECTED">Rejected</option>
           <option value="CANCELLED">Cancelled</option>
         </select>
-        <select value={locationId} onChange={e => setLocationId(e.target.value)} style={selectStyle}>
-          <option value="">All Locations</option>
+        <select className="inv-select" value={locationId} onChange={e => setLocationId(e.target.value)} aria-label="Location">
+          <option value="">Location</option>
           {locations.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
         </select>
-        <input type="date" value={from} onChange={e => setFrom(e.target.value)} style={selectStyle} title="From business date" />
-        <input type="date" value={to} onChange={e => setTo(e.target.value)} style={selectStyle} title="To business date" />
-        <button onClick={() => load(cursor)} style={iconBtn}><RefreshCw size={16} /></button>
-      </div>
+        <input className="inv-input" style={{ width: 'auto' }} type="date" value={from} onChange={e => setFrom(e.target.value)} title="From business date" aria-label="From date" />
+        <input className="inv-input" style={{ width: 'auto' }} type="date" value={to} onChange={e => setTo(e.target.value)} title="To business date" aria-label="To date" />
+        <div className="inv-spacer" />
+        {hasFilters ? <Button size="sm" variant="ghost" onClick={() => { setStatus(''); setLocationId(''); setRequestNumber(''); setFrom(''); setTo(''); }}>Clear</Button> : null}
+        <Button variant="ghost" icon={RefreshCw} onClick={() => load(cursor)} title="Refresh" aria-label="Refresh" />
+      </Toolbar>
 
-      {error && <div style={errorBox}>{error}</div>}
+      {error ? <Alert tone="error" onRetry={() => load(cursor)}>{error}</Alert> : null}
 
-      <div className="glass" style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.08)' }}>
-        {loading ? (
-          <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)' }}>Loading purchase requests...</div>
-        ) : requests.length === 0 ? (
-          <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)' }}>No purchase requests match these filters.</div>
-        ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
-              <thead>
-                <tr style={{ background: 'rgba(15,23,42,0.8)', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
-                  <th style={th}>Request No.</th><th style={th}>Date</th><th style={th}>Requested By</th>
-                  <th style={th}>Department</th><th style={th}>Location</th><th style={th}>Items</th>
-                  <th style={th}>Est. Value</th><th style={th}>Priority</th><th style={th}>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {requests.map(r => {
-                  const st = STATUS_STYLES[r.status] || STATUS_STYLES.DRAFT;
-                  return (
-                    <tr key={r.id} onClick={() => onOpen(r.id)} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)', cursor: 'pointer' }}>
-                      <td style={{ ...td, fontFamily: 'monospace', color: '#38bdf8' }}>{r.request_number || '—'}</td>
-                      <td style={td}>{r.business_date}</td>
-                      <td style={td}>{r.requested_by_name || r.requested_by_uid || '—'}</td>
-                      <td style={td}>{r.department}</td>
-                      <td style={td}>{r.location_name_snapshot || r.location_id}</td>
-                      <td style={td}>{r.item_count}</td>
-                      <td style={{ ...td, fontWeight: 700 }}>{money(r.total_estimated_value)}</td>
-                      <td style={td}>{r.priority}</td>
-                      <td style={td}><span style={{ padding: '3px 9px', borderRadius: 12, fontSize: '0.72rem', fontWeight: 700, background: st.bg, color: st.fg }}>{st.label}</span></td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+      <Card>
+        <Table columns={LIST_COLS}>
+          {loading ? <LoadingRows columns={LIST_COLS.length} rows={6} /> : null}
+          {!loading && requests.length === 0 ? (
+            <tr><td colSpan={LIST_COLS.length}>
+              {hasFilters
+                ? <EmptyState title="No purchase requests match" text="Try different filters." />
+                : <EmptyState title="No purchase requests yet" text="Raise one when stock needs to be bought. It goes to an approver before anything is ordered."
+                    action={<Button size="sm" variant="primary" icon={Plus} onClick={onCreate}>New Request</Button>} />}
+            </td></tr>
+          ) : null}
+          {!loading && requests.map(r => {
+            const st = statusOf(PR_STATUS, r.status);
+            return (
+              <tr key={r.id} className="row-link" onClick={() => onOpen(r.id)}>
+                <td className="mono">{r.request_number || 'Draft'}{r.priority && r.priority !== 'NORMAL' ? <span className="inv-cell-sub" style={{ fontFamily: 'inherit', color: r.priority === 'URGENT' ? 'var(--inv-bad)' : 'var(--inv-warn)' }}>{r.priority}</span> : null}</td>
+                <td>{r.department || '—'}<span className="inv-cell-sub">{r.location_name_snapshot || r.location_id}</span></td>
+                <td className="num">{r.item_count}</td>
+                <td className="num strong">{money(r.total_estimated_value)}</td>
+                <td>{r.requested_by_name || r.requested_by_uid || '—'}</td>
+                <td className="muted nowrap">{r.business_date}</td>
+                <td><StatusBadge label={st.label} tone={st.tone} /></td>
+                <td className="action"><Button size="sm" variant="ghost" icon={ArrowRight}>Open</Button></td>
+              </tr>
+            );
+          })}
+        </Table>
+      </Card>
 
-      <div style={{ display: 'flex', justifyContent: 'center', gap: 8, marginTop: 16, alignItems: 'center', color: '#94a3b8', fontSize: '0.85rem' }}>
-        <button disabled={cursorStack.length === 0} onClick={() => {
-          const stack = [...cursorStack]; const prev = stack.pop() || null;
-          setCursorStack(stack); setCursor(prev); load(prev);
-        }} style={pagerBtn(cursorStack.length === 0)}>Previous</button>
-        <button disabled={!nextCursor} onClick={() => {
-          setCursorStack(s => [...s, cursor]); setCursor(nextCursor); load(nextCursor);
-        }} style={pagerBtn(!nextCursor)}>Next</button>
-      </div>
+      <Pager canPrev={cursorStack.length > 0} canNext={Boolean(nextCursor)}
+        onPrev={() => { const stack = [...cursorStack]; const prev = stack.pop() || null; setCursorStack(stack); setCursor(prev); load(prev); }}
+        onNext={() => { setCursorStack(s => [...s, cursor]); setCursor(nextCursor); load(nextCursor); }} />
     </div>
   );
 }
 
 /* ── Create ───────────────────────────────────────────────────────────────── */
-function CreateRequest({ token, onDone, onCancel }) {
+function CreateRequest({ token, onDone, onCancel, presetProductId, embedded }) {
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState([]);
   const [locations, setLocations] = useState([]);
@@ -215,17 +215,23 @@ function CreateRequest({ token, onDone, onCancel }) {
           inventoryFetch('/inventory/categories', { token }),
           inventoryFetch('/inventory/locations', { token })
         ]);
-        setProducts(p.products || []);
+        const prods = p.products || [];
+        setProducts(prods);
         setCategories(c.categories || []);
         const locs = (l.locations || []).filter(x => x.is_active !== false);
         setLocations(locs);
         const def = locs.find(x => x.is_default) || locs[0];
         if (def) { setLocationId(def.id); setDepartment(def.department || ''); }
+        // Arriving from a low-stock row: bring that item to the top of the list.
+        if (presetProductId) {
+          const hit = prods.find(x => x.id === presetProductId);
+          if (hit) setSearch(hit.name);
+        }
       } catch (err) {
-        setError(err.message);
+        setError(humanError(err));
       }
     })();
-  }, [token]);
+  }, [token, presetProductId]);
 
   const visible = useMemo(() => products.filter(p => {
     if (categoryId && String(p.category_id) !== String(categoryId)) return false;
@@ -270,7 +276,7 @@ function CreateRequest({ token, onDone, onCancel }) {
       const res = await inventoryFetch('/inventory/purchase-requests', { token, method: 'POST', body: buildPayload() });
       setNotice(`Draft saved${res.request?.request_number ? ` (${res.request.request_number})` : ''}. It is not submitted yet.`);
       setTimeout(onDone, 1200);
-    } catch (err) { setError(err.message); } finally { setBusy(false); }
+    } catch (err) { setError(humanError(err)); } finally { setBusy(false); }
   };
 
   const submitRequest = async () => {
@@ -283,140 +289,131 @@ function CreateRequest({ token, onDone, onCancel }) {
       const submitted = await inventoryFetch(`/inventory/purchase-requests/${id}/submit`, { token, method: 'POST', body: {} });
       setNotice(`Submitted as ${submitted.request.request_number} — now pending approval.`);
       setTimeout(onDone, 1400);
-    } catch (err) { setError(err.message); } finally { setBusy(false); }
+    } catch (err) { setError(humanError(err)); } finally { setBusy(false); }
   };
 
+  const ITEM_COLS = [
+    { key: 'item', label: 'Item' }, { key: 'cat', label: 'Category' }, { key: 'stock', label: 'In stock', className: 'num' },
+    { key: 'min', label: 'Minimum', className: 'num' }, { key: 'cost', label: 'Est. unit cost', className: 'num' },
+    { key: 'qty', label: 'Request qty', className: 'num' }, { key: 'tot', label: 'Est. total', className: 'num' }
+  ];
+
   return (
-    <div style={{ padding: 24, color: '#fff', maxWidth: 1300, margin: '0 auto' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
-        <button onClick={onCancel} style={iconBtn}><ArrowLeft size={16} /></button>
-        <h2 style={{ margin: 0, fontSize: '1.3rem', fontWeight: 800 }}>Create Purchase Request</h2>
-      </div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <PageHeader
+        icon={ClipboardList}
+        title={<><Button variant="ghost" icon={ArrowLeft} onClick={onCancel} aria-label="Back" style={{ marginRight: 4 }} /> New Purchase Request</>}
+        subtitle="Choose what is needed and where it should go. The request is sent to an approver."
+      />
 
-      {error && <div style={errorBox}>{error}</div>}
-      {notice && <div style={{ background: 'rgba(16,185,129,0.15)', border: '1px solid #10b981', color: '#10b981', padding: 12, borderRadius: 8, marginBottom: 16 }}>{notice}</div>}
+      {error ? <Alert tone="error" onDismiss={() => setError('')}>{error}</Alert> : null}
+      {notice ? <Alert tone="ok">{notice}</Alert> : null}
 
-      <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(255,255,255,0.08)', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12 }}>
-        <div>
-          <label style={label}>Destination Location *</label>
-          <select value={locationId} onChange={e => {
-            setLocationId(e.target.value);
-            const loc = locations.find(l => l.id === e.target.value);
-            if (loc && !department) setDepartment(loc.department || '');
-          }} style={input}>
-            <option value="">Select location</option>
-            {locations.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
-          </select>
+      <Card padded>
+        <div className="inv-form-grid">
+          <Field label="Destination location" required>
+            <select className="inv-select" style={{ width: '100%' }} value={locationId} onChange={e => {
+              setLocationId(e.target.value);
+              const loc = locations.find(l => l.id === e.target.value);
+              if (loc && !department) setDepartment(loc.department || '');
+            }}>
+              <option value="">Select location</option>
+              {locations.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
+            </select>
+          </Field>
+          <Field label="Department">
+            <input className="inv-input" value={department} onChange={e => setDepartment(e.target.value)} placeholder="e.g. KITCHEN" />
+          </Field>
+          <Field label="Priority">
+            <select className="inv-select" style={{ width: '100%' }} value={priority} onChange={e => setPriority(e.target.value)}>
+              {PRIORITIES.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </Field>
         </div>
-        <div>
-          <label style={label}>Department</label>
-          <input value={department} onChange={e => setDepartment(e.target.value)} placeholder="e.g. KITCHEN" style={input} />
-        </div>
-        <div>
-          <label style={label}>Priority</label>
-          <select value={priority} onChange={e => setPriority(e.target.value)} style={input}>
-            {PRIORITIES.map(p => <option key={p} value={p}>{p}</option>)}
-          </select>
-        </div>
-      </div>
+      </Card>
 
-      <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, display: 'flex', gap: 12, flexWrap: 'wrap', border: '1px solid rgba(255,255,255,0.08)' }}>
-        <div style={{ flex: '1 1 220px', position: 'relative' }}>
-          <Search size={16} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: '#64748b' }} />
-          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search items by name or SKU..."
-            style={{ width: '100%', padding: '9px 12px 9px 36px', borderRadius: 6, background: 'rgba(15,23,42,0.6)', border: '1px solid rgba(255,255,255,0.12)', color: '#fff' }} />
+      <Toolbar>
+        <div className="inv-search">
+          <Search size={14} />
+          <input className="inv-input" value={search} onChange={e => setSearch(e.target.value)} placeholder="Search items by name or SKU…" aria-label="Search items" />
         </div>
-        <select value={categoryId} onChange={e => setCategoryId(e.target.value)} style={selectStyle}>
-          <option value="">All Categories</option>
+        <select className="inv-select" value={categoryId} onChange={e => setCategoryId(e.target.value)} aria-label="Category">
+          <option value="">Category</option>
           {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
         </select>
-      </div>
+      </Toolbar>
 
-      <div className="glass" style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.08)', marginBottom: 16 }}>
-        <div style={{ overflowX: 'auto', maxHeight: 380, overflowY: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
-            <thead>
-              <tr style={{ background: 'rgba(15,23,42,0.9)', borderBottom: '1px solid rgba(255,255,255,0.1)', position: 'sticky', top: 0 }}>
-                <th style={th}>Item</th><th style={th}>SKU</th><th style={th}>Category</th>
-                <th style={th}>Current Stock</th><th style={th}>Min Level</th><th style={th}>Unit</th>
-                <th style={th}>Est. Unit Cost</th><th style={th}>Request Qty</th><th style={th}>Est. Total</th>
-              </tr>
-            </thead>
-            <tbody>
-              {visible.length === 0 ? (
-                <tr><td colSpan={9} style={{ padding: 30, textAlign: 'center', color: 'var(--text-muted)' }}>No items match.</td></tr>
-              ) : visible.map(p => {
-                const qty = lines[p.id] || '';
-                const lineTotal = (Number(qty) || 0) * (Number(p.cost_price) || 0);
-                return (
-                  <tr key={p.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)', background: Number(qty) > 0 ? 'rgba(56,189,248,0.06)' : 'transparent' }}>
-                    <td style={{ ...td, fontWeight: 600 }}>{p.name}</td>
-                    <td style={{ ...td, fontFamily: 'monospace', color: '#38bdf8' }}>{p.sku}</td>
-                    <td style={td}>{p.category_name}</td>
-                    <td style={td}>{formatQty(p.current_stock)} {p.unit_of_measure}</td>
-                    <td style={{ ...td, color: '#94a3b8' }}>{formatQty(p.minimum_stock_level)}</td>
-                    <td style={td}>{p.unit_of_measure}</td>
-                    <td style={td}>{money(p.cost_price)}</td>
-                    <td style={td}>
-                      <input type="number" step="any" min="0" value={qty}
-                        onChange={e => setLines(prev => ({ ...prev, [p.id]: e.target.value }))}
-                        style={{ width: 90, padding: '6px 8px', borderRadius: 6, background: '#020617', border: '1px solid rgba(255,255,255,0.12)', color: '#fff' }} />
-                    </td>
-                    <td style={{ ...td, fontWeight: 700 }}>{lineTotal > 0 ? money(lineTotal) : '—'}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+      <Card>
+        <div style={{ maxHeight: 380, overflowY: 'auto' }}>
+          <Table columns={ITEM_COLS}>
+            {visible.length === 0 ? (
+              <tr><td colSpan={ITEM_COLS.length}><EmptyState title="No items match" text={products.length === 0 ? 'No active items exist yet. Add them under Masters › Items.' : 'Try a different search.'} /></td></tr>
+            ) : visible.map(p => {
+              const qty = lines[p.id] || '';
+              const lineTotal = (Number(qty) || 0) * (Number(p.cost_price) || 0);
+              const picked = Number(qty) > 0;
+              return (
+                <tr key={p.id} style={picked ? { background: 'rgba(56,189,248,0.06)' } : undefined}>
+                  <td><span className="strong">{p.name}</span><span className="inv-cell-sub">{p.sku}</span></td>
+                  <td className="muted">{p.category_name}</td>
+                  <td className="num">{formatQty(p.current_stock)} <span className="muted">{p.unit_of_measure}</span></td>
+                  <td className="num muted">{formatQty(p.minimum_stock_level)}</td>
+                  <td className="num muted">{money(p.cost_price)}</td>
+                  <td className="num">
+                    <input className="inv-input" type="number" step="any" min="0" value={qty}
+                      onChange={e => setLines(prev => ({ ...prev, [p.id]: e.target.value }))}
+                      style={{ width: 90, height: 30, textAlign: 'right' }} aria-label={`Quantity for ${p.name}`} />
+                  </td>
+                  <td className="num strong">{lineTotal > 0 ? money(lineTotal) : '—'}</td>
+                </tr>
+              );
+            })}
+          </Table>
         </div>
-      </div>
+      </Card>
 
-      {selected.length > 0 && (
-        <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(56,189,248,0.3)' }}>
-          <h3 style={{ margin: '0 0 10px 0', fontSize: '0.95rem' }}>Review — {selected.length} item{selected.length > 1 ? 's' : ''}</h3>
+      {selected.length > 0 ? (
+        <Card title={`Review — ${selected.length} item${selected.length > 1 ? 's' : ''}`} padded style={{ borderColor: 'rgba(56,189,248,0.3)' }}>
           {selected.map(l => (
-            <div key={l.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0', borderBottom: '1px solid rgba(255,255,255,0.05)', fontSize: '0.85rem' }}>
-              <span>{l.name} <span style={{ color: '#64748b' }}>({l.sku})</span></span>
-              <span>
-                <span style={{ color: '#94a3b8', marginRight: 12 }}>stock {formatQty(l.current_stock)} {l.unit_of_measure}</span>
+            <div key={l.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: '1px solid var(--inv-line)', fontSize: '0.84rem', gap: 8 }}>
+              <span>{l.name} <span className="muted" style={{ color: 'var(--inv-muted)' }}>({l.sku})</span></span>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <span className="muted" style={{ color: 'var(--inv-muted)' }}>stock {formatQty(l.current_stock)} {l.unit_of_measure}</span>
                 <strong>{formatQty(l.requested_quantity)} {l.unit_of_measure}</strong>
-                <span style={{ marginLeft: 12 }}>{money(l.estimated_total)}</span>
-                <button onClick={() => setLines(prev => { const n = { ...prev }; delete n[l.id]; return n; })}
-                  style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', marginLeft: 10 }}><Trash2 size={14} /></button>
+                <span>{money(l.estimated_total)}</span>
+                <Button size="sm" variant="ghost" icon={Trash2} aria-label="Remove" onClick={() => setLines(prev => { const n = { ...prev }; delete n[l.id]; return n; })} />
               </span>
             </div>
           ))}
           <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10, fontSize: '1rem', fontWeight: 800 }}>
-            Estimated Total:&nbsp;<span style={{ color: '#38bdf8' }}>{money(estimatedTotal)}</span>
+            Estimated total:&nbsp;<span style={{ color: 'var(--inv-accent)' }}>{money(estimatedTotal)}</span>
           </div>
-          <div style={{ fontSize: '0.72rem', color: '#64748b', textAlign: 'right', marginTop: 4 }}>
-            Estimate only — not a purchase, not a payment, and it does not change stock.
-          </div>
-        </div>
-      )}
+          <div className="inv-hint" style={{ textAlign: 'right' }}>Estimate only — not a purchase, not a payment, and it does not change stock.</div>
+        </Card>
+      ) : null}
 
-      <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(255,255,255,0.08)', display: 'grid', gap: 12 }}>
-        <div>
-          <label style={label}>Reason</label>
-          <input value={reason} onChange={e => setReason(e.target.value)} placeholder="e.g. Kitchen stock replenishment" style={input} />
+      <Card padded>
+        <div className="inv-form-grid">
+          <Field label="Reason">
+            <input className="inv-input" value={reason} onChange={e => setReason(e.target.value)} placeholder="e.g. Kitchen stock replenishment" />
+          </Field>
+          <Field label="Remarks">
+            <input className="inv-input" value={remarks} onChange={e => setRemarks(e.target.value)} placeholder="e.g. Required for upcoming occupancy" />
+          </Field>
         </div>
-        <div>
-          <label style={label}>Remarks</label>
-          <input value={remarks} onChange={e => setRemarks(e.target.value)} placeholder="e.g. Required for upcoming occupancy" style={input} />
-        </div>
-      </div>
+      </Card>
 
-      <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
-        <button onClick={onCancel} style={secondaryBtn}>Cancel</button>
-        <button onClick={saveDraft} disabled={busy} style={secondaryBtn}><Save size={15} /> Save Draft</button>
-        <button onClick={submitRequest} disabled={busy} style={primaryBtn}><Send size={15} /> {busy ? 'Working...' : 'Submit Request'}</button>
+      <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+        <Button onClick={onCancel} disabled={busy}>Cancel</Button>
+        <Button icon={Save} onClick={saveDraft} disabled={busy}>Save draft</Button>
+        <Button variant="primary" icon={Send} onClick={submitRequest} disabled={busy}>{busy ? 'Working…' : 'Submit for approval'}</Button>
       </div>
     </div>
   );
 }
 
 /* ── Detail ───────────────────────────────────────────────────────────────── */
-function RequestDetail({ token, requestId, currentUserUid, onBack, canManageOrders, onOpenPurchaseOrder }) {
+function RequestDetail({ token, requestId, currentUserUid, onBack, canManageOrders, onOpenPurchaseOrder, embedded }) {
   const [request, setRequest] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -439,7 +436,7 @@ function RequestDetail({ token, requestId, currentUserUid, onBack, canManageOrde
     try {
       const data = await inventoryFetch(`/inventory/purchase-requests/${requestId}`, { token });
       setRequest(data.request);
-    } catch (err) { setError(err.message); } finally { setLoading(false); }
+    } catch (err) { setError(humanError(err)); } finally { setLoading(false); }
   }, [token, requestId]);
 
   useEffect(() => { load(); }, [load]);
@@ -464,7 +461,7 @@ function RequestDetail({ token, requestId, currentUserUid, onBack, canManageOrde
       setPurchaseOrder(res.order);
       if (onOpenPurchaseOrder) onOpenPurchaseOrder(res.order.id);
     } catch (err) {
-      setError(err.message);
+      setError(humanError(err));
     } finally {
       setOrderBusy(false);
     }
@@ -475,13 +472,26 @@ function RequestDetail({ token, requestId, currentUserUid, onBack, canManageOrde
     try {
       await inventoryFetch(`/inventory/purchase-requests/${requestId}/${action}`, { token, method: 'POST', body });
       await load();
-    } catch (err) { setError(err.message); } finally { setBusy(false); }
+    } catch (err) { setError(humanError(err)); } finally { setBusy(false); }
   };
 
-  if (loading) return <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)' }}>Loading request...</div>;
-  if (!request) return <div style={{ padding: 24 }}><button onClick={onBack} style={iconBtn}><ArrowLeft size={16} /></button><div style={errorBox}>{error || 'Request not found.'}</div></div>;
+  if (loading) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: 8 }}>
+        {[40, 70, 55, 65].map((w, i) => <span key={i} className="inv-skel" style={{ width: `${w}%` }} />)}
+      </div>
+    );
+  }
+  if (!request) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <div><Button variant="ghost" icon={ArrowLeft} onClick={onBack}>Back</Button></div>
+        <Alert tone="error" onRetry={load}>{error || 'This request could not be found.'}</Alert>
+      </div>
+    );
+  }
 
-  const st = STATUS_STYLES[request.status] || STATUS_STYLES.DRAFT;
+  const st = statusOf(PR_STATUS, request.status);
   const isDraft = request.status === 'DRAFT';
   const isOwner = request.requested_by_uid && currentUserUid && String(request.requested_by_uid) === String(currentUserUid);
   const isPending = request.status === 'PENDING_APPROVAL';
@@ -490,202 +500,143 @@ function RequestDetail({ token, requestId, currentUserUid, onBack, canManageOrde
   // button that would always fail.
   const canDecide = isPending && approvalCtx.caller_can_approve && !isOwner;
 
+  const ITEM_COLS = [
+    { key: 'p', label: 'Item' }, { key: 'c', label: 'Category' }, { key: 'q', label: 'Quantity', className: 'num' },
+    { key: 's', label: 'Stock at request', className: 'num' }, { key: 'u', label: 'Est. unit cost', className: 'num' }, { key: 't', label: 'Est. total', className: 'num' }
+  ];
+
   return (
-    <div style={{ padding: 24, color: '#fff', maxWidth: 1100, margin: '0 auto' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
-        <button onClick={onBack} style={iconBtn}><ArrowLeft size={16} /></button>
-        <h2 style={{ margin: 0, fontSize: '1.2rem', fontWeight: 800, fontFamily: 'monospace' }}>{request.request_number || 'DRAFT (not submitted)'}</h2>
-        <span style={{ padding: '4px 10px', borderRadius: 12, fontSize: '0.75rem', fontWeight: 700, background: st.bg, color: st.fg }}>{st.label}</span>
-      </div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <PageHeader
+        title={<><Button variant="ghost" icon={ArrowLeft} onClick={onBack} aria-label="Back" style={{ marginRight: 4 }} /><span className="mono" style={{ fontFamily: 'ui-monospace, Menlo, monospace', color: 'var(--inv-accent)' }}>{request.request_number || 'Draft (not submitted)'}</span> <StatusBadge label={st.label} tone={st.tone} /></>}
+        subtitle={`${request.requested_by_name || request.requested_by_uid} · ${request.department || ''} · ${request.location_name_snapshot || request.location_id} · ${request.business_date}`}
+        actions={
+          <>
+            {canDecide && !rejecting ? (
+              <>
+                <Button icon={ThumbsDown} disabled={busy} onClick={() => { setRejectReason(''); setRejecting(true); }}>Reject</Button>
+                <Button variant="primary" icon={CheckCircle2} disabled={busy} onClick={() => act('approve', {})}>{busy ? 'Working…' : 'Approve'}</Button>
+              </>
+            ) : null}
+            {isDraft ? (
+              <>
+                <Button icon={XCircle} disabled={busy} onClick={() => { if (window.confirm('Cancel this draft purchase request?')) act('cancel', { reason: 'Cancelled by requester' }); }}>Cancel request</Button>
+                <Button variant="primary" icon={Send} disabled={busy} onClick={() => act('submit')}>{busy ? 'Submitting…' : 'Submit for approval'}</Button>
+              </>
+            ) : null}
+          </>
+        }
+      />
 
-      {error && <div style={errorBox}>{error}</div>}
+      {error ? <Alert tone="error" onDismiss={() => setError('')}>{error}</Alert> : null}
 
-      <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(255,255,255,0.08)', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
-        <Field label="Requested By" value={request.requested_by_name || request.requested_by_uid} />
-        <Field label="Department" value={request.department} />
-        <Field label="Location" value={request.location_name_snapshot || request.location_id} />
-        <Field label="Priority" value={request.priority} />
-        <Field label="Business Date" value={request.business_date} />
-        <Field label="Estimated Value" value={money(request.total_estimated_value)} />
-      </div>
+      {canDecide && rejecting ? (
+        <Card padded style={{ borderColor: 'rgba(248,113,113,0.4)' }}>
+          <Field label="Rejection reason (recorded permanently on the request)" required>
+            <input className="inv-input" value={rejectReason} onChange={e => setRejectReason(e.target.value)} autoFocus placeholder="e.g. Budget not available this month" />
+          </Field>
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 12 }}>
+            <Button onClick={() => setRejecting(false)}>Cancel</Button>
+            <Button variant="danger" icon={ThumbsDown} disabled={busy || rejectReason.trim().length < 3}
+              onClick={async () => { await act('reject', { reason: rejectReason.trim() }); setRejecting(false); }}>
+              {busy ? 'Rejecting…' : 'Confirm rejection'}
+            </Button>
+          </div>
+        </Card>
+      ) : null}
 
-      <div className="glass" style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.08)', marginBottom: 16 }}>
-        <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
-          <thead>
-            <tr style={{ background: 'rgba(15,23,42,0.8)', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
-              <th style={th}>Product</th><th style={th}>Category</th><th style={th}>Quantity</th>
-              <th style={th}>Unit</th><th style={th}>Stock at Request</th><th style={th}>Est. Unit Cost</th><th style={th}>Est. Total</th>
+      <Card padded>
+        <div className="inv-kv">
+          <div><span>Requested by</span><strong style={{ fontSize: '0.88rem' }}>{request.requested_by_name || request.requested_by_uid}</strong></div>
+          <div><span>Department</span><strong style={{ fontSize: '0.88rem' }}>{request.department || '—'}</strong></div>
+          <div><span>Location</span><strong style={{ fontSize: '0.88rem' }}>{request.location_name_snapshot || request.location_id}</strong></div>
+          <div><span>Priority</span><strong style={{ fontSize: '0.88rem' }}>{request.priority}</strong></div>
+          <div><span>Business date</span><strong style={{ fontSize: '0.88rem' }}>{request.business_date}</strong></div>
+          <div><span>Estimated value</span><strong>{money(request.total_estimated_value)}</strong></div>
+        </div>
+      </Card>
+
+      <Card>
+        <Table columns={ITEM_COLS}>
+          {(request.items || []).map(it => (
+            <tr key={it.id}>
+              <td><span className="strong">{it.product_name_snapshot}</span><span className="inv-cell-sub">{it.sku}</span></td>
+              <td className="muted">{it.category_name_snapshot}</td>
+              <td className="num strong">{formatQty(it.requested_quantity)} <span className="muted" style={{ fontWeight: 400 }}>{it.unit}</span></td>
+              <td className="num muted">{formatQty(it.current_stock_snapshot)} <span style={{ fontSize: '0.7rem' }}>(min {formatQty(it.minimum_stock_snapshot)})</span></td>
+              <td className="num muted">{money(it.estimated_unit_cost)}</td>
+              <td className="num strong">{money(it.estimated_total)}</td>
             </tr>
-          </thead>
-          <tbody>
-            {(request.items || []).map(it => (
-              <tr key={it.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
-                <td style={{ ...td, fontWeight: 600 }}>{it.product_name_snapshot} <span style={{ color: '#64748b' }}>({it.sku})</span></td>
-                <td style={td}>{it.category_name_snapshot}</td>
-                <td style={{ ...td, fontWeight: 700 }}>{formatQty(it.requested_quantity)}</td>
-                <td style={td}>{it.unit}</td>
-                <td style={{ ...td, color: '#94a3b8' }}>{formatQty(it.current_stock_snapshot)} (min {formatQty(it.minimum_stock_snapshot)})</td>
-                <td style={td}>{money(it.estimated_unit_cost)}</td>
-                <td style={{ ...td, fontWeight: 700 }}>{money(it.estimated_total)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+          ))}
+        </Table>
+      </Card>
 
-      <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(255,255,255,0.08)' }}>
-        <Field label="Reason" value={request.reason || '—'} />
-        <div style={{ height: 10 }} />
-        <Field label="Remarks" value={request.remarks || '—'} />
-      </div>
-
-      <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(255,255,255,0.08)' }}>
-        <h3 style={{ margin: '0 0 10px 0', fontSize: '0.95rem' }}>Timeline</h3>
-        {(request.status_history || []).map((h, i) => (
-          <div key={i} style={{ display: 'flex', gap: 12, fontSize: '0.85rem', padding: '4px 0', color: '#94a3b8' }}>
-            <span style={{ minWidth: 150, color: '#fff', fontWeight: 600 }}>{STATUS_STYLES[h.status]?.label || h.status}</span>
-            <span>{new Date(h.at).toLocaleString()}</span>
-            <span>{h.by_name || h.by_uid || ''}</span>
+      {(request.reason || request.remarks) ? (
+        <Card padded>
+          <div className="inv-kv">
+            <div><span>Reason</span><strong style={{ fontSize: '0.86rem', fontWeight: 500 }}>{request.reason || '—'}</strong></div>
+            <div><span>Remarks</span><strong style={{ fontSize: '0.86rem', fontWeight: 500 }}>{request.remarks || '—'}</strong></div>
           </div>
-        ))}
-        {request.status === 'PENDING_APPROVAL' && (
-          <div style={{ marginTop: 10, fontSize: '0.78rem', color: '#64748b' }}>
-            Awaiting an approval decision. A submitted request can no longer be edited or cancelled — approving or rejecting it is the only way forward.
-          </div>
-        )}
-      </div>
+        </Card>
+      ) : null}
 
-      {request.status === 'APPROVED' && canManageOrders && (
-        <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(56,189,248,0.3)' }}>
-          <h3 style={{ margin: '0 0 10px 0', fontSize: '0.95rem' }}>Purchase Order</h3>
+      {request.status === 'APPROVED' && canManageOrders ? (
+        <Card title="Purchase order" padded style={{ borderColor: 'rgba(56,189,248,0.3)' }}>
           {purchaseOrder ? (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
               <div>
-                <div style={{ fontFamily: 'monospace', fontWeight: 700, color: '#38bdf8' }}>{purchaseOrder.po_number}</div>
-                <div style={{ fontSize: '0.8rem', color: '#94a3b8' }}>
-                  {purchaseOrder.supplier_name_snapshot} · {purchaseOrder.status === 'ISSUED' ? 'Issued' : 'Draft'}
-                </div>
+                <div className="mono" style={{ fontFamily: 'ui-monospace, Menlo, monospace', fontWeight: 700, color: 'var(--inv-accent)' }}>{purchaseOrder.po_number}</div>
+                <div className="inv-hint">{purchaseOrder.supplier_name_snapshot} · {purchaseOrder.status === 'ISSUED' ? 'Issued' : 'Draft'}</div>
               </div>
-              <button onClick={() => onOpenPurchaseOrder && onOpenPurchaseOrder(purchaseOrder.id)} style={primaryBtn}>
-                View Purchase Order
-              </button>
+              <Button variant="primary" icon={ArrowRight} onClick={() => onOpenPurchaseOrder && onOpenPurchaseOrder(purchaseOrder.id)}>View purchase order</Button>
             </div>
           ) : (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-              <div style={{ fontSize: '0.82rem', color: '#94a3b8' }}>
-                No purchase order raised yet. Creating one does not change stock — it produces the document for the supplier.
-              </div>
-              <button onClick={createPurchaseOrder} disabled={orderBusy} style={primaryBtn}>
-                {orderBusy ? 'Creating...' : 'Create Purchase Order'}
-              </button>
+              <div className="inv-hint">No purchase order raised yet. Creating one does not change stock — it produces the document for the supplier.</div>
+              <Button variant="primary" onClick={createPurchaseOrder} disabled={orderBusy}>{orderBusy ? 'Creating…' : 'Create purchase order'}</Button>
             </div>
           )}
-        </div>
-      )}
+        </Card>
+      ) : null}
 
-      {(request.approvals || []).length > 0 && (
-        <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(255,255,255,0.08)' }}>
-          <h3 style={{ margin: '0 0 10px 0', fontSize: '0.95rem' }}>Approval History</h3>
+      {(request.approvals || []).length > 0 ? (
+        <Card title="Approval history" padded>
           {(request.approvals || []).map(a => {
             const approved = a.action === 'APPROVED';
             return (
-              <div key={a.approval_id} style={{ display: 'flex', gap: 12, alignItems: 'flex-start', padding: '8px 0', borderBottom: '1px solid rgba(255,255,255,0.05)', fontSize: '0.85rem' }}>
-                {approved ? <CheckCircle2 size={16} color="#10b981" /> : <ThumbsDown size={16} color="#f87171" />}
+              <div key={a.approval_id} style={{ display: 'flex', gap: 10, alignItems: 'flex-start', padding: '6px 0', borderBottom: '1px solid var(--inv-line)', fontSize: '0.84rem' }}>
+                {approved ? <CheckCircle2 size={15} color="var(--inv-ok)" /> : <ThumbsDown size={15} color="var(--inv-bad)" />}
                 <div>
-                  <div style={{ fontWeight: 700, color: approved ? '#10b981' : '#f87171' }}>
+                  <div style={{ fontWeight: 700, color: approved ? 'var(--inv-ok)' : 'var(--inv-bad)' }}>
                     {approved ? 'Approved' : 'Rejected'} by {a.approver_name || a.approver_uid}
-                    {a.approver_role ? <span style={{ color: '#64748b', fontWeight: 400 }}> ({a.approver_role})</span> : null}
+                    {a.approver_role ? <span className="muted" style={{ color: 'var(--inv-muted)', fontWeight: 400 }}> ({a.approver_role})</span> : null}
                   </div>
-                  <div style={{ color: '#94a3b8', fontSize: '0.8rem' }}>{new Date(a.created_at).toLocaleString()}</div>
-                  {a.comment && <div style={{ marginTop: 4 }}>{approved ? 'Comment' : 'Reason'}: {a.comment}</div>}
+                  <div className="inv-hint">{fmtDateTime(a.created_at)}</div>
+                  {a.comment ? <div style={{ marginTop: 3 }}>{approved ? 'Comment' : 'Reason'}: {a.comment}</div> : null}
                 </div>
               </div>
             );
           })}
-        </div>
-      )}
+        </Card>
+      ) : null}
 
-      {canDecide && !rejecting && (
-        <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end', marginBottom: 12 }}>
-          <button disabled={busy} onClick={() => { setRejectReason(''); setRejecting(true); }} style={secondaryBtn}>
-            <ThumbsDown size={15} /> Reject
-          </button>
-          <button disabled={busy} onClick={() => act('approve', {})} style={primaryBtn}>
-            <CheckCircle2 size={15} /> {busy ? 'Working...' : 'Approve'}
-          </button>
-        </div>
-      )}
-
-      {canDecide && rejecting && (
-        <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(248,113,113,0.4)' }}>
-          <label style={label}>Rejection reason * (recorded permanently on the request)</label>
-          <input value={rejectReason} onChange={e => setRejectReason(e.target.value)} autoFocus
-            placeholder="e.g. Budget not available this month" style={input} />
-          <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end', marginTop: 12 }}>
-            <button onClick={() => setRejecting(false)} style={secondaryBtn}>Cancel</button>
-            <button
-              disabled={busy || rejectReason.trim().length < 3}
-              onClick={async () => { await act('reject', { reason: rejectReason.trim() }); setRejecting(false); }}
-              style={primaryBtn}
-            >
-              <ThumbsDown size={15} /> {busy ? 'Rejecting...' : 'Confirm Rejection'}
-            </button>
+      <Card title="Timeline" padded>
+        {(request.status_history || []).map((h, i) => (
+          <div key={i} style={{ display: 'flex', gap: 12, fontSize: '0.82rem', padding: '3px 0', color: 'var(--inv-muted)' }}>
+            <span style={{ minWidth: 140, color: 'var(--inv-text)', fontWeight: 600 }}>{statusOf(PR_STATUS, h.status).label}</span>
+            <span>{fmtDateTime(h.at)}</span>
+            <span>{h.by_name || h.by_uid || ''}</span>
           </div>
-        </div>
-      )}
-
-      {isPending && isOwner && (
-        <div style={{ textAlign: 'right', fontSize: '0.78rem', color: '#64748b', marginBottom: 12 }}>
-          You raised this request, so you cannot approve or reject it yourself.
-        </div>
-      )}
-      {isPending && !isOwner && !approvalCtx.caller_can_approve && (
-        <div style={{ textAlign: 'right', fontSize: '0.78rem', color: '#64748b', marginBottom: 12 }}>
-          Awaiting a decision from an authorized approver.
-        </div>
-      )}
-
-      {isDraft && (
-        <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
-          <button
-            disabled={busy}
-            onClick={() => { if (window.confirm('Cancel this draft purchase request?')) act('cancel', { reason: 'Cancelled by requester' }); }}
-            style={secondaryBtn}
-          >
-            <XCircle size={15} /> Cancel Request
-          </button>
-          <button disabled={busy} onClick={() => act('submit')} style={primaryBtn}>
-            <Send size={15} /> {busy ? 'Submitting...' : 'Submit for Approval'}
-          </button>
-        </div>
-      )}
-      {isDraft && !isOwner && (
-        <div style={{ textAlign: 'right', fontSize: '0.75rem', color: '#64748b', marginTop: 8 }}>
-          Only the requester or an administrator can submit or cancel this draft; the server enforces this.
-        </div>
-      )}
+        ))}
+        {isPending ? (
+          <div className="inv-hint" style={{ marginTop: 8 }}>
+            Awaiting an approval decision. A submitted request can no longer be edited or cancelled — approving or rejecting it is the only way forward.
+          </div>
+        ) : null}
+        {isPending && isOwner ? <div className="inv-hint">You raised this request, so you cannot approve or reject it yourself.</div> : null}
+        {isPending && !isOwner && !approvalCtx.caller_can_approve ? <div className="inv-hint">Awaiting a decision from an authorised approver.</div> : null}
+        {isDraft && !isOwner ? <div className="inv-hint">Only the requester or an administrator can submit or cancel this draft; the server enforces this.</div> : null}
+      </Card>
     </div>
   );
-}
-
-function Field({ label: l, value }) {
-  return (
-    <div>
-      <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginBottom: 3 }}>{l}</div>
-      <div style={{ fontWeight: 600 }}>{value}</div>
-    </div>
-  );
-}
-
-const th = { padding: '10px 14px' };
-const td = { padding: '9px 14px' };
-const label = { display: 'block', fontSize: '0.8rem', color: '#94a3b8', marginBottom: 4 };
-const input = { width: '100%', padding: '8px 12px', borderRadius: 6, background: '#020617', border: '1px solid rgba(255,255,255,0.12)', color: '#fff' };
-const selectStyle = { padding: '9px 12px', borderRadius: 6, background: '#0f172a', border: '1px solid rgba(255,255,255,0.12)', color: '#fff' };
-const iconBtn = { padding: 9, borderRadius: 6, background: 'rgba(15,23,42,0.6)', border: '1px solid rgba(255,255,255,0.12)', color: '#94a3b8', cursor: 'pointer' };
-const primaryBtn = { display: 'flex', alignItems: 'center', gap: 8, background: 'linear-gradient(135deg, #38bdf8 0%, #0284c7 100%)', color: '#fff', border: 'none', padding: '9px 16px', borderRadius: 8, fontWeight: 700, cursor: 'pointer' };
-const secondaryBtn = { display: 'flex', alignItems: 'center', gap: 8, padding: '9px 16px', borderRadius: 6, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', color: '#94a3b8', fontWeight: 600, cursor: 'pointer' };
-const errorBox = { background: 'rgba(239,68,68,0.15)', border: '1px solid #ef4444', color: '#ef4444', padding: 12, borderRadius: 8, marginBottom: 16 };
-function pagerBtn(disabled) {
-  return { padding: '6px 14px', borderRadius: 6, border: '1px solid rgba(255,255,255,0.12)', background: disabled ? 'rgba(255,255,255,0.02)' : 'rgba(15,23,42,0.6)', color: disabled ? '#475569' : '#fff', cursor: disabled ? 'not-allowed' : 'pointer' };
 }

@@ -7,42 +7,32 @@
  * stock, and it posts the quantity actually ACCEPTED (never the quantity
  * ordered).
  *
- * A purchase order is the formal document sent to ONE supplier, created from
- * exactly ONE approved purchase request. Creating or issuing it does NOT
- * receive goods, does NOT change stock and does NOT pay anyone — the figures
- * shown are the estimates carried over from the approved request.
- *
  * Phase G — Corrections: reverse a goods receipt that was recorded in error,
  * or close a partially received order short when the balance will never
  * arrive. A reversal never edits or deletes the original receipt — it posts a
  * compensating stock movement and records a separate reversal document. The
  * receipt stays in the delivery history exactly as it was written, shown as
- * REVERSED from the JOINED reversal record (`receipt.reversal`, supplied by
- * the delivery-history endpoint), never from a field on the receipt itself.
- * A short close moves no stock at all.
+ * REVERSED from the JOINED reversal record (`receipt.reversal`).
  *
  * Once ISSUED the order is read-only here, matching the server's state machine.
  * All controls are UX only; the server authorizes every call.
+ *
+ * Batch 5: presentation only. Every request, payload, confirmation dialog and
+ * guard is the Phase E/F/G one. Additive props: `receivingOnly` (the Receiving
+ * workspace shows only orders that can still take a delivery) and `embedded`.
  */
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   FileText, Search, RefreshCw, ArrowLeft, Send, CheckCircle2, Building2,
-  PackageCheck, AlertTriangle, Undo2, XCircle, Ban
+  PackageCheck, AlertTriangle, Undo2, XCircle, Ban, ArrowRight
 } from 'lucide-react';
 import { inventoryFetch, formatQty } from './inventoryApi';
+import { Alert, Button, Card, EmptyState, Field, LoadingRows, Pager, StatusBadge, Table, Toolbar, humanError, money, fmtDateTime, PageHeader } from './ui';
+import { PO_STATUS, PO_RECEIVABLE_STATUSES, statusOf } from './statusMaps';
 
-const STATUS_STYLES = {
-  DRAFT:              { bg: 'rgba(148,163,184,0.15)', fg: '#94a3b8', label: 'Draft' },
-  ISSUED:             { bg: 'rgba(56,189,248,0.15)',  fg: '#38bdf8', label: 'Issued' },
-  PARTIALLY_RECEIVED: { bg: 'rgba(245,158,11,0.15)',  fg: '#f59e0b', label: 'Partially Received' },
-  RECEIVED:           { bg: 'rgba(16,185,129,0.15)',  fg: '#10b981', label: 'Received' },
-  CLOSED_SHORT:       { bg: 'rgba(148,163,184,0.15)', fg: '#cbd5e1', label: 'Closed Short' }
-};
-const RECEIVABLE = ['ISSUED', 'PARTIALLY_RECEIVED'];
+const RECEIVABLE = PO_RECEIVABLE_STATUSES;
 
-const money = (n) => `₹${(Number(n) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-
-export default function InventoryPurchaseOrders({ token, openOrderId, onDeepLinkHandled, canCorrect = false }) {
+export default function InventoryPurchaseOrders({ token, openOrderId, onDeepLinkHandled, canCorrect = false, receivingOnly = false, embedded = false }) {
   const [view, setView] = useState('list');
   const [detailId, setDetailId] = useState(null);
 
@@ -56,16 +46,29 @@ export default function InventoryPurchaseOrders({ token, openOrderId, onDeepLink
   }, [openOrderId, onDeepLinkHandled]);
 
   return view === 'detail'
-    ? <OrderDetail token={token} orderId={detailId} canCorrect={canCorrect} onBack={() => setView('list')} />
-    : <OrderList token={token} onOpen={(id) => { setDetailId(id); setView('detail'); }} />;
+    ? <OrderDetail token={token} orderId={detailId} canCorrect={canCorrect} onBack={() => setView('list')} embedded={embedded} />
+    : <OrderList token={token} receivingOnly={receivingOnly} embedded={embedded} onOpen={(id) => { setDetailId(id); setView('detail'); }} />;
 }
 
 /* ── List ─────────────────────────────────────────────────────────────────── */
-function OrderList({ token, onOpen }) {
+const LIST_COLS = [
+  { key: 'no', label: 'Order' },
+  { key: 'sup', label: 'Supplier' },
+  { key: 'loc', label: 'Department / location' },
+  { key: 'items', label: 'Items', className: 'num' },
+  { key: 'val', label: 'Estimated', className: 'num' },
+  { key: 'date', label: 'Date' },
+  { key: 'st', label: 'Status' },
+  { key: 'a', label: '', className: 'action' }
+];
+
+function OrderList({ token, onOpen, receivingOnly, embedded }) {
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [status, setStatus] = useState('');
+  // In receiving mode the default view is "everything that can still take a
+  // delivery". The API filters by one status, so that view is two requests.
+  const [status, setStatus] = useState(receivingOnly ? 'RECEIVABLE' : '');
   const [poNumber, setPoNumber] = useState('');
   const [cursor, setCursor] = useState(null);
   const [cursorStack, setCursorStack] = useState([]);
@@ -75,15 +78,24 @@ function OrderList({ token, onOpen }) {
     setLoading(true);
     setError('');
     try {
-      const params = new URLSearchParams({ limit: '20' });
-      if (status) params.set('status', status);
-      if (poNumber.trim()) params.set('po_number', poNumber.trim());
-      if (cur) params.set('cursor', cur);
-      const data = await inventoryFetch(`/inventory/purchase-orders?${params.toString()}`, { token });
-      setOrders(data.orders || []);
-      setNextCursor(data.next_cursor || null);
+      const fetchStatus = async (st) => {
+        const params = new URLSearchParams({ limit: '20' });
+        if (st) params.set('status', st);
+        if (poNumber.trim()) params.set('po_number', poNumber.trim());
+        if (cur) params.set('cursor', cur);
+        return inventoryFetch(`/inventory/purchase-orders?${params.toString()}`, { token });
+      };
+      if (status === 'RECEIVABLE') {
+        const [a, b] = await Promise.all(RECEIVABLE.map(s => fetchStatus(s)));
+        setOrders([...(a.orders || []), ...(b.orders || [])]);
+        setNextCursor(null);
+      } else {
+        const data = await fetchStatus(status);
+        setOrders(data.orders || []);
+        setNextCursor(data.next_cursor || null);
+      }
     } catch (err) {
-      setError(err.message);
+      setError(humanError(err, 'Unable to load purchase orders right now. Please try again.'));
     } finally {
       setLoading(false);
     }
@@ -92,84 +104,73 @@ function OrderList({ token, onOpen }) {
   useEffect(() => { setCursor(null); setCursorStack([]); load(null); }, [load]);
 
   return (
-    <div style={{ padding: 24, color: '#fff', maxWidth: 1300, margin: '0 auto' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
-        <h2 style={{ margin: 0, fontSize: '1.3rem', fontWeight: 800, display: 'flex', alignItems: 'center', gap: 8 }}>
-          <FileText size={20} /> Purchase Orders
-        </h2>
-        <div style={{ fontSize: '0.78rem', color: '#64748b' }}>
-          Raised from an approved purchase request — creating or issuing one never changes stock.
-        </div>
-      </div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      {!embedded || receivingOnly ? (
+        <PageHeader
+          icon={receivingOnly ? PackageCheck : FileText}
+          title={receivingOnly ? 'Receive Against Purchase Order' : 'Purchase Orders'}
+          subtitle={receivingOnly
+            ? 'Choose the order the delivery belongs to, then compare what was ordered with what arrived.'
+            : 'Raised from an approved purchase request. Creating or issuing an order never changes stock.'}
+        />
+      ) : null}
 
-      <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', border: '1px solid rgba(255,255,255,0.08)' }}>
-        <div style={{ position: 'relative' }}>
-          <Search size={15} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: '#64748b' }} />
-          <input value={poNumber} onChange={e => setPoNumber(e.target.value)} placeholder="PO-20260908-000001"
-            style={{ padding: '8px 12px 8px 32px', borderRadius: 6, background: 'rgba(15,23,42,0.6)', border: '1px solid rgba(255,255,255,0.12)', color: '#fff' }} />
+      <Toolbar>
+        <div className="inv-search" style={{ flex: '0 1 220px' }}>
+          <Search size={14} />
+          <input className="inv-input" value={poNumber} onChange={e => setPoNumber(e.target.value)} placeholder="Order number" aria-label="Order number" />
         </div>
-        <select value={status} onChange={e => setStatus(e.target.value)} style={selectStyle}>
-          <option value="">All Statuses</option>
+        <select className="inv-select" value={status} onChange={e => setStatus(e.target.value)} aria-label="Status">
+          {receivingOnly ? <option value="RECEIVABLE">Awaiting delivery</option> : <option value="">Status</option>}
           <option value="DRAFT">Draft</option>
           <option value="ISSUED">Issued</option>
-          <option value="PARTIALLY_RECEIVED">Partially Received</option>
+          <option value="PARTIALLY_RECEIVED">Partially received</option>
           <option value="RECEIVED">Received</option>
-          <option value="CLOSED_SHORT">Closed Short</option>
+          <option value="CLOSED_SHORT">Closed short</option>
         </select>
-        <button onClick={() => load(cursor)} style={iconBtn}><RefreshCw size={16} /></button>
-      </div>
+        <div className="inv-spacer" />
+        <Button variant="ghost" icon={RefreshCw} onClick={() => load(cursor)} title="Refresh" aria-label="Refresh" />
+      </Toolbar>
 
-      {error && <div style={errorBox}>{error}</div>}
+      {error ? <Alert tone="error" onRetry={() => load(cursor)}>{error}</Alert> : null}
 
-      <div className="glass" style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.08)' }}>
-        {loading ? (
-          <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)' }}>Loading purchase orders...</div>
-        ) : orders.length === 0 ? (
-          <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)' }}>
-            No purchase orders yet. Approve a purchase request, then raise its order from the request detail.
-          </div>
-        ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
-              <thead>
-                <tr style={{ background: 'rgba(15,23,42,0.8)', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
-                  <th style={th}>PO Number</th><th style={th}>Source Request</th><th style={th}>Supplier</th>
-                  <th style={th}>Department</th><th style={th}>Location</th><th style={th}>Items</th>
-                  <th style={th}>Est. Total</th><th style={th}>Created</th><th style={th}>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {orders.map(o => {
-                  const st = STATUS_STYLES[o.status] || STATUS_STYLES.DRAFT;
-                  return (
-                    <tr key={o.id} onClick={() => onOpen(o.id)} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)', cursor: 'pointer' }}>
-                      <td style={{ ...td, fontFamily: 'monospace', color: '#38bdf8' }}>{o.po_number}</td>
-                      <td style={{ ...td, fontFamily: 'monospace', color: '#94a3b8' }}>{o.source_request_number || '—'}</td>
-                      <td style={{ ...td, fontWeight: 600 }}>{o.supplier_name_snapshot}</td>
-                      <td style={td}>{o.department || '—'}</td>
-                      <td style={td}>{o.location_name_snapshot || o.location_id}</td>
-                      <td style={td}>{o.item_count}</td>
-                      <td style={{ ...td, fontWeight: 700 }}>{money(o.total_estimated_value)}</td>
-                      <td style={{ ...td, color: '#94a3b8' }}>{o.business_date}</td>
-                      <td style={td}><span style={{ padding: '3px 9px', borderRadius: 12, fontSize: '0.72rem', fontWeight: 700, background: st.bg, color: st.fg }}>{st.label}</span></td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+      <Card>
+        <Table columns={LIST_COLS}>
+          {loading ? <LoadingRows columns={LIST_COLS.length} rows={6} /> : null}
+          {!loading && orders.length === 0 ? (
+            <tr><td colSpan={LIST_COLS.length}>
+              {receivingOnly && status === 'RECEIVABLE'
+                ? <EmptyState icon={PackageCheck} title="No orders are awaiting delivery" text="Issued orders will appear here until they are fully received or closed." />
+                : <EmptyState title="No purchase orders" text="Approve a purchase request, then raise its order from the request." />}
+            </td></tr>
+          ) : null}
+          {!loading && orders.map(o => {
+            const st = statusOf(PO_STATUS, o.status);
+            return (
+              <tr key={o.id} className="row-link" onClick={() => onOpen(o.id)}>
+                <td className="mono">{o.po_number}{o.source_request_number ? <span className="inv-cell-sub" style={{ fontFamily: 'inherit', color: 'var(--inv-muted)' }}>from {o.source_request_number}</span> : null}</td>
+                <td className="strong">{o.supplier_name_snapshot}</td>
+                <td>{o.department || '—'}<span className="inv-cell-sub">{o.location_name_snapshot || o.location_id}</span></td>
+                <td className="num">{o.item_count}</td>
+                <td className="num strong">{money(o.total_estimated_value)}</td>
+                <td className="muted nowrap">{o.business_date}</td>
+                <td><StatusBadge label={st.label} tone={st.tone} /></td>
+                <td className="action">
+                  {receivingOnly && RECEIVABLE.includes(o.status)
+                    ? <Button size="sm" variant="primary" icon={PackageCheck}>Receive</Button>
+                    : <Button size="sm" variant="ghost" icon={ArrowRight}>Open</Button>}
+                </td>
+              </tr>
+            );
+          })}
+        </Table>
+      </Card>
 
-      <div style={{ display: 'flex', justifyContent: 'center', gap: 8, marginTop: 16, alignItems: 'center' }}>
-        <button disabled={cursorStack.length === 0} onClick={() => {
-          const stack = [...cursorStack]; const prev = stack.pop() || null;
-          setCursorStack(stack); setCursor(prev); load(prev);
-        }} style={pagerBtn(cursorStack.length === 0)}>Previous</button>
-        <button disabled={!nextCursor} onClick={() => {
-          setCursorStack(s => [...s, cursor]); setCursor(nextCursor); load(nextCursor);
-        }} style={pagerBtn(!nextCursor)}>Next</button>
-      </div>
+      {status !== 'RECEIVABLE' ? (
+        <Pager canPrev={cursorStack.length > 0} canNext={Boolean(nextCursor)}
+          onPrev={() => { const stack = [...cursorStack]; const prev = stack.pop() || null; setCursorStack(stack); setCursor(prev); load(prev); }}
+          onNext={() => { setCursorStack(s => [...s, cursor]); setCursor(nextCursor); load(nextCursor); }} />
+      ) : null}
     </div>
   );
 }
@@ -207,7 +208,7 @@ function OrderDetail({ token, orderId, onBack, canCorrect = false }) {
         const r = await inventoryFetch(`/inventory/purchase-orders/${orderId}/receipts`, { token });
         setReceipts(r.receipts || []);
       } catch { setReceipts([]); }
-    } catch (err) { setError(err.message); } finally { setLoading(false); }
+    } catch (err) { setError(humanError(err)); } finally { setLoading(false); }
   }, [token, orderId]);
 
   useEffect(() => { load(); }, [load]);
@@ -218,7 +219,7 @@ function OrderDetail({ token, orderId, onBack, canCorrect = false }) {
     try {
       await inventoryFetch(`/inventory/purchase-orders/${orderId}/issue`, { token, method: 'POST', body: {} });
       await load();
-    } catch (err) { setError(err.message); } finally { setBusy(false); }
+    } catch (err) { setError(humanError(err)); } finally { setBusy(false); }
   };
 
   const outstandingOf = (it) => {
@@ -272,7 +273,7 @@ function OrderDetail({ token, orderId, onBack, canCorrect = false }) {
       setReceiving(false);
       setNotice('Delivery recorded. Stock has been updated.');
       await load();
-    } catch (err) { setError(err.message); } finally { setBusy(false); }
+    } catch (err) { setError(humanError(err)); } finally { setBusy(false); }
   };
 
   /* ── Phase G — corrections ───────────────────────────────────────────── */
@@ -309,7 +310,7 @@ function OrderDetail({ token, orderId, onBack, canCorrect = false }) {
       setReversing(null);
       setNotice(res.message || `${reversing.receipt_number} reversed.`);
       await load();
-    } catch (err) { setError(err.message); } finally { setBusy(false); }
+    } catch (err) { setError(humanError(err)); } finally { setBusy(false); }
   };
 
   const submitShortClose = async () => {
@@ -335,18 +336,24 @@ function OrderDetail({ token, orderId, onBack, canCorrect = false }) {
       setCloseReason('');
       setNotice(res.message || 'Purchase order closed short.');
       await load();
-    } catch (err) { setError(err.message); } finally { setBusy(false); }
+    } catch (err) { setError(humanError(err)); } finally { setBusy(false); }
   };
 
-  if (loading) return <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)' }}>Loading purchase order...</div>;
+  if (loading) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: 8 }}>
+        {[40, 70, 55, 65].map((w, i) => <span key={i} className="inv-skel" style={{ width: `${w}%` }} />)}
+      </div>
+    );
+  }
   if (!order) return (
-    <div style={{ padding: 24 }}>
-      <button onClick={onBack} style={iconBtn}><ArrowLeft size={16} /></button>
-      <div style={errorBox}>{error || 'Purchase order not found.'}</div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div><Button variant="ghost" icon={ArrowLeft} onClick={onBack}>Back</Button></div>
+      <Alert tone="error" onRetry={load}>{error || 'This purchase order could not be found.'}</Alert>
     </div>
   );
 
-  const st = STATUS_STYLES[order.status] || STATUS_STYLES.DRAFT;
+  const st = statusOf(PO_STATUS, order.status);
   const isDraft = order.status === 'DRAFT';
   const isClosedShort = order.status === 'CLOSED_SHORT';
   const canReceive = RECEIVABLE.includes(order.status) && !isClosedShort;
@@ -355,469 +362,299 @@ function OrderDetail({ token, orderId, onBack, canCorrect = false }) {
   const canCloseShort = canCorrect && order.status === 'PARTIALLY_RECEIVED';
   const totalOutstanding = (order.items || []).reduce((sum, it) => sum + outstandingOf(it), 0);
 
+  /** Line status in words: what a storekeeper needs to know at a glance. */
+  const lineState = (it) => {
+    const ordered = Number(it.ordered_quantity) || 0;
+    const received = Number(it.received_quantity) || 0;
+    if (received <= 0) return { label: 'Not received', tone: 'neutral' };
+    if (received < ordered) return { label: 'Short', tone: 'warn' };
+    if (received > ordered) return { label: 'Over', tone: 'bad' };
+    return { label: 'Complete', tone: 'ok' };
+  };
+
+  const ITEM_COLS = [
+    { key: 'p', label: 'Item' }, { key: 'o', label: 'Ordered', className: 'num' }, { key: 'r', label: 'Received', className: 'num' },
+    { key: 'rem', label: 'Remaining', className: 'num' }, { key: 'u', label: 'Unit' }, { key: 's', label: 'Status' }, { key: 'v', label: 'Est. value', className: 'num' }
+  ];
+
   return (
-    <div style={{ padding: 24, color: '#fff', maxWidth: 1100, margin: '0 auto' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20, flexWrap: 'wrap' }}>
-        <button onClick={onBack} style={iconBtn}><ArrowLeft size={16} /></button>
-        <h2 style={{ margin: 0, fontSize: '1.2rem', fontWeight: 800, fontFamily: 'monospace' }}>{order.po_number}</h2>
-        <span style={{ padding: '4px 10px', borderRadius: 12, fontSize: '0.75rem', fontWeight: 700, background: st.bg, color: st.fg }}>{st.label}</span>
-      </div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <PageHeader
+        title={<><Button variant="ghost" icon={ArrowLeft} onClick={onBack} aria-label="Back" style={{ marginRight: 4 }} /><span style={{ fontFamily: 'ui-monospace, Menlo, monospace', color: 'var(--inv-accent)' }}>{order.po_number}</span> <StatusBadge label={st.label} tone={st.tone} /></>}
+        subtitle={`${order.supplier_name_snapshot} · ${order.location_name_snapshot || order.location_id} · ${order.business_date} · from ${order.source_request_number || order.source_request_id}`}
+        actions={
+          <>
+            {isDraft ? <Button variant="primary" icon={Send} disabled={busy} onClick={issue}>{busy ? 'Issuing…' : 'Issue purchase order'}</Button> : null}
+            {canCloseShort && !receiving && !closingShort && !reversing ? (
+              <Button icon={XCircle} onClick={() => { setCloseReason(''); setNotice(''); setClosingShort(true); }}>Close short ({formatQty(totalOutstanding)} outstanding)</Button>
+            ) : null}
+            {canReceive && !receiving && !closingShort && !reversing ? (
+              <Button variant="primary" icon={PackageCheck} onClick={startReceiving}>Receive goods</Button>
+            ) : null}
+          </>
+        }
+      />
 
-      {error && <div style={errorBox}>{error}</div>}
-      {notice && <div style={noticeBox}>{notice}</div>}
+      {error ? <Alert tone="error" onDismiss={() => setError('')}>{error}</Alert> : null}
+      {notice ? <Alert tone="ok" onDismiss={() => setNotice('')}>{notice}</Alert> : null}
 
-      {isClosedShort && (
-        <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(203,213,225,0.35)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 700, marginBottom: 8 }}>
-            <Ban size={16} color="#cbd5e1" /> Closed Short
+      {order.status === 'RECEIVED' ? <Alert tone="ok" title="Fully received">Stock has been posted for every ordered item.</Alert> : null}
+      {isClosedShort ? (
+        <Alert tone="warn" title="Closed short">
+          The outstanding balance on this order was written off as never arriving. Nothing was received for it and no stock was added.
+          {order.close_short_reason ? <div style={{ marginTop: 4 }}>Reason: {order.close_short_reason}</div> : null}
+          <div className="inv-hint" style={{ color: 'inherit', opacity: 0.8 }}>
+            {order.closed_short_by_name || order.closed_short_by_uid || ''}{order.closed_short_at ? ` · ${fmtDateTime(order.closed_short_at)}` : ''} · {formatQty(order.closed_short_outstanding_quantity || 0)} written off across {(order.closed_short_outstanding || []).length} item(s)
           </div>
-          <div style={{ fontSize: '0.85rem', color: '#cbd5e1', marginBottom: 10 }}>
-            The outstanding balance on this order was written off as never arriving.
-            Nothing was received for it and no stock was added.
+        </Alert>
+      ) : null}
+
+      {receiving ? (
+        <Card title={<span style={{ display: 'flex', alignItems: 'center', gap: 8 }}><PackageCheck size={14} color="var(--inv-accent)" /> Receive goods</span>} style={{ borderColor: 'rgba(56,189,248,0.4)' }}>
+          <div className="inv-hint" style={{ padding: '10px 14px 0 14px' }}>
+            Enter what actually arrived. Stock increases by the quantity you accept here. Leave an item blank if it did not arrive.
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
-            <Field label="Reason" value={order.close_short_reason || '—'} />
-            <Field label="Closed By" value={order.closed_short_by_name || order.closed_short_by_uid || '—'} />
-            <Field label="Closed At" value={order.closed_short_at ? new Date(order.closed_short_at).toLocaleString() : '—'} />
-            <Field label="Written Off" value={`${formatQty(order.closed_short_outstanding_quantity || 0)} across ${(order.closed_short_outstanding || []).length} item(s)`} />
-          </div>
-          {(order.closed_short_outstanding || []).length > 0 && (
-            <div style={{ marginTop: 10, fontSize: '0.82rem', color: '#94a3b8' }}>
-              {order.closed_short_outstanding.map(o => (
-                <div key={o.po_item_id}>
-                  {o.product_name}: ordered <strong style={{ color: '#fff' }}>{formatQty(o.ordered_quantity)}</strong>,
-                  {' '}received <strong style={{ color: '#10b981' }}>{formatQty(o.received_quantity)}</strong>,
-                  {' '}<strong style={{ color: '#cbd5e1' }}>{formatQty(o.outstanding_quantity)} {o.unit} never delivered</strong>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(56,189,248,0.25)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, fontWeight: 700 }}>
-          <Building2 size={16} color="#38bdf8" /> Supplier
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
-          <Field label="Name" value={order.supplier_name_snapshot} />
-          <Field label="Phone" value={order.supplier_phone_snapshot || '—'} />
-          <Field label="GSTIN" value={order.supplier_gstin_snapshot || '—'} />
-          <Field label="Address" value={order.supplier_address_snapshot || '—'} />
-        </div>
-        <div style={{ fontSize: '0.72rem', color: '#64748b', marginTop: 8 }}>
-          Supplier details recorded when this order was created. Later changes to the supplier master do not alter this document.
-        </div>
-      </div>
-
-      <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(255,255,255,0.08)', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
-        <Field label="Source Request" value={order.source_request_number || order.source_request_id} mono />
-        <Field label="Department" value={order.department || '—'} />
-        <Field label="Location" value={order.location_name_snapshot || order.location_id} />
-        <Field label="Requested By" value={order.requester_name_snapshot || '—'} />
-        <Field label="Priority" value={order.priority || '—'} />
-        <Field label="Business Date" value={order.business_date} />
-        <Field label="Created By" value={order.created_by_name || '—'} />
-        <Field label="Estimated Total" value={money(order.total_estimated_value)} />
-      </div>
-
-      <div className="glass" style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.08)', marginBottom: 16 }}>
-        <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
-          <thead>
-            <tr style={{ background: 'rgba(15,23,42,0.8)', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
-              <th style={th}>#</th><th style={th}>Product</th><th style={th}>Category</th>
-              <th style={th}>Ordered</th><th style={th}>Received</th><th style={th}>Outstanding</th>
-              <th style={th}>Unit</th><th style={th}>Est. Rate</th><th style={th}>Est. Line Total</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(order.items || []).map(it => (
-              <tr key={it.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
-                <td style={{ ...td, color: '#64748b' }}>{it.line_no}</td>
-                <td style={{ ...td, fontWeight: 600 }}>
-                  {it.product_name_snapshot} <span style={{ color: '#64748b' }}>({it.sku_snapshot})</span>
-                </td>
-                <td style={td}>{it.category_snapshot || '—'}</td>
-                <td style={{ ...td, fontWeight: 700 }}>{formatQty(it.ordered_quantity)}</td>
-                <td style={{ ...td, color: (Number(it.received_quantity) || 0) > 0 ? '#10b981' : '#64748b' }}>
-                  {formatQty(it.received_quantity || 0)}
-                </td>
-                <td style={{ ...td, color: outstandingOf(it) > 0 ? '#f59e0b' : '#64748b' }}>
-                  {formatQty(outstandingOf(it))}
-                </td>
-                <td style={td}>{it.unit_snapshot}</td>
-                <td style={td}>{money(it.estimated_unit_cost)}</td>
-                <td style={{ ...td, fontWeight: 700 }}>{money(it.estimated_line_total)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      {order.remarks && (
-        <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(255,255,255,0.08)' }}>
-          <Field label="Remarks" value={order.remarks} />
-        </div>
-      )}
-
-      {receiving && (
-        <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(56,189,248,0.4)' }}>
-          <h3 style={{ margin: '0 0 4px 0', fontSize: '0.95rem', display: 'flex', alignItems: 'center', gap: 8 }}>
-            <PackageCheck size={16} color="#38bdf8" /> Receive Goods
-          </h3>
-          <div style={{ fontSize: '0.78rem', color: '#64748b', marginBottom: 12 }}>
-            Enter what actually arrived. Stock increases by the quantity you accept here — leave an item blank if it did not arrive.
-          </div>
-
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
-              <thead>
-                <tr style={{ background: 'rgba(15,23,42,0.6)', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
-                  <th style={th}>Item</th><th style={th}>Ordered</th><th style={th}>Received</th>
-                  <th style={th}>Outstanding</th><th style={th}>Receive Now</th><th style={th}>Unit</th><th style={th}>Variance</th>
+          <Table columns={[
+            { key: 'i', label: 'Item' }, { key: 'o', label: 'Ordered', className: 'num' }, { key: 'r', label: 'Received so far', className: 'num' },
+            { key: 'rem', label: 'Remaining', className: 'num' }, { key: 'now', label: 'Receive now', className: 'num' }, { key: 'u', label: 'Unit' }, { key: 'v', label: 'Variance' }
+          ]}>
+            {(order.items || []).map(it => {
+              const ordered = Number(it.ordered_quantity) || 0;
+              const already = Number(it.received_quantity) || 0;
+              const qty = Number(receiveQty[it.id]);
+              const over = Number.isFinite(qty) && qty > 0 ? Math.round((already + qty - ordered) * 1000) / 1000 : 0;
+              const short = Number.isFinite(qty) && qty > 0 && already + qty < ordered ? Math.round((ordered - already - qty) * 1000) / 1000 : 0;
+              return (
+                <tr key={it.id}>
+                  <td className="strong">{it.product_name_snapshot}<span className="inv-cell-sub">{it.sku_snapshot}</span></td>
+                  <td className="num">{formatQty(ordered)}</td>
+                  <td className="num muted">{formatQty(already)}</td>
+                  <td className="num" style={{ color: outstandingOf(it) > 0 ? 'var(--inv-warn)' : 'var(--inv-muted)' }}>{formatQty(outstandingOf(it))}</td>
+                  <td className="num">
+                    <input className="inv-input" type="number" step="any" min="0" value={receiveQty[it.id] ?? ''}
+                      onChange={e => setReceiveQty(prev => ({ ...prev, [it.id]: e.target.value }))}
+                      style={{ width: 96, height: 30, textAlign: 'right' }} aria-label={`Receive quantity for ${it.product_name_snapshot}`} />
+                  </td>
+                  <td className="muted">{it.unit_snapshot}</td>
+                  <td>
+                    {over > 0 ? (
+                      <div>
+                        <StatusBadge label={`Over by ${formatQty(over)}`} tone="bad" icon={AlertTriangle} />
+                        <input className={`inv-input${!String(varianceReason[it.id] || '').trim() ? ' invalid' : ''}`}
+                          value={varianceReason[it.id] || ''}
+                          onChange={e => setVarianceReason(prev => ({ ...prev, [it.id]: e.target.value }))}
+                          placeholder="Reason required"
+                          style={{ marginTop: 5, width: 200, height: 28, fontSize: '0.78rem' }} aria-label="Over-receipt reason" />
+                      </div>
+                    ) : short > 0 ? (
+                      <StatusBadge label={`Short by ${formatQty(short)}`} tone="warn" />
+                    ) : Number.isFinite(qty) && qty > 0 ? (
+                      <StatusBadge label="Exact" tone="ok" />
+                    ) : <span className="muted">—</span>}
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {(order.items || []).map(it => {
-                  const ordered = Number(it.ordered_quantity) || 0;
-                  const already = Number(it.received_quantity) || 0;
-                  const qty = Number(receiveQty[it.id]);
-                  const over = Number.isFinite(qty) && qty > 0
-                    ? Math.round((already + qty - ordered) * 1000) / 1000
-                    : 0;
-                  return (
-                    <tr key={it.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
-                      <td style={{ ...td, fontWeight: 600 }}>{it.product_name_snapshot}</td>
-                      <td style={td}>{formatQty(ordered)}</td>
-                      <td style={td}>{formatQty(already)}</td>
-                      <td style={{ ...td, color: '#f59e0b' }}>{formatQty(outstandingOf(it))}</td>
-                      <td style={td}>
-                        <input type="number" step="any" min="0" value={receiveQty[it.id] ?? ''}
-                          onChange={e => setReceiveQty(prev => ({ ...prev, [it.id]: e.target.value }))}
-                          style={{ width: 90, padding: '6px 8px', borderRadius: 6, background: '#020617', border: '1px solid rgba(255,255,255,0.12)', color: '#fff' }} />
-                      </td>
-                      <td style={td}>{it.unit_snapshot}</td>
-                      <td style={td}>
-                        {over > 0 ? (
-                          <div>
-                            <div style={{ color: '#f59e0b', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 4 }}>
-                              <AlertTriangle size={13} /> +{formatQty(over)} over
-                            </div>
-                            <input
-                              value={varianceReason[it.id] || ''}
-                              onChange={e => setVarianceReason(prev => ({ ...prev, [it.id]: e.target.value }))}
-                              placeholder="Reason required *"
-                              style={{ marginTop: 4, width: 190, padding: '5px 8px', borderRadius: 6, background: '#020617', border: '1px solid rgba(245,158,11,0.6)', color: '#fff', fontSize: '0.8rem' }} />
-                          </div>
-                        ) : <span style={{ color: '#64748b' }}>—</span>}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-
-          <div style={{ marginTop: 12 }}>
-            <label style={{ display: 'block', fontSize: '0.8rem', color: '#94a3b8', marginBottom: 4 }}>Delivery remarks</label>
-            <input value={receiveRemarks} onChange={e => setReceiveRemarks(e.target.value)}
-              placeholder="e.g. Delivered by supplier van, checked at gate"
-              style={{ width: '100%', padding: '8px 12px', borderRadius: 6, background: '#020617', border: '1px solid rgba(255,255,255,0.12)', color: '#fff' }} />
-          </div>
-
-          {receivingLines.length > 0 && (
-            <div style={{ marginTop: 14, padding: 12, borderRadius: 8, background: 'rgba(15,23,42,0.6)' }}>
-              <div style={{ fontWeight: 700, marginBottom: 6, fontSize: '0.9rem' }}>Receiving now</div>
-              {receivingLines.map(l => (
-                <div key={l.it.id} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85rem', padding: '3px 0' }}>
-                  <span>{l.it.product_name_snapshot}</span>
-                  <span><strong>{formatQty(l.qty)} {l.it.unit_snapshot}</strong> · {money(l.qty * (Number(l.it.estimated_unit_cost) || 0))}</span>
+              );
+            })}
+          </Table>
+          <div className="inv-card-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <Field label="Delivery remarks">
+              <input className="inv-input" value={receiveRemarks} onChange={e => setReceiveRemarks(e.target.value)} placeholder="e.g. Delivered by supplier van, checked at gate" />
+            </Field>
+            {receivingLines.length > 0 ? (
+              <div className="inv-card" style={{ padding: 12 }}>
+                <div className="inv-section-title">Receiving now</div>
+                {receivingLines.map(l => (
+                  <div key={l.it.id} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.84rem', padding: '3px 0' }}>
+                    <span>{l.it.product_name_snapshot}</span>
+                    <span><strong>{formatQty(l.qty)} {l.it.unit_snapshot}</strong> · {money(l.qty * (Number(l.it.estimated_unit_cost) || 0))}</span>
+                  </div>
+                ))}
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--inv-line)', fontWeight: 800 }}>
+                  <span>Total value</span><span style={{ color: 'var(--inv-accent)' }}>{money(receivingValue)}</span>
                 </div>
-              ))}
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, paddingTop: 8, borderTop: '1px solid rgba(255,255,255,0.08)', fontWeight: 800 }}>
-                <span>Total value</span><span style={{ color: '#38bdf8' }}>{money(receivingValue)}</span>
+                {overLines.length > 0 ? (
+                  <div style={{ marginTop: 8, color: 'var(--inv-warn)', fontSize: '0.8rem' }}>
+                    {overLines.length} item{overLines.length > 1 ? 's' : ''} exceed the ordered quantity — a reason is required for each.
+                  </div>
+                ) : null}
+                <div className="inv-hint">Stock will increase by exactly these quantities. This records no invoice and no payment.</div>
               </div>
-              {overLines.length > 0 && (
-                <div style={{ marginTop: 8, color: '#f59e0b', fontSize: '0.82rem' }}>
-                  {overLines.length} item{overLines.length > 1 ? 's' : ''} exceed the ordered quantity — a reason is required for each.
-                </div>
-              )}
-              <div style={{ marginTop: 6, fontSize: '0.72rem', color: '#64748b' }}>
-                Stock will increase by exactly these quantities. This records no invoice and no payment.
-              </div>
+            ) : null}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <Button onClick={() => setReceiving(false)} disabled={busy}>Cancel</Button>
+              <Button variant="primary" icon={PackageCheck} onClick={submitReceipt} disabled={busy || receivingLines.length === 0}>{busy ? 'Posting…' : 'Confirm delivery'}</Button>
             </div>
-          )}
-
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 16 }}>
-            <button onClick={() => setReceiving(false)} disabled={busy} style={secondaryBtn}>Cancel</button>
-            <button onClick={submitReceipt} disabled={busy || receivingLines.length === 0} style={primaryBtn}>
-              <PackageCheck size={15} /> {busy ? 'Posting...' : 'Receive Goods'}
-            </button>
           </div>
-        </div>
-      )}
+        </Card>
+      ) : null}
 
-      {receipts.length > 0 && (
-        <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(255,255,255,0.08)' }}>
-          <h3 style={{ margin: '0 0 10px 0', fontSize: '0.95rem' }}>Deliveries ({receipts.length})</h3>
+      <Card>
+        <Table columns={ITEM_COLS}>
+          {(order.items || []).map(it => {
+            const ls = lineState(it);
+            return (
+              <tr key={it.id}>
+                <td><span className="strong">{it.product_name_snapshot}</span><span className="inv-cell-sub">{it.sku_snapshot}{it.category_snapshot ? ` · ${it.category_snapshot}` : ''}</span></td>
+                <td className="num strong">{formatQty(it.ordered_quantity)}</td>
+                <td className="num" style={{ color: (Number(it.received_quantity) || 0) > 0 ? 'var(--inv-ok)' : 'var(--inv-muted)' }}>{formatQty(it.received_quantity || 0)}</td>
+                <td className="num" style={{ color: outstandingOf(it) > 0 ? 'var(--inv-warn)' : 'var(--inv-muted)' }}>{formatQty(outstandingOf(it))}</td>
+                <td className="muted">{it.unit_snapshot}</td>
+                <td><StatusBadge label={ls.label} tone={ls.tone} /></td>
+                <td className="num muted">{money(it.estimated_line_total)}<span className="inv-cell-sub">@ {money(it.estimated_unit_cost)}</span></td>
+              </tr>
+            );
+          })}
+        </Table>
+      </Card>
+
+      <div className="inv-two-col">
+        <Card title={<span style={{ display: 'flex', alignItems: 'center', gap: 8 }}><Building2 size={13} /> Supplier</span>} padded>
+          <div className="inv-kv">
+            <div><span>Name</span><strong style={{ fontSize: '0.88rem' }}>{order.supplier_name_snapshot}</strong></div>
+            <div><span>Phone</span><strong style={{ fontSize: '0.88rem' }}>{order.supplier_phone_snapshot || '—'}</strong></div>
+            <div><span>GSTIN</span><strong style={{ fontSize: '0.88rem' }}>{order.supplier_gstin_snapshot || '—'}</strong></div>
+            <div><span>Address</span><strong style={{ fontSize: '0.86rem', fontWeight: 500 }}>{order.supplier_address_snapshot || '—'}</strong></div>
+          </div>
+          <div className="inv-hint" style={{ marginTop: 8 }}>Recorded when the order was created; later changes to the supplier master do not alter this document.</div>
+        </Card>
+        <Card title="Order" padded>
+          <div className="inv-kv">
+            <div><span>Requested by</span><strong style={{ fontSize: '0.88rem' }}>{order.requester_name_snapshot || '—'}</strong></div>
+            <div><span>Department</span><strong style={{ fontSize: '0.88rem' }}>{order.department || '—'}</strong></div>
+            <div><span>Priority</span><strong style={{ fontSize: '0.88rem' }}>{order.priority || '—'}</strong></div>
+            <div><span>Created by</span><strong style={{ fontSize: '0.88rem' }}>{order.created_by_name || '—'}</strong></div>
+            <div><span>Estimated total</span><strong>{money(order.total_estimated_value)}</strong></div>
+          </div>
+          {order.remarks ? <div className="inv-hint" style={{ marginTop: 8 }}>Remarks: {order.remarks}</div> : null}
+        </Card>
+      </div>
+
+      {receipts.length > 0 ? (
+        <Card title={`Deliveries (${receipts.length})`}>
           {receipts.map(r => {
             // The receipt document is immutable and says nothing about
             // reversal; `r.reversal` is joined from goods_receipt_reversals.
             const rev = r.reversal || null;
             const isReversed = Boolean(rev);
             return (
-              <div key={r.id} style={{
-                padding: '10px 0', borderBottom: '1px solid rgba(255,255,255,0.05)',
-                opacity: isReversed ? 0.75 : 1
-              }}>
+              <div key={r.id} style={{ padding: '10px 14px', borderBottom: '1px solid var(--inv-line)', opacity: isReversed ? 0.75 : 1 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
                   <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span style={{
-                      fontFamily: 'monospace', fontWeight: 700,
-                      color: isReversed ? '#94a3b8' : '#38bdf8',
-                      textDecoration: isReversed ? 'line-through' : 'none'
-                    }}>{r.receipt_number}</span>
-                    {isReversed && (
-                      <span style={{
-                        padding: '2px 8px', borderRadius: 10, fontSize: '0.7rem', fontWeight: 800,
-                        background: 'rgba(239,68,68,0.15)', color: '#f87171', letterSpacing: '0.04em'
-                      }}>REVERSED</span>
-                    )}
+                    <span style={{ fontFamily: 'ui-monospace, Menlo, monospace', fontWeight: 700, color: isReversed ? 'var(--inv-muted)' : 'var(--inv-accent)', textDecoration: isReversed ? 'line-through' : 'none' }}>{r.receipt_number}</span>
+                    {isReversed ? <StatusBadge label="Reversed" tone="bad" /> : <StatusBadge label="Received" tone="ok" />}
                   </span>
-                  <span style={{ color: '#94a3b8', fontSize: '0.82rem' }}>
-                    {new Date(r.received_at).toLocaleString()} · {r.received_by_name || r.received_by_uid} · {money(r.total_received_value)}
-                  </span>
+                  <span className="inv-hint" style={{ margin: 0 }}>{fmtDateTime(r.received_at)} · {r.received_by_name || r.received_by_uid} · {money(r.total_received_value)}</span>
                 </div>
                 {(r.items || []).map(li => (
-                  <div key={li.id} style={{ fontSize: '0.82rem', color: '#94a3b8', paddingLeft: 4 }}>
-                    {li.product_name_snapshot}: <strong style={{ color: isReversed ? '#94a3b8' : '#fff' }}>{formatQty(li.received_quantity)} {li.unit_snapshot}</strong>
-                    {li.variance_type === 'OVER' && (
-                      <span style={{ color: '#f59e0b' }}> · +{formatQty(li.variance_quantity)} over ({li.variance_reason})</span>
-                    )}
-                    {!isReversed && li.outstanding_quantity > 0 && (
-                      <span style={{ color: '#64748b' }}> · {formatQty(li.outstanding_quantity)} still outstanding</span>
-                    )}
+                  <div key={li.id} style={{ fontSize: '0.8rem', color: 'var(--inv-muted)', paddingLeft: 4, marginTop: 2 }}>
+                    {li.product_name_snapshot}: <strong style={{ color: isReversed ? 'var(--inv-muted)' : 'var(--inv-text)' }}>{formatQty(li.received_quantity)} {li.unit_snapshot}</strong>
+                    {li.variance_type === 'OVER' ? <span style={{ color: 'var(--inv-warn)' }}> · +{formatQty(li.variance_quantity)} over ({li.variance_reason})</span> : null}
+                    {!isReversed && li.outstanding_quantity > 0 ? <span> · {formatQty(li.outstanding_quantity)} still outstanding</span> : null}
                   </div>
                 ))}
-                {r.remarks && <div style={{ fontSize: '0.8rem', color: '#64748b', paddingLeft: 4 }}>{r.remarks}</div>}
-
+                {r.remarks ? <div className="inv-hint" style={{ paddingLeft: 4 }}>{r.remarks}</div> : null}
                 {isReversed ? (
-                  <div style={{
-                    marginTop: 8, padding: '8px 10px', borderRadius: 6,
-                    background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)',
-                    fontSize: '0.8rem', color: '#fca5a5'
-                  }}>
-                    <strong>Reversed</strong>
-                    {rev.reversed_by_name ? ` by ${rev.reversed_by_name}` : ''}
-                    {(rev.reversed_at || rev.created_at)
-                      ? ` on ${new Date(rev.reversed_at || rev.created_at).toLocaleString()}`
-                      : ''}
-                    {rev.reason ? ` — ${rev.reason}` : ''}
-                    <div style={{ color: '#94a3b8', marginTop: 3 }}>
-                      The quantities above are kept for the record. Their stock effect has been cancelled.
+                  <div className="inv-alert error" style={{ marginTop: 8, padding: '8px 10px', fontSize: '0.78rem' }}>
+                    <div>
+                      <strong>Reversed</strong>{rev.reversed_by_name ? ` by ${rev.reversed_by_name}` : ''}{(rev.reversed_at || rev.created_at) ? ` on ${fmtDateTime(rev.reversed_at || rev.created_at)}` : ''}{rev.reason ? ` — ${rev.reason}` : ''}
+                      <div style={{ opacity: 0.8, marginTop: 3 }}>The quantities above are kept for the record. Their stock effect has been cancelled.</div>
                     </div>
                   </div>
-                ) : canCorrect && !isClosedShort && (
+                ) : canCorrect && !isClosedShort ? (
                   <div style={{ marginTop: 8 }}>
-                    <button onClick={() => startReversal(r)} disabled={busy} style={dangerBtn}>
-                      <Undo2 size={14} /> Reverse this delivery
-                    </button>
+                    <Button size="sm" variant="danger" icon={Undo2} onClick={() => startReversal(r)} disabled={busy}>Reverse this delivery</Button>
                   </div>
-                )}
+                ) : null}
               </div>
             );
           })}
-          {isClosedShort && receipts.some(r => !r.reversal) && (
-            <div style={{ marginTop: 10, fontSize: '0.78rem', color: '#64748b' }}>
-              This order was closed short, which is a final purchasing decision — its deliveries can no longer be reversed.
-            </div>
-          )}
-        </div>
-      )}
+          {isClosedShort && receipts.some(r => !r.reversal) ? (
+            <div className="inv-hint" style={{ padding: '8px 14px' }}>This order was closed short, which is a final purchasing decision — its deliveries can no longer be reversed.</div>
+          ) : null}
+        </Card>
+      ) : null}
 
-      {reversing && (
-        <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(239,68,68,0.5)' }}>
-          <h3 style={{ margin: '0 0 4px 0', fontSize: '0.95rem', display: 'flex', alignItems: 'center', gap: 8, color: '#f87171' }}>
-            <Undo2 size={16} /> Reverse Delivery {reversing.receipt_number}
-          </h3>
-          <div style={{ fontSize: '0.8rem', color: '#fca5a5', marginBottom: 12, display: 'flex', gap: 6, alignItems: 'flex-start' }}>
-            <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
-            <span>
-              This removes the stock this delivery added and reopens the purchase order for those quantities.
-              The receipt is never deleted — it stays in the history marked REVERSED.
-            </span>
+      {reversing ? (
+        <Card title={<span style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--inv-bad)' }}><Undo2 size={14} /> Reverse delivery {reversing.receipt_number}</span>} padded style={{ borderColor: 'rgba(248,113,113,0.5)' }}>
+          <Alert tone="error">This removes the stock this delivery added and reopens the purchase order for those quantities. The receipt is never deleted — it stays in the history marked Reversed.</Alert>
+          <div className="inv-kv" style={{ margin: '12px 0' }}>
+            <div><span>Receipt</span><strong style={{ fontFamily: 'ui-monospace, Menlo, monospace' }}>{reversing.receipt_number}</strong></div>
+            <div><span>Supplier</span><strong style={{ fontSize: '0.88rem' }}>{order.supplier_name_snapshot}</strong></div>
+            <div><span>Received on</span><strong style={{ fontSize: '0.88rem' }}>{fmtDateTime(reversing.received_at)}</strong></div>
+            <div><span>Received by</span><strong style={{ fontSize: '0.88rem' }}>{reversing.received_by_name || reversing.received_by_uid || '—'}</strong></div>
           </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 12 }}>
-            <Field label="Receipt" value={reversing.receipt_number} mono />
-            <Field label="Supplier" value={order.supplier_name_snapshot} />
-            <Field label="Received On" value={new Date(reversing.received_at).toLocaleString()} />
-            <Field label="Received By" value={reversing.received_by_name || reversing.received_by_uid || '—'} />
-          </div>
-
-          <div style={{ padding: 12, borderRadius: 8, background: 'rgba(15,23,42,0.6)', marginBottom: 12 }}>
-            <div style={{ fontWeight: 700, marginBottom: 6, fontSize: '0.9rem' }}>Stock that will be removed</div>
+          <div className="inv-card" style={{ padding: 12, marginBottom: 12 }}>
+            <div className="inv-section-title">Stock that will be removed</div>
             {(reversing.items || []).map(li => (
-              <div key={li.id} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85rem', padding: '3px 0' }}>
+              <div key={li.id} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.84rem', padding: '3px 0' }}>
                 <span>{li.product_name_snapshot}</span>
-                <span style={{ color: '#f87171', fontWeight: 700 }}>−{formatQty(li.received_quantity)} {li.unit_snapshot}</span>
+                <span style={{ color: 'var(--inv-bad)', fontWeight: 700 }}>−{formatQty(li.received_quantity)} {li.unit_snapshot}</span>
               </div>
             ))}
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, paddingTop: 8, borderTop: '1px solid rgba(255,255,255,0.08)', fontWeight: 800 }}>
-              <span>Value reversed</span><span style={{ color: '#f87171' }}>{money(reversing.total_received_value)}</span>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--inv-line)', fontWeight: 800 }}>
+              <span>Value reversed</span><span style={{ color: 'var(--inv-bad)' }}>{money(reversing.total_received_value)}</span>
             </div>
           </div>
-
-          <label style={{ display: 'block', fontSize: '0.8rem', color: '#94a3b8', marginBottom: 4 }}>
-            Reason for reversal <span style={{ color: '#f87171' }}>*</span>
-          </label>
-          <input value={reverseReason} onChange={e => setReverseReason(e.target.value)}
-            placeholder="e.g. Wrong quantity entered / Duplicate receipt / Wrong supplier delivery"
-            style={{ width: '100%', padding: '8px 12px', borderRadius: 6, background: '#020617', border: '1px solid rgba(239,68,68,0.5)', color: '#fff' }} />
-
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 16 }}>
-            <button onClick={() => { setReversing(null); setError(''); }} disabled={busy} style={secondaryBtn}>Cancel</button>
-            <button onClick={submitReversal} disabled={busy || reverseReason.trim().length < 3} style={dangerPrimaryBtn}>
-              <Undo2 size={15} /> {busy ? 'Reversing...' : 'Reverse Delivery'}
-            </button>
+          <Field label="Reason for reversal" required>
+            <input className="inv-input" value={reverseReason} onChange={e => setReverseReason(e.target.value)} placeholder="e.g. Wrong quantity entered / Duplicate receipt / Wrong supplier delivery" />
+          </Field>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
+            <Button onClick={() => { setReversing(null); setError(''); }} disabled={busy}>Cancel</Button>
+            <Button variant="danger" icon={Undo2} onClick={submitReversal} disabled={busy || reverseReason.trim().length < 3}>{busy ? 'Reversing…' : 'Reverse delivery'}</Button>
           </div>
-        </div>
-      )}
+        </Card>
+      ) : null}
 
-      {closingShort && (
-        <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(203,213,225,0.4)' }}>
-          <h3 style={{ margin: '0 0 4px 0', fontSize: '0.95rem', display: 'flex', alignItems: 'center', gap: 8 }}>
-            <XCircle size={16} color="#cbd5e1" /> Close {order.po_number} Short
-          </h3>
-          <div style={{ fontSize: '0.8rem', color: '#94a3b8', marginBottom: 12 }}>
-            Use this when the supplier will not deliver the rest. The outstanding balance is written off.
-            No stock changes, no delivery is recorded, and nothing is received for the missing quantity.
+      {closingShort ? (
+        <Card title={<span style={{ display: 'flex', alignItems: 'center', gap: 8 }}><XCircle size={14} /> Close {order.po_number} short</span>} padded style={{ borderColor: 'rgba(203,213,225,0.4)' }}>
+          <div className="inv-hint" style={{ marginBottom: 10 }}>
+            Use this when the supplier will not deliver the rest. The outstanding balance is written off. No stock changes, no delivery is recorded, and nothing is received for the missing quantity.
           </div>
-
-          <div style={{ overflowX: 'auto', marginBottom: 12 }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
-              <thead>
-                <tr style={{ background: 'rgba(15,23,42,0.6)', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
-                  <th style={th}>Item</th><th style={th}>Ordered</th><th style={th}>Received</th>
-                  <th style={th}>Never Delivered</th><th style={th}>Unit</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(order.items || []).filter(it => outstandingOf(it) > 0).map(it => (
-                  <tr key={it.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
-                    <td style={{ ...td, fontWeight: 600 }}>{it.product_name_snapshot}</td>
-                    <td style={td}>{formatQty(it.ordered_quantity)}</td>
-                    <td style={{ ...td, color: '#10b981' }}>{formatQty(it.received_quantity || 0)}</td>
-                    <td style={{ ...td, color: '#cbd5e1', fontWeight: 700 }}>{formatQty(outstandingOf(it))}</td>
-                    <td style={td}>{it.unit_snapshot}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <Table columns={[{ key: 'i', label: 'Item' }, { key: 'o', label: 'Ordered', className: 'num' }, { key: 'r', label: 'Received', className: 'num' }, { key: 'n', label: 'Never delivered', className: 'num' }, { key: 'u', label: 'Unit' }]}>
+            {(order.items || []).filter(it => outstandingOf(it) > 0).map(it => (
+              <tr key={it.id}>
+                <td className="strong">{it.product_name_snapshot}</td>
+                <td className="num">{formatQty(it.ordered_quantity)}</td>
+                <td className="num" style={{ color: 'var(--inv-ok)' }}>{formatQty(it.received_quantity || 0)}</td>
+                <td className="num strong">{formatQty(outstandingOf(it))}</td>
+                <td className="muted">{it.unit_snapshot}</td>
+              </tr>
+            ))}
+          </Table>
+          <div style={{ marginTop: 12 }}>
+            <Field label="Reason for closing short" required>
+              <input className="inv-input" value={closeReason} onChange={e => setCloseReason(e.target.value)} placeholder="e.g. Supplier confirmed the remaining quantity is unavailable" />
+            </Field>
           </div>
-
-          <label style={{ display: 'block', fontSize: '0.8rem', color: '#94a3b8', marginBottom: 4 }}>
-            Reason for closing short <span style={{ color: '#f87171' }}>*</span>
-          </label>
-          <input value={closeReason} onChange={e => setCloseReason(e.target.value)}
-            placeholder="e.g. Supplier confirmed the remaining quantity is unavailable"
-            style={{ width: '100%', padding: '8px 12px', borderRadius: 6, background: '#020617', border: '1px solid rgba(255,255,255,0.2)', color: '#fff' }} />
-
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 16 }}>
-            <button onClick={() => { setClosingShort(false); setError(''); }} disabled={busy} style={secondaryBtn}>Cancel</button>
-            <button onClick={submitShortClose} disabled={busy || closeReason.trim().length < 3} style={primaryBtn}>
-              <XCircle size={15} /> {busy ? 'Closing...' : 'Close Short'}
-            </button>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
+            <Button onClick={() => { setClosingShort(false); setError(''); }} disabled={busy}>Cancel</Button>
+            <Button variant="primary" icon={XCircle} onClick={submitShortClose} disabled={busy || closeReason.trim().length < 3}>{busy ? 'Closing…' : 'Close short'}</Button>
           </div>
-        </div>
-      )}
+        </Card>
+      ) : null}
 
-      <div className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 16, border: '1px solid rgba(255,255,255,0.08)' }}>
-        <h3 style={{ margin: '0 0 10px 0', fontSize: '0.95rem' }}>History</h3>
+      <Card title="History" padded>
         {(order.status_history || []).map((h, i) => (
-          <div key={i} style={{ fontSize: '0.85rem', padding: '4px 0', color: '#94a3b8' }}>
+          <div key={i} style={{ fontSize: '0.82rem', padding: '3px 0', color: 'var(--inv-muted)' }}>
             <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-              <span style={{ minWidth: 90, color: '#fff', fontWeight: 600 }}>{STATUS_STYLES[h.status]?.label || h.status}</span>
-              <span>{new Date(h.at).toLocaleString()}</span>
+              <span style={{ minWidth: 130, color: 'var(--inv-text)', fontWeight: 600 }}>{statusOf(PO_STATUS, h.status).label}</span>
+              <span>{fmtDateTime(h.at)}</span>
               <span>{h.by_name || h.by_uid || ''}</span>
-              {h.receipt_number && <span style={{ fontFamily: 'monospace', color: '#38bdf8' }}>{h.receipt_number}</span>}
-              {h.reversed_receipt_number && (
-                <span style={{ fontFamily: 'monospace', color: '#f87171' }}>
-                  {h.reversed_receipt_number} reversed
-                </span>
-              )}
-              {h.outstanding_quantity > 0 && h.status === 'CLOSED_SHORT' && (
-                <span style={{ color: '#cbd5e1' }}>{formatQty(h.outstanding_quantity)} written off</span>
-              )}
+              {h.receipt_number ? <span style={{ fontFamily: 'ui-monospace, Menlo, monospace', color: 'var(--inv-accent)' }}>{h.receipt_number}</span> : null}
+              {h.reversed_receipt_number ? <span style={{ fontFamily: 'ui-monospace, Menlo, monospace', color: 'var(--inv-bad)' }}>{h.reversed_receipt_number} reversed</span> : null}
+              {h.outstanding_quantity > 0 && h.status === 'CLOSED_SHORT' ? <span>{formatQty(h.outstanding_quantity)} written off</span> : null}
             </div>
-            {h.reason && (
-              <div style={{ paddingLeft: 102, fontSize: '0.8rem', color: '#64748b' }}>{h.reason}</div>
-            )}
+            {h.reason ? <div className="inv-hint" style={{ paddingLeft: 142 }}>{h.reason}</div> : null}
           </div>
         ))}
-        {order.status === 'ISSUED' && (
-          <div style={{ marginTop: 10, fontSize: '0.78rem', color: '#64748b' }}>
+        {order.status === 'ISSUED' ? (
+          <div className="inv-hint" style={{ marginTop: 8 }}>
             {receipts.length > 0
               ? 'Every delivery recorded against this order has been reversed, so nothing is currently received and the full quantity is outstanding again.'
-              : 'This order has been issued and its figures are now read-only. Record deliveries with Receive Goods — that is what changes stock.'}
+              : 'This order has been issued and its figures are now read-only. Record deliveries with Receive goods — that is what changes stock.'}
           </div>
-        )}
-      </div>
-
-      {isDraft && (
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12 }}>
-          <button disabled={busy} onClick={issue} style={primaryBtn}>
-            <Send size={15} /> {busy ? 'Issuing...' : 'Issue Purchase Order'}
-          </button>
-        </div>
-      )}
-      {(canReceive || canCloseShort) && !receiving && !closingShort && !reversing && (
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, flexWrap: 'wrap' }}>
-          {canCloseShort && (
-            <button onClick={() => { setCloseReason(''); setNotice(''); setClosingShort(true); }} style={secondaryBtn}>
-              <XCircle size={15} /> Close Short ({formatQty(totalOutstanding)} outstanding)
-            </button>
-          )}
-          {canReceive && (
-            <button onClick={startReceiving} style={primaryBtn}>
-              <PackageCheck size={15} /> Receive Goods
-            </button>
-          )}
-        </div>
-      )}
-      {order.status === 'RECEIVED' && (
-        <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, color: '#10b981', fontWeight: 600, fontSize: '0.9rem' }}>
-          <CheckCircle2 size={16} /> Fully received — stock has been posted for every ordered item.
-        </div>
-      )}
-      {isClosedShort && (
-        <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, color: '#cbd5e1', fontWeight: 600, fontSize: '0.9rem' }}>
-          <Ban size={16} /> Closed short — no further deliveries or corrections are accepted for this order.
-        </div>
-      )}
+        ) : null}
+      </Card>
     </div>
   );
-}
-
-function Field({ label: l, value, mono }) {
-  return (
-    <div>
-      <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginBottom: 3 }}>{l}</div>
-      <div style={{ fontWeight: 600, fontFamily: mono ? 'monospace' : undefined }}>{value}</div>
-    </div>
-  );
-}
-
-const th = { padding: '10px 14px' };
-const td = { padding: '9px 14px' };
-const selectStyle = { padding: '9px 12px', borderRadius: 6, background: '#0f172a', border: '1px solid rgba(255,255,255,0.12)', color: '#fff' };
-const iconBtn = { padding: 9, borderRadius: 6, background: 'rgba(15,23,42,0.6)', border: '1px solid rgba(255,255,255,0.12)', color: '#94a3b8', cursor: 'pointer' };
-const primaryBtn = { display: 'flex', alignItems: 'center', gap: 8, background: 'linear-gradient(135deg, #38bdf8 0%, #0284c7 100%)', color: '#fff', border: 'none', padding: '9px 16px', borderRadius: 8, fontWeight: 700, cursor: 'pointer' };
-const secondaryBtn = { display: 'flex', alignItems: 'center', gap: 8, padding: '9px 16px', borderRadius: 6, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', color: '#94a3b8', fontWeight: 600, cursor: 'pointer' };
-const dangerBtn = { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 10px', borderRadius: 6, background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.35)', color: '#f87171', fontWeight: 600, fontSize: '0.78rem', cursor: 'pointer' };
-const dangerPrimaryBtn = { display: 'flex', alignItems: 'center', gap: 8, background: 'linear-gradient(135deg, #ef4444 0%, #b91c1c 100%)', color: '#fff', border: 'none', padding: '9px 16px', borderRadius: 8, fontWeight: 700, cursor: 'pointer' };
-const errorBox = { background: 'rgba(239,68,68,0.15)', border: '1px solid #ef4444', color: '#ef4444', padding: 12, borderRadius: 8, marginBottom: 16 };
-const noticeBox = { background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.5)', color: '#10b981', padding: 12, borderRadius: 8, marginBottom: 16 };
-function pagerBtn(disabled) {
-  return { padding: '6px 14px', borderRadius: 6, border: '1px solid rgba(255,255,255,0.12)', background: disabled ? 'rgba(255,255,255,0.02)' : 'rgba(15,23,42,0.6)', color: disabled ? '#475569' : '#fff', cursor: disabled ? 'not-allowed' : 'pointer' };
 }

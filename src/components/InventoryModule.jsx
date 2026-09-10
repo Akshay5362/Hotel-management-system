@@ -18,7 +18,7 @@ import {
 
 import { API_URL as API_BASE, getAssetUrl, getApiHeaders } from '../config/apiConfig';
 
-export default function InventoryModule({ token: tokenProp }) {
+export default function InventoryModule({ token: tokenProp, embedded = false }) {
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState([]);
   // Phase A: units and locations are real master data (backend/repositories/
@@ -136,7 +136,7 @@ export default function InventoryModule({ token: tokenProp }) {
       });
 
       if (!res.ok) {
-        throw new Error(`Failed to load inventory products (HTTP ${res.status})`);
+        throw new Error(res.status === 403 ? 'You do not have permission to view items.' : 'Unable to load items right now. Please try again.');
       }
 
       const data = await res.json();
@@ -146,7 +146,7 @@ export default function InventoryModule({ token: tokenProp }) {
       }
       setPageInfo({ total: data.total || 0, total_pages: data.total_pages || 1 });
     } catch (err) {
-      setError(err.message || 'Error loading inventory.');
+      setError(err.message || 'Unable to load items right now. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -340,7 +340,7 @@ export default function InventoryModule({ token: tokenProp }) {
   };
 
   return (
-    <div style={{ padding: '24px', color: '#fff', maxWidth: '1400px', margin: '0 auto' }}>
+    <div style={{ padding: embedded ? 0 : '24px', color: '#fff', maxWidth: embedded ? 'none' : '1400px', margin: '0 auto' }}>
       
       {/* Toast Notification */}
       {toast.show && (
@@ -367,36 +367,25 @@ export default function InventoryModule({ token: tokenProp }) {
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
         <div>
-          <h1 style={{ fontSize: '1.8rem', fontWeight: 800, margin: 0, display: 'flex', alignItems: 'center', gap: '10px' }}>
-            <Package color="var(--accent-color, #38bdf8)" size={28} />
-            Inventory & Product Master
-          </h1>
-          <p style={{ color: 'var(--text-muted, #94a3b8)', margin: '4px 0 0 0', fontSize: '0.9rem' }}>
-            Manage hotel stock items, minimum thresholds, unit pricing, and department categories.
+          <h2 style={{ fontSize: '1.15rem', fontWeight: 700, margin: 0, display: 'flex', alignItems: 'center', gap: '8px', fontFamily: 'var(--font-heading, Outfit, sans-serif)' }}>
+            <Package color="var(--accent-color, #38bdf8)" size={18} />
+            Items
+          </h2>
+          <p style={{ color: 'var(--text-muted, #94a3b8)', margin: '3px 0 0 0', fontSize: '0.8rem' }}>
+            The product master: SKU, category, unit, minimum level, cost and photo. Opening stock is recorded here once; everything after that goes through the stock ledger.
           </p>
         </div>
 
         <button 
           onClick={() => openModal()}
-          style={{
-            background: 'linear-gradient(135deg, #38bdf8 0%, #0284c7 100%)',
-            color: '#fff',
-            border: 'none',
-            padding: '10px 20px',
-            borderRadius: '8px',
-            fontWeight: 700,
-            cursor: 'pointer',
-            display: 'flex',
-            alignItems: 'center',
-            gap: '8px',
-            boxShadow: '0 4px 14px rgba(56, 189, 248, 0.3)'
-          }}
+          className="inv-btn primary"
         >
-          <Plus size={18} /> Add Product
+          <Plus size={15} /> Add Item
         </button>
       </div>
 
-      {/* Dashboard Summary Cards */}
+      {/* Dashboard Summary Cards — Overview owns the KPIs; shown only standalone */}
+      {!embedded && (
       <div style={{
         display: 'grid',
         gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
@@ -435,6 +424,7 @@ export default function InventoryModule({ token: tokenProp }) {
           <div style={{ fontSize: '1.8rem', fontWeight: 800, marginTop: '8px', color: '#ef4444' }}>{metrics.outOfStockProducts}</div>
         </div>
       </div>
+      )}
 
       {/* Toolbar / Filters */}
       <div className="glass" style={{
@@ -550,10 +540,15 @@ export default function InventoryModule({ token: tokenProp }) {
       {/* Product Master Table */}
       <div className="glass" style={{ borderRadius: '12px', overflow: 'hidden', border: '1px solid rgba(255,255,255,0.08)' }}>
         {loading ? (
-          <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>Loading inventory records...</div>
+          <div style={{ padding: '24px 16px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {[70, 55, 65, 60].map((w, i) => <span key={i} className="inv-skel" style={{ width: `${w}%` }} />)}
+          </div>
         ) : products.length === 0 ? (
-          <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
-            No products found matching the criteria. Click "Add Product" to create one.
+          <div className="inv-empty">
+            <Package size={22} style={{ opacity: 0.5 }} />
+            <strong>{searchTerm || selectedCategory || selectedStatus || onlyLowStock ? 'No items match' : 'No items have been configured'}</strong>
+            <p>{searchTerm || selectedCategory || selectedStatus || onlyLowStock ? 'Try a different search or clear the filters.' : 'Add the products the hotel keeps in stock. Each needs a category and a unit of measure.'}</p>
+            <button type="button" className="inv-btn primary sm" onClick={() => openModal()}><Plus size={13} /> Add Item</button>
           </div>
         ) : (
           <div style={{ overflowX: 'auto' }}>

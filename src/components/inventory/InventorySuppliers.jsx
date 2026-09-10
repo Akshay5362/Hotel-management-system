@@ -5,14 +5,22 @@
  * spec's "do not expose supplier information to unauthorized roles." The
  * backend enforces this independently (GET/POST/PUT/DELETE /inventory/suppliers
  * all require MANAGE — see backend/routes/inventoryRoutes.js).
+ *
+ * Batch 5: presentation only. Same endpoints, same payloads, same rules.
  */
 import React, { useCallback, useEffect, useState } from 'react';
-import { Plus, Power, RefreshCw, Search, CheckCircle, XCircle } from 'lucide-react';
+import { Plus, Power, RefreshCw, Search, Truck } from 'lucide-react';
 import { inventoryFetch } from './inventoryApi';
+import { Alert, Button, Card, EmptyState, Field, LoadingRows, StatusBadge, Table, Toolbar, humanError, PageHeader } from './ui';
 
 const EMPTY = { name: '', contact_person: '', phone: '', whatsapp: '', email: '', address: '', gstin: '', payment_terms: '' };
 
-export default function InventorySuppliers({ token }) {
+const COLS = [
+  { key: 'name', label: 'Supplier' }, { key: 'contact', label: 'Contact' }, { key: 'phone', label: 'Phone' },
+  { key: 'gstin', label: 'GSTIN' }, { key: 'terms', label: 'Payment terms' }, { key: 'st', label: 'Status' }, { key: 'a', label: '', className: 'action' }
+];
+
+export default function InventorySuppliers({ token, embedded = false }) {
   const [suppliers, setSuppliers] = useState([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
@@ -31,7 +39,7 @@ export default function InventorySuppliers({ token }) {
       const data = await inventoryFetch(`/inventory/suppliers?${params.toString()}`, { token });
       setSuppliers(data.suppliers || []);
     } catch (err) {
-      setError(err.message);
+      setError(humanError(err, 'Unable to load suppliers right now. Please try again.'));
     } finally {
       setLoading(false);
     }
@@ -50,7 +58,7 @@ export default function InventorySuppliers({ token }) {
       setForm(EMPTY);
       load();
     } catch (err) {
-      setFormError(err.message);
+      setFormError(humanError(err));
     } finally {
       setSubmitting(false);
     }
@@ -62,100 +70,87 @@ export default function InventorySuppliers({ token }) {
       await inventoryFetch(`/inventory/suppliers/${s.id}`, { token, method: 'DELETE' });
       load();
     } catch (err) {
-      alert(err.message);
+      setError(humanError(err));
     }
   };
 
-  const inputStyle = { width: '100%', padding: '8px 12px', borderRadius: 6, background: '#020617', border: '1px solid rgba(255,255,255,0.12)', color: '#fff' };
   const fieldSets = [
-    ['name', 'Supplier Name *'], ['contact_person', 'Contact Person'],
-    ['phone', 'Phone'], ['whatsapp', 'WhatsApp Number'],
+    ['name', 'Supplier name', true], ['contact_person', 'Contact person'],
+    ['phone', 'Phone'], ['whatsapp', 'WhatsApp number'],
     ['email', 'Email'], ['gstin', 'GSTIN'],
-    ['payment_terms', 'Payment Terms'], ['address', 'Address']
+    ['payment_terms', 'Payment terms'], ['address', 'Address']
   ];
 
   return (
-    <div style={{ padding: 24, color: '#fff', maxWidth: 1100, margin: '0 auto' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
-        <h2 style={{ margin: 0, fontSize: '1.3rem', fontWeight: 800 }}>Suppliers</h2>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <div style={{ position: 'relative' }}>
-            <Search size={15} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: '#64748b' }} />
-            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search suppliers..." style={{ padding: '8px 12px 8px 32px', borderRadius: 6, background: 'rgba(15,23,42,0.6)', border: '1px solid rgba(255,255,255,0.12)', color: '#fff' }} />
-          </div>
-          <button onClick={load} style={iconBtnStyle}><RefreshCw size={16} /></button>
-          <button onClick={() => { setForm(EMPTY); setFormError(''); setShowForm(true); }} style={primaryBtnStyle}><Plus size={16} /> Add Supplier</button>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <PageHeader
+        icon={Truck}
+        title="Suppliers"
+        subtitle="Vendor directory. Supplier details are copied onto each purchase order when it is created."
+        actions={
+          <>
+            <Button variant="ghost" icon={RefreshCw} onClick={load} title="Refresh" aria-label="Refresh" />
+            <Button variant="primary" icon={Plus} onClick={() => { setForm(EMPTY); setFormError(''); setShowForm(true); }}>Add Supplier</Button>
+          </>
+        }
+      />
+
+      <Toolbar>
+        <div className="inv-search">
+          <Search size={14} />
+          <input className="inv-input" value={search} onChange={e => setSearch(e.target.value)} placeholder="Search suppliers…" aria-label="Search suppliers" />
         </div>
-      </div>
+      </Toolbar>
 
-      {error && <div style={errorBoxStyle}>{error}</div>}
+      {error ? <Alert tone="error" onRetry={load} onDismiss={() => setError('')}>{error}</Alert> : null}
 
-      {showForm && (
-        <form onSubmit={submit} className="glass" style={{ padding: 16, borderRadius: 12, marginBottom: 20, border: '1px solid rgba(255,255,255,0.08)', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-          {fieldSets.map(([key, label]) => (
-            <div key={key} style={key === 'address' ? { gridColumn: '1 / -1' } : undefined}>
-              <label style={{ display: 'block', fontSize: '0.8rem', color: '#94a3b8', marginBottom: 4 }}>{label}</label>
-              <input value={form[key]} onChange={e => setForm({ ...form, [key]: e.target.value })} style={inputStyle} />
+      {showForm ? (
+        <Card title="New supplier" padded>
+          <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div className="inv-form-grid">
+              {fieldSets.map(([key, label, required]) => (
+                <div key={key} style={key === 'address' ? { gridColumn: '1 / -1' } : undefined}>
+                  <Field label={label} required={required}>
+                    <input className="inv-input" value={form[key]} onChange={e => setForm({ ...form, [key]: e.target.value })} />
+                  </Field>
+                </div>
+              ))}
             </div>
-          ))}
-          {formError && <div style={{ gridColumn: '1 / -1', color: '#ef4444', fontSize: '0.85rem' }}>{formError}</div>}
-          <div style={{ gridColumn: '1 / -1', display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
-            <button type="button" onClick={() => setShowForm(false)} style={secondaryBtnStyle}>Cancel</button>
-            <button type="submit" disabled={submitting} style={primaryBtnStyle}>{submitting ? 'Saving...' : 'Save Supplier'}</button>
-          </div>
-        </form>
-      )}
+            {formError ? <Alert tone="error">{formError}</Alert> : null}
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <Button onClick={() => setShowForm(false)}>Cancel</Button>
+              <Button variant="primary" type="submit" disabled={submitting} onClick={submit}>{submitting ? 'Saving…' : 'Save supplier'}</Button>
+            </div>
+          </form>
+        </Card>
+      ) : null}
 
-      <div className="glass" style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.08)' }}>
-        {loading ? (
-          <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)' }}>Loading...</div>
-        ) : suppliers.length === 0 ? (
-          <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)' }}>No suppliers yet.</div>
-        ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.9rem' }}>
-              <thead>
-                <tr style={{ background: 'rgba(15,23,42,0.8)', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
-                  <th style={{ padding: '10px 16px' }}>Name</th>
-                  <th style={{ padding: '10px 16px' }}>Contact</th>
-                  <th style={{ padding: '10px 16px' }}>Phone</th>
-                  <th style={{ padding: '10px 16px' }}>Payment Terms</th>
-                  <th style={{ padding: '10px 16px' }}>Status</th>
-                  <th style={{ padding: '10px 16px', textAlign: 'right' }}>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {suppliers.map(s => (
-                  <tr key={s.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)', opacity: s.is_active === false ? 0.55 : 1 }}>
-                    <td style={{ padding: '10px 16px', fontWeight: 700 }}>{s.name}</td>
-                    <td style={{ padding: '10px 16px' }}>{s.contact_person || '—'}</td>
-                    <td style={{ padding: '10px 16px' }}>{s.phone || '—'}</td>
-                    <td style={{ padding: '10px 16px', color: '#94a3b8' }}>{s.payment_terms || '—'}</td>
-                    <td style={{ padding: '10px 16px' }}>
-                      {s.is_active === false
-                        ? <span style={badgeStyle('#94a3b8', 'rgba(148,163,184,0.15)')}><XCircle size={12} /> Inactive</span>
-                        : <span style={badgeStyle('#10b981', 'rgba(16,185,129,0.15)')}><CheckCircle size={12} /> Active</span>}
-                    </td>
-                    <td style={{ padding: '10px 16px', textAlign: 'right' }}>
-                      {s.is_active !== false && (
-                        <button onClick={() => deactivate(s)} title="Deactivate" style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer' }}>
-                          <Power size={16} />
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+      <Card>
+        <Table columns={COLS}>
+          {loading ? <LoadingRows columns={COLS.length} rows={4} /> : null}
+          {!loading && suppliers.length === 0 ? (
+            <tr><td colSpan={COLS.length}>
+              {search
+                ? <EmptyState title="No suppliers match" text="Try a different search." />
+                : <EmptyState icon={Truck} title="No suppliers have been configured" text="Add the vendors the hotel buys from. Each item can name a default supplier for purchase orders."
+                    action={<Button size="sm" variant="primary" icon={Plus} onClick={() => { setForm(EMPTY); setFormError(''); setShowForm(true); }}>Add Supplier</Button>} />}
+            </td></tr>
+          ) : null}
+          {!loading && suppliers.map(s => (
+            <tr key={s.id} style={{ opacity: s.is_active === false ? 0.6 : 1 }}>
+              <td><span className="strong">{s.name}</span>{s.email ? <span className="inv-cell-sub">{s.email}</span> : null}</td>
+              <td>{s.contact_person || '—'}</td>
+              <td className="nowrap">{s.phone || '—'}{s.whatsapp && s.whatsapp !== s.phone ? <span className="inv-cell-sub">WhatsApp {s.whatsapp}</span> : null}</td>
+              <td className="mono" style={{ color: 'var(--inv-text-2)' }}>{s.gstin || '—'}</td>
+              <td className="muted">{s.payment_terms || '—'}</td>
+              <td>{s.is_active === false ? <StatusBadge label="Inactive" tone="neutral" /> : <StatusBadge label="Active" tone="ok" />}</td>
+              <td className="action">
+                {s.is_active !== false ? <Button size="sm" variant="ghost" icon={Power} onClick={() => deactivate(s)} title="Deactivate">Deactivate</Button> : null}
+              </td>
+            </tr>
+          ))}
+        </Table>
+      </Card>
     </div>
   );
 }
-
-const iconBtnStyle = { padding: 9, borderRadius: 6, background: 'rgba(15,23,42,0.6)', border: '1px solid rgba(255,255,255,0.12)', color: '#94a3b8', cursor: 'pointer' };
-const primaryBtnStyle = { display: 'flex', alignItems: 'center', gap: 8, background: 'linear-gradient(135deg, #38bdf8 0%, #0284c7 100%)', color: '#fff', border: 'none', padding: '9px 16px', borderRadius: 8, fontWeight: 700, cursor: 'pointer' };
-const secondaryBtnStyle = { padding: '9px 16px', borderRadius: 6, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', color: '#94a3b8', fontWeight: 600, cursor: 'pointer' };
-const errorBoxStyle = { background: 'rgba(239,68,68,0.15)', border: '1px solid #ef4444', color: '#ef4444', padding: 12, borderRadius: 8, marginBottom: 16 };
-function badgeStyle(fg, bg) { return { display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 9px', borderRadius: 12, fontSize: '0.72rem', fontWeight: 700, background: bg, color: fg }; }
