@@ -22,7 +22,11 @@ export function getActor(req) {
   const u = req.user || {};
   return {
     uid: u.uid || (u.id !== undefined && u.id !== null ? String(u.id) : null) || u.username || null,
-    name: u.full_name || u.name || u.username || u.email || null
+    name: u.full_name || u.name || u.username || u.email || null,
+    // H7 — the role the request was authorized under. Several audit writers
+    // already recorded `actor_role`, but this helper did not carry it, so every
+    // one of them stored null. Additive: nothing reads the actor by shape.
+    role: u.role || null
   };
 }
 
@@ -35,14 +39,18 @@ export function sendError(res, error, fallback = 'Internal Server Error') {
   return res.status(status).json({ error: error.message, code: error.code || undefined });
 }
 
-export async function auditInventory(req, action, details, explicitId = null) {
+export async function auditInventory(req, action, details, explicitId = null, businessDate = null) {
   try {
     const actor = getActor(req);
     await createAuditLogFirestore({
       log_id: explicitId ? `inv_${explicitId}` : `inv_${action.toLowerCase()}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       action,
-      details: { ...details, actor_name: actor.name },
-      user_id: actor.uid || 'unknown'
+      details: { ...details, actor_name: actor.name, actor_role: actor.role },
+      user_id: actor.uid || 'unknown',
+      // Optional: the repository falls back to today's date when it is absent,
+      // which is right for master-data edits but wrong for anything tied to a
+      // trading day. Callers that know the business date now pass it.
+      ...(businessDate ? { business_date: businessDate } : {})
     });
   } catch (err) {
     console.warn(`[Inventory] audit log failed (${action}): ${err.message}`);

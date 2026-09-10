@@ -325,3 +325,111 @@ export function roundMoney(value) {
 export const MASTER_LIST_FETCH_CAP = 1000;
 export const DEFAULT_PAGE_SIZE = 25;
 export const MAX_PAGE_SIZE = 100;
+
+// ── Phase H1 — supplier bill capture ─────────────────────────────────────────
+// Additive only. Nothing above this line changes, and no A–G behaviour reads
+// any of these constants.
+
+/**
+ * Lifecycle of an uploaded supplier bill. H1 only ever produces UPLOADED and
+ * DISCARDED; the extraction and review states are declared here so the schema
+ * is stable before H2–H6 fill them in.
+ */
+export const BILL_STATUS = Object.freeze({
+  UPLOADED:          'UPLOADED',           // stored and hashed, nothing read yet
+  EXTRACTING:        'EXTRACTING',         // H2 — OCR in flight
+  EXTRACTED:         'EXTRACTED',          // H2 — raw text available
+  EXTRACTION_FAILED: 'EXTRACTION_FAILED',  // H2 — usable as a manual entry form
+  IN_REVIEW:         'IN_REVIEW',          // H4 — operator editing a draft
+  // H5 — a confirmation is in flight. The PO path cannot write the bill and the
+  // receipt in one transaction, because the Phase F engine owns its own; this
+  // state is what makes the gap between them recoverable instead of permanent.
+  // A bill is only ever CONFIRMING while a claim is outstanding, and the claim
+  // records the exact receipt id the engine will produce.
+  CONFIRMING:        'CONFIRMING',         // H5 — claimed, receipt not yet confirmed
+  CONFIRMED:         'CONFIRMED',          // H5/H6 — a receipt exists, file immutable
+  DISCARDED:         'DISCARDED'           // abandoned before confirmation
+});
+
+export const ALL_BILL_STATUSES = Object.freeze(Object.values(BILL_STATUS));
+
+/**
+ * A bill in one of these states has never moved stock, so its stored file may
+ * still be removed. CONFIRMED is deliberately absent: once a receipt exists the
+ * bill is evidence and the file becomes immutable, mirroring receipt
+ * immutability in Phase G.
+ */
+export const BILL_DISCARDABLE_STATUSES = Object.freeze([
+  BILL_STATUS.UPLOADED,
+  BILL_STATUS.EXTRACTING,
+  BILL_STATUS.EXTRACTED,
+  BILL_STATUS.EXTRACTION_FAILED,
+  BILL_STATUS.IN_REVIEW
+]);
+// CONFIRMING is deliberately absent above: a claimed bill may already have a
+// receipt that this process has not yet observed, so discarding it could
+// orphan real stock.
+
+/**
+ * How long a confirmation claim may stand before it is treated as abandoned.
+ *
+ * A Firestore transaction cannot outlive about a minute, and the Phase F engine
+ * runs one transaction, so a claim older than this cannot still have work in
+ * flight — the process that made it is gone. Generous on purpose: releasing a
+ * claim that is merely slow is the one mistake that could let a second receipt
+ * be created, so the recovery waits far longer than any real call can take.
+ */
+export const BILL_CONFIRMATION_STALE_MS = 15 * 60 * 1000;
+
+/** Which receiving workflow the operator chose for a bill. Null until chosen (H4). */
+export const BILL_MODE = Object.freeze({
+  PO:     'PO',      // received against an existing purchase order (Option 1)
+  DIRECT: 'DIRECT'   // PO-less direct receipt (Option 3)
+});
+
+/** Confidence bands for supplier and product matching. Declared for H3. */
+export const MATCH_CONFIDENCE = Object.freeze({
+  HIGH:      'HIGH',       // only this band may be pre-selected for the operator
+  MEDIUM:    'MEDIUM',
+  LOW:       'LOW',
+  UNMATCHED: 'UNMATCHED'
+});
+
+/**
+ * H7 — duplicate signals raised on a bill.
+ *
+ * Every one of these is a WARNING, never an automatic rejection. A hotel
+ * legitimately receives a corrected reprint of an invoice, and a supplier
+ * legitimately reuses an invoice number by mistake; silently refusing either
+ * would push the operator into working around the system. What the signals do
+ * instead is withhold confirmation until the operator names the signal they are
+ * overriding and says why, which is then auditable.
+ */
+export const BILL_DUPLICATE_CODE = Object.freeze({
+  // The stored file hashes to a value another bill already has. Two identical
+  // photographs are a near-certain re-upload rather than two deliveries.
+  FILE_DUPLICATE: 'FILE_DUPLICATE',
+  // supplier + invoice number + invoice date all match an existing bill.
+  INVOICE_DUPLICATE: 'INVOICE_DUPLICATE',
+  // Same supplier and invoice number, different date. Usually a correction.
+  INVOICE_NUMBER_REUSED: 'INVOICE_NUMBER_REUSED',
+  // No invoice number at all. Never fabricated from a timestamp or file name;
+  // the operator must acknowledge receiving against an unnumbered document.
+  MISSING_INVOICE_NUMBER: 'MISSING_INVOICE_NUMBER'
+});
+
+export const ALL_BILL_DUPLICATE_CODES = Object.freeze(Object.values(BILL_DUPLICATE_CODE));
+
+/**
+ * A duplicate override must carry a real explanation. Short enough that a
+ * genuine reason fits, long enough that "ok" does not.
+ */
+export const MIN_DUPLICATE_OVERRIDE_REASON = 10;
+
+/** Bills in these states are ignored when looking for duplicates. */
+export const BILL_DUPLICATE_IGNORED_STATUSES = Object.freeze([
+  BILL_STATUS.DISCARDED
+]);
+
+/** Raw OCR text is capped before storage so a bill document stays small. */
+export const BILL_OCR_TEXT_MAX = 20000;

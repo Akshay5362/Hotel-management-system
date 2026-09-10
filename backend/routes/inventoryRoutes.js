@@ -18,6 +18,10 @@ import express from 'express';
 import { requireRole } from '../controllers/authController.js';
 import { INVENTORY_ROLES, RECEIVING_ROLES, REVERSAL_ROLES, SHORT_CLOSE_ROLES } from '../utils/inventoryConstants.js';
 import { uploadProductPhoto } from '../middleware/inventoryUploadMiddleware.js';
+import { billUpload, verifyUploadedBill } from '../middleware/billUploadMiddleware.js';
+import { uploadBill, listBills, getBill, streamBillFile, discardBill, extractBill, interpretBill, getBillLines, confirmBillAgainstPO, confirmBillDirect, reverseDirectReceipt,
+  getBillDuplicates
+} from '../controllers/billController.js';
 import {
   getCategories, createCategory, updateCategory, deleteCategory,
   getProducts, getProductById, createProduct, updateProduct, deleteProduct
@@ -149,5 +153,35 @@ router.get('/products/:id', VIEW, getProductById);
 router.post('/products', MANAGE, photoUpload, createProduct);
 router.put('/products/:id', MANAGE, photoUpload, updateProduct);
 router.delete('/products/:id', MANAGE, deleteProduct);
+
+// ── Supplier bills — Phase H1 ────────────────────────────────────────────────
+// Upload, retrieval and discard only. NOTHING here moves stock: extraction,
+// matching, review and both confirmation paths arrive in H2–H6.
+//
+// RECEIVE (RECEIVING_ROLES) is the correct gate: a bill is the paperwork for a
+// delivery, so whoever may sign for goods may capture the bill. It is
+// deliberately NOT the broader VIEW set — a bill exposes purchase pricing.
+router.get('/bills', RECEIVE, listBills);
+router.post('/bills', RECEIVE, billUpload, verifyUploadedBill, uploadBill);
+router.get('/bills/:id', RECEIVE, getBill);
+router.get('/bills/:id/file', RECEIVE, streamBillFile);
+// H2 — re-run OCR. Manual reaper for a bill stranded in EXTRACTING by a restart,
+// and the retry path for a poor extraction. Synchronous by design.
+router.post('/bills/:id/extract', RECEIVE, extractBill);
+// H3 — parse the OCR text into reviewable lines and propose matches. Writes only
+// bill + bill-line documents; moves no stock and creates no receipt.
+router.post('/bills/:id/interpret', RECEIVE, interpretBill);
+router.get('/bills/:id/lines', RECEIVE, getBillLines);
+// H7 — read-only duplicate signals for the review screen. RECEIVE-guarded like
+// the rest of the bill surface: the response names other bills and their
+// invoice references, which is purchasing information.
+router.get('/bills/:id/duplicates', RECEIVE, getBillDuplicates);
+// H5 / H6 — the ONLY stock-affecting bill endpoints. RECEIVE matches the Phase F
+// receiving gate; the direct reversal uses the narrower Phase G gate because
+// undoing a delivery is a stronger action than signing for one.
+router.post('/bills/:id/confirm-po', RECEIVE, confirmBillAgainstPO);
+router.post('/bills/:id/confirm-direct', RECEIVE, confirmBillDirect);
+router.post('/receipts/:id/reverse-direct', REVERSE, reverseDirectReceipt);
+router.delete('/bills/:id', RECEIVE, discardBill);
 
 export default router;
