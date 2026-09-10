@@ -94,3 +94,17 @@ backend/tests/output/
 # The directory is created on first upload and its contents are business
 # data, never source. Ignore the contents, not the feature.
 backend/inventory-photos/
+
+# Supplier bill uploads — runtime directory (Phase H1). Contents are business
+# documents containing purchase pricing; never source, never served statically.
+backend/inventory-bills/
+
+# Tesseract language models cache into process.cwd(), so running OCR from the
+# repository root drops a ~5 MB eng.traineddata here. Root-anchored on purpose:
+# backend/eng.traineddata is TRACKED deliberately (the backend's own runtime
+# copy, which electron/backend-launcher.js checks for) and must stay in git.
+/eng.traineddata
+/*.traineddata
+
+# Claude Code local tooling config (dev-server launch definitions, not app code).
+.claude/
