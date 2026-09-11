@@ -1,5 +1,9 @@
-import React, { useEffect, useState, useCallback } from 'react';
-import { API_URL, getApiHeaders } from '../config/apiConfig';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { API_URL, getApiHeaders, authenticatedFetch, AuthenticationError } from '../config/apiConfig';
+
+/** Matches the badge poller in App.jsx, so the two never fight each other. */
+const MODAL_POLL_MS = 15000;
+const MODAL_BACKOFF_MS = [30000, 60000];
 
 const TYPE_CONFIG = {
   service: { label: 'Room Service', color: '#818cf8', bg: 'rgba(129,140,248,0.12)', border: 'rgba(129,140,248,0.3)', icon: '🛎️' },
@@ -15,21 +19,52 @@ export default function GuestRequestsModal({ isOpen, onClose, token, onRequestRe
   const [lastUpdated, setLastUpdated] = useState(null);
   const [resolvingId, setResolvingId] = useState(null);
 
-  const fetchRequests = useCallback(async (silent = false) => {
+  // The same three protections the App badge poller has. Without them this was
+  // a second, independent polling system: raw fetch that could not refresh a
+  // token, no in-flight guard, and no backoff — so while the modal sat open
+  // during an outage it called the endpoint every 15s regardless.
+  const inFlightRef = useRef(false);
+  const backoffRef = useRef({ failures: 0, nextAllowedAt: 0 });
+  const [degraded, setDegraded] = useState(false);
+
+  const fetchRequests = useCallback(async (silent = false, { fromPoll = false } = {}) => {
     if (!token) return;
+    if (inFlightRef.current) return;                                   // one at a time
+    if (fromPoll && Date.now() < backoffRef.current.nextAllowedAt) return;
+
+    inFlightRef.current = true;
     if (!silent) setLoading(true);
     try {
-      const res = await fetch(`${API_URL}/admin/guest-requests`, {
-        headers: getApiHeaders(token)
-      });
+      // authenticatedFetch refreshes the token once on a 401 and retries once.
+      const res = await authenticatedFetch(`${API_URL}/admin/guest-requests`, {}, token);
       if (res.ok) {
         const data = await res.json();
         setRequests(data.requests || []);
         setLastUpdated(new Date());
+        setDegraded(false);
+        backoffRef.current = { failures: 0, nextAllowedAt: 0 };
+        return;
+      }
+      // 503 means the server cannot tell us. The list already on screen is the
+      // last thing we actually knew, so it stays; it is not replaced by empty.
+      if (res.status === 503 || res.status === 429 || res.status >= 500) {
+        setDegraded(true);
+        const failures = backoffRef.current.failures + 1;
+        const wait = MODAL_BACKOFF_MS[Math.min(failures - 1, MODAL_BACKOFF_MS.length - 1)];
+        backoffRef.current = { failures, nextAllowedAt: Date.now() + wait };
       }
     } catch (e) {
-      console.error('fetchRequests error:', e);
+      if (e instanceof AuthenticationError) {
+        console.warn('[GuestRequests] Session expired; the list was not refreshed.');
+      } else {
+        console.error('fetchRequests error:', e);
+      }
+      setDegraded(true);
+      const failures = backoffRef.current.failures + 1;
+      const wait = MODAL_BACKOFF_MS[Math.min(failures - 1, MODAL_BACKOFF_MS.length - 1)];
+      backoffRef.current = { failures, nextAllowedAt: Date.now() + wait };
     } finally {
+      inFlightRef.current = false;
       if (!silent) setLoading(false);
     }
   }, [token]);
@@ -72,15 +107,17 @@ export default function GuestRequestsModal({ isOpen, onClose, token, onRequestRe
     }
   };
 
-  // Fetch on open + live poll every 15s while open
+  // Fetch on open, then poll while open. The interval keeps a steady beat and
+  // the fetcher decides whether to act, so there is one timer and no recursion.
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) return undefined;
+    backoffRef.current = { failures: 0, nextAllowedAt: 0 };   // a fresh open starts clean
     fetchRequests(false);
 
     const handleRefresh = () => fetchRequests(true);
     document.addEventListener('guest-request-refresh', handleRefresh);
 
-    const interval = setInterval(() => fetchRequests(true), 15000);
+    const interval = setInterval(() => fetchRequests(true, { fromPoll: true }), MODAL_POLL_MS);
     return () => {
       document.removeEventListener('guest-request-refresh', handleRefresh);
       clearInterval(interval);
@@ -129,14 +166,24 @@ export default function GuestRequestsModal({ isOpen, onClose, token, onRequestRe
                 <h2 style={{ margin: 0, fontFamily: 'var(--font-heading)', fontWeight: '800', color: '#fff', fontSize: '1.2rem' }}>
                   Guest Requests
                 </h2>
-                {/* LIVE pulse dot */}
-                <span style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'rgba(34,197,94,0.12)', border: '1px solid rgba(34,197,94,0.3)', borderRadius: '20px', padding: '2px 8px', fontSize: '0.65rem', fontWeight: '700', color: '#22c55e', letterSpacing: '0.5px' }}>
-                  <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#22c55e', display: 'inline-block', animation: 'pulse 2s infinite' }} />
-                  LIVE
-                </span>
+                {/* Feed state. Green LIVE only while refreshes are actually
+                    succeeding; amber STALE once the server stops answering, so
+                    the list is never presented as current when it is not. */}
+                {degraded ? (
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'rgba(250,204,21,0.12)', border: '1px solid rgba(250,204,21,0.35)', borderRadius: '20px', padding: '2px 8px', fontSize: '0.65rem', fontWeight: '700', color: '#facc15', letterSpacing: '0.5px' }}>
+                    <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#facc15', display: 'inline-block' }} />
+                    STALE
+                  </span>
+                ) : (
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'rgba(34,197,94,0.12)', border: '1px solid rgba(34,197,94,0.3)', borderRadius: '20px', padding: '2px 8px', fontSize: '0.65rem', fontWeight: '700', color: '#22c55e', letterSpacing: '0.5px' }}>
+                    <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#22c55e', display: 'inline-block', animation: 'pulse 2s infinite' }} />
+                    LIVE
+                  </span>
+                )}
               </div>
               <p style={{ margin: '2px 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                {requests.length} active request{requests.length !== 1 ? 's' : ''} · Auto-refreshes every 15s
+                {requests.length} active request{requests.length !== 1 ? 's' : ''} ·{' '}
+                {degraded ? 'Server unreachable — showing the last known list' : 'Auto-refreshes every 15s'}
                 {lastUpdated && <span style={{ marginLeft: '6px', opacity: 0.6 }}>· Updated {lastUpdated.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>}
               </p>
             </div>

@@ -32,7 +32,7 @@ import { auth } from './config/firebaseClient';
 import InventoryHub from './components/inventory/InventoryHub';
 import FoodPOS from './components/food/FoodPOS';           // Food POS Phase 1 — Menu Master
 import { io } from 'socket.io-client';
-import { API_URL, SOCKET_URL, getApiHeaders } from './config/apiConfig';
+import { API_URL, SOCKET_URL, getApiHeaders, authenticatedFetch, AuthenticationError } from './config/apiConfig';
 
 
 
@@ -155,6 +155,22 @@ function LandingPage({ onNavigate }) {
 import AdminHousekeeping from './components/AdminHousekeeping.jsx';
 import AdminGuests from './components/AdminGuests.jsx';
 import ReservationModule from './components/ReservationModule.jsx';
+
+/**
+ * Tabs that hide the room Toolbar, and with it the guest-request badge.
+ * Polling for a number nobody can see is a Firestore read spent on nothing, so
+ * the badge poller stands down on these and refreshes on the way back.
+ *
+ * Kept beside the render guards that hide the Toolbar and MetricsBar — if one
+ * list changes the other must change with it.
+ */
+const TOOLBAR_HIDDEN_TABS = ['food', 'inventory'];
+const isRequestCountVisible = (tab) => !TOOLBAR_HIDDEN_TABS.includes(tab);
+
+/** Polling cadence for the guest-request badge, in milliseconds. */
+const REQUEST_COUNT_POLL_MS = 15000;
+/** After a failure the next attempt waits this long, then this long again. */
+const REQUEST_COUNT_BACKOFF_MS = [30000, 60000];
 
 function AppContent() {
   const [adminTab, setAdminTab] = useState('frontdesk');
@@ -492,48 +508,142 @@ function AppContent() {
     }
   }, [adminToken, guestToken, navigate]);
 
-  // Fetch guest requests count for badge
-  const [requestCount, setRequestCount] = useState(0);
-  const fetchRequestCount = useCallback(async () => {
+  // Read by the poller so a tab switch never has to tear down the socket.
+  const adminTabRef = useRef(adminTab);
+  useEffect(() => { adminTabRef.current = adminTab; }, [adminTab]);
+
+  // ── Guest-request badge count ─────────────────────────────────────────────
+  //
+  // `requestCount` is null until it is actually known. Null and zero are
+  // different answers: zero says the hotel has nothing waiting, null says we
+  // could not ask. A failed request must never be allowed to say the first.
+  // The Toolbar renders the badge only when the count is greater than zero, so
+  // null simply shows nothing rather than a confident "0".
+  const [requestCount, setRequestCount] = useState(null);
+
+  // Guards against the poller stacking calls on a slow or failing endpoint, and
+  // against continuing to hammer one that has already said it is unavailable.
+  // Both are refs: a failing poll must not re-render the whole dashboard.
+  const requestCountInFlightRef = useRef(false);
+  const requestCountBackoffRef = useRef({ failures: 0, nextAllowedAt: 0 });
+
+  /**
+   * Widens the gap before the next poll: 30s after the first failure, 60s after
+   * any further one. There is no recursive timer — the interval keeps its
+   * steady 15s beat and the poller simply declines to act until the window
+   * opens, so nothing can run away and there is nothing extra to clean up.
+   */
+  const scheduleRequestCountBackoff = useCallback(() => {
+    const failures = requestCountBackoffRef.current.failures + 1;
+    const wait = REQUEST_COUNT_BACKOFF_MS[Math.min(failures - 1, REQUEST_COUNT_BACKOFF_MS.length - 1)];
+    requestCountBackoffRef.current = { failures, nextAllowedAt: Date.now() + wait };
+  }, []);
+
+  /**
+   * @param {object} [opts]
+   * @param {boolean} [opts.fromPoll] true for the interval tick. A poll defers
+   *   to the backoff window and skips tabs where the badge is not on screen;
+   *   an explicit action (a refresh, a socket event, a tab change) does not.
+   */
+  const fetchRequestCount = useCallback(async ({ fromPoll = false } = {}) => {
     const currentToken = adminToken;
     if (!currentToken) return;
+
+    // One request at a time. Without this the 15s timer stacks calls whenever
+    // the endpoint is slower than the interval.
+    if (requestCountInFlightRef.current) return;
+
+    if (fromPoll) {
+      // Nothing to keep fresh while the badge is off screen.
+      if (!isRequestCountVisible(adminTabRef.current)) return;
+      if (Date.now() < requestCountBackoffRef.current.nextAllowedAt) return;
+    }
+
+    requestCountInFlightRef.current = true;
     try {
-      const res = await fetch(`${API_URL}/admin/guest-requests`, {
-        headers: getApiHeaders(currentToken)
-      });
+      // authenticatedFetch refreshes the Firebase ID token and retries once on
+      // a 401, so an expired token no longer leaves this poller failing every
+      // 15s while fetchStatus silently self-heals on the same session.
+      const res = await authenticatedFetch(`${API_URL}/admin/guest-requests`, {}, currentToken);
       if (res.ok) {
         const data = await res.json();
-        setRequestCount(data.total || 0);
+        setRequestCount(Number(data.total) || 0);
+        requestCountBackoffRef.current = { failures: 0, nextAllowedAt: 0 };
+        return;
       }
-    } catch (e) { /* silent */ }
-  }, [adminToken]);
+      // 503 means "we do not know", 429 means "stop asking so fast". Neither
+      // is zero, so the last known count is left exactly as it was.
+      if (res.status === 503 || res.status === 429 || res.status >= 500) {
+        scheduleRequestCountBackoff();
+      }
+    } catch (e) {
+      // Auth failures are surfaced rather than swallowed: this badge poller was
+      // discarding every 401 with no trace. Do NOT log the user out here —
+      // fetchStatus owns that decision for the session.
+      if (e instanceof AuthenticationError) {
+        console.warn('[GuestRequests] Authentication failed after token refresh; badge count not updated.');
+      }
+      // Offline or backend down. Also a "we do not know", so it backs off too
+      // and still does not touch the count.
+      scheduleRequestCountBackoff();
+    } finally {
+      requestCountInFlightRef.current = false;
+    }
+  }, [adminToken, scheduleRequestCountBackoff]);
+
+  // A stable handle to the newest fetcher. The effects below must not depend on
+  // the callback's identity: it is rebuilt on every token change, and a 401
+  // forces a token refresh, so depending on it made an auth failure re-run the
+  // socket effect — tearing down a live socket and firing another request,
+  // which could 401 again.
+  const fetchRequestCountRef = useRef(fetchRequestCount);
+  useEffect(() => { fetchRequestCountRef.current = fetchRequestCount; }, [fetchRequestCount]);
+
+  // Whether an admin session exists at all. A boolean, so refreshing the token
+  // does not change it and the socket below is built exactly once per session.
+  const hasAdminSession = Boolean(adminUser && adminUser.role === 'admin' && adminToken);
 
   // Real-time Guest Requests and Fallback Polling
   useEffect(() => {
-    if (!adminUser || adminUser.role !== 'admin' || !adminToken) return;
-    fetchRequestCount();
+    if (!hasAdminSession) return;
+    fetchRequestCountRef.current();
 
     const socket = io(SOCKET_URL);
 
     let fallbackInterval = null;
+    // Teardown latch. socket.disconnect() on a CONNECTED socket fires the
+    // 'disconnect' handler synchronously (socket.io-client 4.x calls onclose →
+    // emitReserved('disconnect')). Without this the handler installed a fresh
+    // interval during cleanup, after the old one had been cleared — an orphan
+    // that nothing owned and nothing ever cleared, one per effect re-run.
+    let disposed = false;
 
-    socket.on('connect', () => {
-      console.log('Connected to real-time Guest Requests socket');
+    const stopFallback = () => {
       if (fallbackInterval) {
         clearInterval(fallbackInterval);
         fallbackInterval = null;
       }
+    };
+
+    socket.on('connect', () => {
+      console.log('Connected to real-time Guest Requests socket');
+      stopFallback();
     });
 
     socket.on('disconnect', () => {
-      console.log('Disconnected from socket. Falling back to 15s polling.');
+      if (disposed) return;            // going away; do not schedule anything
+      console.log('Disconnected from socket. Falling back to polling.');
       if (!fallbackInterval) {
-        fallbackInterval = setInterval(fetchRequestCount, 15000);
+        // Steady beat; the poller itself decides whether to act, honouring the
+        // backoff window and skipping tabs where the badge is off screen.
+        fallbackInterval = setInterval(() => fetchRequestCountRef.current({ fromPoll: true }), REQUEST_COUNT_POLL_MS);
       }
     });
 
     socket.on('new_guest_request', () => {
-      fetchRequestCount();
+      // A real event, not a poll: worth fetching even from a hidden tab so the
+      // badge is already right when the user comes back.
+      fetchRequestCountRef.current();
       // Dispatch an event so GuestRequestsModal can refresh if it's currently open
       document.dispatchEvent(new CustomEvent('guest-request-refresh'));
     });
@@ -544,10 +654,19 @@ function AppContent() {
     // removed so Admin does not get a duplicate modal on top of the toast.
 
     return () => {
-      if (fallbackInterval) clearInterval(fallbackInterval);
-      socket.disconnect();
+      disposed = true;
+      socket.disconnect();             // may fire 'disconnect' synchronously
+      stopFallback();                  // clears whatever exists, in either order
     };
-  }, [adminUser, adminToken, fetchRequestCount]);
+  }, [hasAdminSession]);
+
+  // Coming back to a tab that shows the badge: fetch once so the count on
+  // screen is current, rather than whatever it was before the user left.
+  useEffect(() => {
+    if (!hasAdminSession) return;
+    if (!isRequestCountVisible(adminTab)) return;
+    fetchRequestCountRef.current();
+  }, [adminTab, hasAdminSession]);
 
   // ── AUTO-POLL: Refresh full room grid every 20 seconds for admin ───────────────────
   // This ensures new guest bookings appear without manual refresh.
@@ -620,14 +739,14 @@ function AppContent() {
 
     const handleDateChange = () => {
       fetchStatus();
-      if (adminToken) fetchRequestCount();
+      if (adminToken) fetchRequestCountRef.current();
     };
 
     // Factory Reset auto-refresh — reloads all rooms, counters and data
     // immediately after a successful factory reset without restarting Electron.
     const handleFactoryReset = () => {
       fetchStatus();
-      if (adminToken) fetchRequestCount();
+      if (adminToken) fetchRequestCountRef.current();
     };
 
     window.addEventListener('businessDateChanged', handleDateChange);
@@ -636,7 +755,7 @@ function AppContent() {
       window.removeEventListener('businessDateChanged', handleDateChange);
       window.removeEventListener('factoryResetComplete', handleFactoryReset);
     };
-  }, [adminToken, guestToken, fetchStatus, fetchRequestCount]);
+  }, [adminToken, guestToken, fetchStatus]);
 
   // Clock runner
   useEffect(() => {
@@ -1348,7 +1467,7 @@ function AppContent() {
 
           {/* Action and Filter Toolbar — hotel front-desk chrome, not applicable
               inside the self-contained Food & Beverage workspace */}
-          {adminTab !== 'food' && (
+          {adminTab !== 'food' && adminTab !== 'inventory' && (
             <Toolbar
               onActionClick={handleActionClick}
               activeFilter={filter}
@@ -1441,7 +1560,7 @@ function AppContent() {
 
           {/* Bottom Metrics Information Bar — room occupancy statistics,
               not applicable inside the self-contained Food & Beverage workspace */}
-          {adminTab !== 'food' && (
+          {adminTab !== 'food' && adminTab !== 'inventory' && (
             <MetricsBar
               stats={globalStats}
               systemStatus={isBackendOnline}

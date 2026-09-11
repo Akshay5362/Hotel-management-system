@@ -84,6 +84,62 @@ let quotaExhaustedUntil = 0;
 const NEGATIVE_QUOTA_CACHE_TTL_MS = 15000; // 15 seconds negative cache for quota exhaustion
 
 // Test/Diagnostic inspection helpers
+/**
+ * Guest-request degradation state, mirroring the status endpoint above.
+ *
+ * `guestRequestsUnavailableUntil` is a NEGATIVE cache: during a known outage the
+ * endpoint answers 503 without calling Firestore at all, so a failing badge
+ * poller cannot keep spending quota it has already been told is gone. It is
+ * cleared the moment a real read succeeds.
+ *
+ * The log counters exist because this endpoint is polled: without them an
+ * outage writes an identical warning every few seconds for as long as it lasts.
+ */
+let guestRequestsUnavailableUntil = 0;
+let guestRequestsLastLoggedAt = 0;
+let guestRequestsSuppressedLogCount = 0;
+const GUEST_REQUESTS_NEGATIVE_CACHE_TTL_MS = 15000;   // matches the service's own TTL
+const GUEST_REQUESTS_LOG_INTERVAL_MS = 60000;
+
+/** Firestore signals an exhausted project quota as gRPC code 8. */
+const isFirestoreQuotaError = (err) => Boolean(
+  err && (
+    err.code === 8 ||
+    (typeof err.message === 'string' && (err.message.includes('RESOURCE_EXHAUSTED') || err.message.includes('Quota exceeded'))) ||
+    (typeof err.details === 'string' && err.details.includes('Quota exceeded'))
+  )
+);
+
+/**
+ * Logs an unavailable guest-request read at most once a minute, and says how
+ * many identical failures were folded into that line so nothing is hidden.
+ */
+function logGuestRequestsUnavailable(err) {
+  const now = Date.now();
+  if (now - guestRequestsLastLoggedAt < GUEST_REQUESTS_LOG_INTERVAL_MS) {
+    guestRequestsSuppressedLogCount++;
+    return;
+  }
+  const suppressed = guestRequestsSuppressedLogCount;
+  guestRequestsSuppressedLogCount = 0;
+  guestRequestsLastLoggedAt = now;
+  console.warn(
+    `[getGuestRequests] Firestore unavailable — serving 503 (degraded). ` +
+    `MySQL fallback is disabled, so no fallback was attempted. ` +
+    `reason=${isFirestoreQuotaError(err) ? 'FIRESTORE_RESOURCE_EXHAUSTED' : (err?.code || 'FIRESTORE_ERROR')}` +
+    (suppressed > 0 ? ` (${suppressed} identical failure(s) suppressed since the last line)` : '')
+  );
+}
+
+// Test accessors, matching the ones already used for the status endpoint.
+export const _getGuestRequestsUnavailableUntil = () => guestRequestsUnavailableUntil;
+export const _setGuestRequestsUnavailableUntil = (ts) => { guestRequestsUnavailableUntil = ts; };
+export const _resetGuestRequestsDegradedState = () => {
+  guestRequestsUnavailableUntil = 0;
+  guestRequestsLastLoggedAt = 0;
+  guestRequestsSuppressedLogCount = 0;
+};
+
 export const _getQuotaExhaustedUntil = () => quotaExhaustedUntil;
 export const _setQuotaExhaustedUntil = (ts) => { quotaExhaustedUntil = ts; };
 export const _getLastKnownGoodStatusSnapshot = () => lastKnownGoodStatusSnapshot;
@@ -813,19 +869,77 @@ export const undoDayEnd = async (req, res) => {
   }
 };
 
-/** Admin endpoint — get all pending guest requests with room & guest details */
+/**
+ * Admin endpoint — get all pending guest requests with room & guest details.
+ *
+ * WHY THIS DOES NOT FALL BACK TO MySQL
+ * Firestore-only mode is the production runtime, and every MySQL entry point is
+ * fronted by a guard that throws ER_MYSQL_DECOMMISSIONED. Falling through to it
+ * on a Firestore error turned one upstream failure into a 500, which the badge
+ * poller then repeated for as long as the outage lasted. When fallbacks are
+ * disabled this now answers 503 immediately and never reaches the guard.
+ *
+ * WHY IT NEVER ANSWERS "ZERO"
+ * Returning `{ requests: [], total: 0 }` on failure would tell reception there
+ * is nothing waiting, which is a statement about the hotel rather than about
+ * the database. Not knowing and knowing there is nothing are different answers,
+ * and only one of them is true here.
+ */
 export const getGuestRequests = async (req, res) => {
+  const firestoreOnly = isMysqlCutoverFallbacksDisabled();
+
+  /** The one place the degraded answer is written, so it cannot drift. */
+  const respondUnavailable = (err) => {
+    const quota = isFirestoreQuotaError(err);
+    const retryAfter = Math.max(1, Math.ceil(
+      ((guestRequestsUnavailableUntil || (Date.now() + GUEST_REQUESTS_NEGATIVE_CACHE_TTL_MS)) - Date.now()) / 1000
+    ));
+    res.set('Retry-After', String(retryAfter));
+    // Deliberately a fixed message: no stack, no Firebase internals, no
+    // credentials. The specifics stay in the server log.
+    return res.status(503).json({
+      error: quota
+        ? 'Guest requests are temporarily unavailable because the database has reached its daily quota.'
+        : 'Guest requests are temporarily unavailable.',
+      code: quota ? 'FIRESTORE_RESOURCE_EXHAUSTED' : 'GUEST_REQUESTS_UNAVAILABLE',
+      degraded: true,
+      firestore_degraded: true,
+      backend_online: true,
+      retry_after_seconds: retryAfter
+    });
+  };
+
+  // A known outage: answer without spending a read that is already known to fail.
+  if (firestoreOnly && Date.now() < guestRequestsUnavailableUntil) {
+    return respondUnavailable(null);
+  }
+
+  let firestoreError = null;
   try {
     // Primary: Authoritative Firestore serving with 15s caching and in-flight deduplication
-    try {
-      const fsData = await GuestRequestsService.getGuestRequests({ skipCache: false });
-      if (fsData && Array.isArray(fsData.requests)) {
-        return res.json(fsData);
-      }
-    } catch (fsErr) {
-      console.warn('[getGuestRequests] Firestore serving error, attempting MySQL fallback:', fsErr.message);
+    const fsData = await GuestRequestsService.getGuestRequests({ skipCache: false });
+    if (fsData && Array.isArray(fsData.requests)) {
+      guestRequestsUnavailableUntil = 0;          // recovered
+      guestRequestsSuppressedLogCount = 0;
+      return res.json(fsData);
     }
+    // A shape we do not recognise is not an empty list.
+    firestoreError = new Error('Guest requests service returned an unexpected payload shape.');
+  } catch (fsErr) {
+    firestoreError = fsErr;
+  }
 
+  if (firestoreOnly) {
+    if (isFirestoreQuotaError(firestoreError)) {
+      guestRequestsUnavailableUntil = Date.now() + GUEST_REQUESTS_NEGATIVE_CACHE_TTL_MS;
+    }
+    logGuestRequestsUnavailable(firestoreError);
+    return respondUnavailable(firestoreError);
+  }
+
+  console.warn('[getGuestRequests] Firestore serving error, attempting MySQL fallback:', firestoreError?.message);
+
+  try {
     // ── Fallback: Legacy MySQL Path ──────────────────────────────────────────
     // 1. Ledger-based service requests (food orders, room service, laundry etc.)
     const [serviceItems] = await pool.query(`

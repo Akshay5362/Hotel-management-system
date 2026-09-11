@@ -88,6 +88,38 @@ export class AuthenticationError extends Error {
 }
 
 /**
+ * A forced token refresh that several callers can share.
+ *
+ * Every forced refresh fires Firebase's onIdTokenChanged, which the auth
+ * context turns into new state. When a handful of requests 401 at the same
+ * moment — which is exactly what happens when the backend is degraded — each
+ * one used to force its own refresh, so one outage produced a burst of token
+ * changes and a burst of re-renders. Callers arriving while a refresh is
+ * already running now wait for that one instead of starting another.
+ *
+ * Deliberately NOT a cache: it holds the promise only while it is in flight, so
+ * a later 401 still gets a genuinely fresh token.
+ */
+let inFlightTokenRefresh = null;
+
+/** Test seam: how many forced refreshes actually reached Firebase. */
+export const _tokenRefreshDiagnostics = { forcedRefreshes: 0 };
+export function _resetTokenRefreshDiagnostics() {
+  _tokenRefreshDiagnostics.forcedRefreshes = 0;
+  inFlightTokenRefresh = null;
+}
+
+function refreshIdTokenOnce(currentUser) {
+  if (!inFlightTokenRefresh) {
+    _tokenRefreshDiagnostics.forcedRefreshes++;   // counts refreshes, not callers
+    inFlightTokenRefresh = currentUser.getIdToken(true).finally(() => {
+      inFlightTokenRefresh = null;
+    });
+  }
+  return inFlightTokenRefresh;
+}
+
+/**
  * fetch() wrapper for authenticated API calls, with the same resilience
  * App.jsx's Dashboard polling already has inline: on a 401, force-refresh
  * the Firebase ID token and retry exactly once before giving up cleanly.
@@ -127,9 +159,12 @@ export async function authenticatedFetch(url, options = {}, token, extraHeaders 
     throw new AuthenticationError();
   }
 
+  // EXACTLY ONE refresh and EXACTLY ONE retry. There is no loop here and no
+  // recursion: whatever the retry returns is the final answer, and a second
+  // 401 ends the call rather than starting the cycle again.
   let freshToken;
   try {
-    freshToken = await auth.currentUser.getIdToken(true);
+    freshToken = await refreshIdTokenOnce(auth.currentUser);
   } catch {
     throw new AuthenticationError();
   }
