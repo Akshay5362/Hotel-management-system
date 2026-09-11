@@ -22,7 +22,7 @@
  */
 
 import { db } from '../../config/firebaseAdmin.js';
-import { getDoc, formatDocSnapshot, RepositoryError } from './firestoreUtils.js';
+import { getDoc, formatDocSnapshot, RepositoryError, buildStatusFilter } from './firestoreUtils.js';
 import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from '../../utils/inventoryConstants.js';
 
 export const ORDERS_COLLECTION = 'purchase_orders';
@@ -111,7 +111,12 @@ export async function listPurchaseOrdersFirestore({
   }
 
   let q = db.collection(ORDERS_COLLECTION);
-  if (status) q = q.where('status', '==', String(status).toUpperCase());
+  // One status or several: `buildStatusFilter` collapses a single value back to
+  // `==`, so every existing caller keeps the query it has always issued.
+  const statusFilter = buildStatusFilter(
+    (Array.isArray(status) ? status : [status]).map(s => (s ? String(s).toUpperCase() : s))
+  );
+  if (statusFilter) q = q.where(statusFilter.field, statusFilter.op, statusFilter.value);
   if (supplier_id) q = q.where('supplier_id', '==', String(supplier_id));
   if (location_id) q = q.where('location_id', '==', String(location_id));
   if (department) q = q.where('department', '==', String(department));

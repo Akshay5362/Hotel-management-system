@@ -21,7 +21,7 @@
  * all client writes to both collections.
  */
 
-import { getDoc, listDocs, setDoc, updateDoc, RepositoryError } from './firestoreUtils.js';
+import { getDoc, listDocs, setDoc, updateDoc, RepositoryError, buildStatusFilter } from './firestoreUtils.js';
 import { db } from '../../config/firebaseAdmin.js';
 import { FieldPath } from 'firebase-admin/firestore';
 import {
@@ -132,7 +132,8 @@ export async function getInventoryBillByIdFirestore(billId, options = {}) {
 }
 
 /**
- * Paged bill list, newest first. `status` may be a single status string.
+ * Paged bill list, newest first. `status` may be a single status string or a
+ * list of them, in which case one `in` query replaces several `==` queries.
  * Deliberately not cached: a bill's status changes throughout its short life
  * and a stale work queue would be worse than an extra read.
  */
@@ -140,10 +141,14 @@ export async function listInventoryBillsFirestore(query = {}, options = {}) {
   const { status = null, supplier_id = null, limit = 25, startAfterDoc = null } = query;
   const filters = [];
   if (status) {
-    if (!ALL_BILL_STATUSES.includes(status)) {
-      throw new RepositoryError(`Unknown bill status '${status}'`, 'VALIDATION_ERROR', 400);
+    const wanted = Array.isArray(status) ? status : [status];
+    for (const s of wanted) {
+      if (!ALL_BILL_STATUSES.includes(s)) {
+        throw new RepositoryError(`Unknown bill status '${s}'`, 'VALIDATION_ERROR', 400);
+      }
     }
-    filters.push({ field: 'status', op: '==', value: status });
+    const statusFilter = buildStatusFilter(wanted);
+    if (statusFilter) filters.push(statusFilter);
   }
   if (supplier_id) filters.push({ field: 'supplier_id', op: '==', value: String(supplier_id) });
 

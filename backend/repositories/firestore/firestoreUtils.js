@@ -216,6 +216,27 @@ export async function getDocsByIds(collectionName, docIds = [], options = {}) {
 }
 
 /**
+ * Builds the `status` clause for a list query from a single status or several.
+ *
+ * Returns `null` when nothing was asked for, an `==` filter for exactly one
+ * status, and an `in` filter for more than one. Collapsing a one-element list
+ * back to `==` matters: it keeps every existing single-status caller on the
+ * exact query it has always issued.
+ *
+ * An `in` filter reuses the same composite index as the `==` form it replaces
+ * (verified against both the bill and purchase-order indexes), so consolidating
+ * several single-status requests into one needs no new index.
+ */
+export function buildStatusFilter(status, field = 'status') {
+  const values = (Array.isArray(status) ? status : [status])
+    .map(v => (v === null || v === undefined ? '' : String(v).trim()))
+    .filter(Boolean);
+  if (values.length === 0) return null;
+  if (values.length === 1) return { field, op: '==', value: values[0] };
+  return { field, op: 'in', value: values };
+}
+
+/**
  * Generic List/Query supporting filtering, pagination, sorting, and optional Transactions
  */
 export async function listDocs(collectionName, options = {}) {

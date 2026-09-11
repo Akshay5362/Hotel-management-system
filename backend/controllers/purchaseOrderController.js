@@ -16,7 +16,7 @@
 import { PurchaseOrderService } from '../services/purchaseOrderService.js';
 import { getActor, sendError } from './inventoryController.js';
 import { normalizeUserRole } from './authController.js';
-import { ALL_PO_STATUSES, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from '../utils/inventoryConstants.js';
+import { ALL_PO_STATUSES, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MAX_STATUS_FILTER_VALUES, parseStatusFilter } from '../utils/inventoryConstants.js';
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -29,8 +29,12 @@ function orderActor(req) {
 export const getPurchaseOrders = async (req, res) => {
   const q = req.query || {};
   const errors = [];
-  if (q.status && !ALL_PO_STATUSES.includes(String(q.status).toUpperCase())) {
-    errors.push(`status must be one of: ${ALL_PO_STATUSES.join(', ')}.`);
+  // `status` accepts one name or a comma-separated list, so the Overview can ask
+  // for ISSUED and PARTIALLY_RECEIVED in a single request.
+  const { statuses, invalid } = parseStatusFilter(q.status, ALL_PO_STATUSES);
+  if (invalid.length) errors.push(`status must be one of: ${ALL_PO_STATUSES.join(', ')}.`);
+  if (statuses.length > MAX_STATUS_FILTER_VALUES) {
+    errors.push(`At most ${MAX_STATUS_FILTER_VALUES} statuses may be requested at once.`);
   }
   if (q.from && !ISO_DATE.test(String(q.from))) errors.push('from must be YYYY-MM-DD.');
   if (q.to && !ISO_DATE.test(String(q.to))) errors.push('to must be YYYY-MM-DD.');
@@ -39,7 +43,7 @@ export const getPurchaseOrders = async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(q.limit || q.page_size, 10) || DEFAULT_PAGE_SIZE, 1), MAX_PAGE_SIZE);
     const result = await PurchaseOrderService.list({
-      status: q.status ? String(q.status).toUpperCase() : null,
+      status: statuses.length ? statuses : null,
       supplier_id: q.supplier_id || null,
       source_request_id: q.source_request_id || null,
       location_id: q.location_id || null,

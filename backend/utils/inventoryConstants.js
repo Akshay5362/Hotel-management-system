@@ -326,6 +326,39 @@ export const MASTER_LIST_FETCH_CAP = 1000;
 export const DEFAULT_PAGE_SIZE = 25;
 export const MAX_PAGE_SIZE = 100;
 
+/**
+ * Firestore evaluates an `in` filter against at most 30 values. Ten is well
+ * under that and still covers every status enum in this module, so a caller
+ * cannot construct a filter the database will reject.
+ */
+export const MAX_STATUS_FILTER_VALUES = 10;
+
+/**
+ * Parses a `?status=` query value into a validated list.
+ *
+ * Accepts what the API has always accepted — a single status string — and
+ * additionally a comma-separated list or an array, so one request can ask for
+ * several statuses at once. Values are upper-cased, trimmed and de-duplicated,
+ * and order is preserved.
+ *
+ * Returns `{ statuses, invalid }`. `invalid` is non-empty when the caller named
+ * something outside `allowed`; callers reject the request rather than silently
+ * dropping the unknown value, which would answer a different question than the
+ * one that was asked.
+ */
+export function parseStatusFilter(raw, allowed = []) {
+  const parts = Array.isArray(raw) ? raw : String(raw ?? '').split(',');
+  const statuses = [];
+  const invalid = [];
+  for (const part of parts) {
+    const value = String(part ?? '').trim().toUpperCase();
+    if (!value) continue;
+    if (!allowed.includes(value)) { if (!invalid.includes(value)) invalid.push(value); continue; }
+    if (!statuses.includes(value)) statuses.push(value);
+  }
+  return { statuses, invalid };
+}
+
 // ── Phase H1 — supplier bill capture ─────────────────────────────────────────
 // Additive only. Nothing above this line changes, and no A–G behaviour reads
 // any of these constants.

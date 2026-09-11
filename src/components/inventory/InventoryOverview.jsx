@@ -26,6 +26,11 @@ import { MOVEMENT_TYPE, PR_STATUS, PO_STATUS, BILL_STATUS, statusOf } from './st
 
 const PAGE = 5;
 
+// The statuses each attention panel watches, sent as one comma-separated
+// `status` filter so the panel costs one request instead of one per status.
+const PO_ATTENTION = 'ISSUED,PARTIALLY_RECEIVED';
+const BILL_ATTENTION = 'EXTRACTED,IN_REVIEW,EXTRACTION_FAILED';
+
 export default function InventoryOverview({ token, perms, onNavigate }) {
   const [metrics, setMetrics] = useState(null);
   const [low, setLow] = useState([]);
@@ -51,14 +56,24 @@ export default function InventoryOverview({ token, perms, onNavigate }) {
     const jobs = {
       stock: safe('Stock', inventoryFetch(`/inventory/stock?page_size=${PAGE}&include_buckets=true`, { token })),
       prs: perms.request ? safe('Approvals', inventoryFetch(`/inventory/purchase-requests?status=PENDING_APPROVAL&limit=${PAGE}`, { token })) : Promise.resolve(null),
-      issued: perms.manage ? safe('Purchase orders', inventoryFetch(`/inventory/purchase-orders?status=ISSUED&limit=${PAGE}`, { token })) : Promise.resolve(null),
-      partial: perms.manage ? safe('Purchase orders', inventoryFetch(`/inventory/purchase-orders?status=PARTIALLY_RECEIVED&limit=${PAGE}`, { token })) : Promise.resolve(null),
-      bills: perms.receive ? Promise.all(['EXTRACTED', 'IN_REVIEW', 'EXTRACTION_FAILED'].map(s =>
-        safe('Bills', inventoryFetch(`/inventory/bills?status=${s}&limit=${PAGE}`, { token })))) : Promise.resolve(null),
+      // One request per panel, not one per status. Both endpoints accept a
+      // comma-separated `status` list and answer it with a single Firestore
+      // `in` query on the index the `==` form already used.
+      //
+      // The limits are the old per-status limit times the number of statuses, so
+      // the longest list a panel can show is unchanged. What DOES change once a
+      // panel overflows is which rows fill it: the old per-status requests
+      // guaranteed up to PAGE rows from EACH status, whereas one merged query
+      // returns the newest rows across all of them. A status that is busy can
+      // therefore crowd out an older, quieter one. That is the intended reading
+      // of an attention panel — newest first — and every row still carries its
+      // own status badge, but it is a real difference from the old behaviour.
+      pos: perms.manage ? safe('Purchase orders', inventoryFetch(`/inventory/purchase-orders?status=${PO_ATTENTION}&limit=${PAGE * 2}`, { token })) : Promise.resolve(null),
+      bills: perms.receive ? safe('Bills', inventoryFetch(`/inventory/bills?status=${BILL_ATTENTION}&limit=${PAGE * 3}`, { token })) : Promise.resolve(null),
       moves: safe('Recent activity', inventoryFetch('/inventory/movements?limit=8', { token }))
     };
     const r = await Promise.all(Object.values(jobs));
-    const [stockR, prR, issuedR, partialR, billsR, movesR] = r;
+    const [stockR, prR, posR, billsR, movesR] = r;
 
     if (stockR) {
       setMetrics(stockR.metrics || null);
@@ -66,8 +81,8 @@ export default function InventoryOverview({ token, perms, onNavigate }) {
       setOut(stockR.outOfStock || []);
     }
     setPendingPRs(prR?.requests || []);
-    setReceivablePOs([...(issuedR?.orders || []), ...(partialR?.orders || [])]);
-    setOpenBills((billsR || []).flatMap(b => b?.bills || []));
+    setReceivablePOs(posR?.orders || []);
+    setOpenBills(billsR?.bills || []);
     setActivity(movesR?.movements || []);
     setErrors([...new Set(errs)]);
     setLoading(false);

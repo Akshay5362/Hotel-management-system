@@ -51,8 +51,16 @@ ok('  it consumes metrics, lowStock and outOfStock from that one response',
   /setMetrics\(stockR\.metrics/.test(OV) &&
   /setLow\(stockR\.lowStock \|\| \[\]\)/.test(OV) &&
   /setOut\(stockR\.outOfStock \|\| \[\]\)/.test(OV));
-ok('  the destructuring matches the job list (6 jobs, 6 names)',
-  /const \[stockR, prR, issuedR, partialR, billsR, movesR\] = r;/.test(OV));
+// Derived, not hardcoded: the invariant is that every job is destructured, and
+// the job count legitimately changes as panels are consolidated (Group C merged
+// the two purchase-order and three bill requests into one each).
+const jobsBlock = OV.slice(OV.indexOf('const jobs'), OV.indexOf('const r = await'));
+const jobCount = (jobsBlock.match(/inventoryFetch\(/g) || []).length;
+const destructured = (OV.match(/const \[([^\]]+)\] = r;/) || [, ''])[1]
+  .split(',').map(x => x.trim()).filter(Boolean);
+ok('  the destructuring matches the job list, one name per request',
+  destructured.length === jobCount, `${jobCount} jobs, ${destructured.length} names`);
+ok('  and the stock response is the first of them', destructured[0] === 'stockR');
 
 // ═════════════════════════════════════════════════════════════════════════════
 console.log('\n═══ 2. STATIC — the Stock page is untouched ═══\n');

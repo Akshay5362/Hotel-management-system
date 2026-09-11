@@ -32,7 +32,7 @@ import { BillConfirmService } from '../services/billConfirmService.js';
 import { DirectReceiptService } from '../services/directReceiptService.js';
 import { resolveBusinessDate } from '../services/inventoryNumberService.js';
 import { detectBillDuplicates } from '../services/billDuplicateService.js';
-import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, ALL_BILL_STATUSES } from '../utils/inventoryConstants.js';
+import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, ALL_BILL_STATUSES, MAX_STATUS_FILTER_VALUES, parseStatusFilter } from '../utils/inventoryConstants.js';
 
 /** Content types this phase can serve back, keyed by what was verified on upload. */
 const SERVEABLE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
@@ -108,13 +108,19 @@ export const uploadBill = async (req, res) => {
 /** GET /api/inventory/bills — paged work queue, newest first. */
 export const listBills = async (req, res) => {
   try {
-    const status = req.query.status ? String(req.query.status).toUpperCase() : null;
-    if (status && !ALL_BILL_STATUSES.includes(status)) {
-      return res.status(400).json({ error: `Unknown bill status '${status}'.`, code: 'INVALID_BILL_STATUS' });
+    // `status` accepts one name or a comma-separated list. The Overview asks for
+    // its whole review queue — EXTRACTED, IN_REVIEW, EXTRACTION_FAILED — in one
+    // request instead of one request per status.
+    const { statuses, invalid } = parseStatusFilter(req.query.status, ALL_BILL_STATUSES);
+    if (invalid.length) {
+      return res.status(400).json({ error: `Unknown bill status '${invalid[0]}'.`, code: 'INVALID_BILL_STATUS' });
+    }
+    if (statuses.length > MAX_STATUS_FILTER_VALUES) {
+      return res.status(400).json({ error: `At most ${MAX_STATUS_FILTER_VALUES} statuses may be requested at once.`, code: 'TOO_MANY_BILL_STATUSES' });
     }
     const limit = Math.min(Number(req.query.limit) || DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
     const bills = await listInventoryBillsFirestore({
-      status,
+      status: statuses.length ? statuses : null,
       supplier_id: req.query.supplier_id || null,
       limit
     });
