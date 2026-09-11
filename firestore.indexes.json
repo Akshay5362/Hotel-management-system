@@ -475,6 +475,39 @@
           { "fieldPath": "business_date", "order": "DESCENDING" },
           { "fieldPath": "created_at", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "inventory_bills",
+      "queryScope": "COLLECTION",
+      "fields": [
+          { "fieldPath": "status", "order": "ASCENDING" },
+          { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "inventory_bills",
+      "queryScope": "COLLECTION",
+      "fields": [
+          { "fieldPath": "supplier_id", "order": "ASCENDING" },
+          { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "inventory_bills",
+      "queryScope": "COLLECTION",
+      "fields": [
+          { "fieldPath": "status", "order": "ASCENDING" },
+          { "fieldPath": "supplier_id", "order": "ASCENDING" },
+          { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "inventory_bill_lines",
+      "queryScope": "COLLECTION",
+      "fields": [
+          { "fieldPath": "bill_id", "order": "ASCENDING" },
+          { "fieldPath": "line_no", "order": "ASCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

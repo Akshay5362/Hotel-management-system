@@ -235,6 +235,22 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // Phase H1 — supplier bills. The uploaded document itself lives on the
+    // server filesystem and is streamed through an authenticated, role-gated
+    // route; only this metadata envelope is in Firestore. A bill carries
+    // purchase pricing, so reads are restricted to staff and every write goes
+    // through the Express API (Admin SDK), which owns the status lifecycle and
+    // the rule that a confirmed bill can never be discarded.
+    match /inventory_bills/{billId} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+
+    match /inventory_bill_lines/{lineId} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+
     match /cash_logs/{logId} {
       allow read: if isStaff();
       allow create: if isStaff();
