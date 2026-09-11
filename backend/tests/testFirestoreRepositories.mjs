@@ -1,5 +1,79 @@
-import { db, isFirebaseConfigured } from '../config/firebaseAdmin.js';
-import {
+/**
+ * backend/tests/testFirestoreRepositories.mjs
+ * ─────────────────────────────────────────────────────────────────────────────
+ * DEV-ONLY. This suite CREATES AND DELETES documents across 19 collections
+ * (rooms, bookings, payments, invoices, staff, guests, inventory, ...), so it
+ * must never be pointed at the production Firebase project.
+ *
+ * SAFETY — quadruple guard, checked in this order, BEFORE Firebase Admin is
+ * initialized or any Firestore access happens:
+ *   1. HPMS_ENV must literally be "development" (else: abort, exit 1).
+ *   2. Firebase Admin config is loaded from backend/.env.development only.
+ *   3. isProductionProject() (backend/config/productionSafetyGuard.js) must be
+ *      false — the same fail-closed predicate firebaseAdmin.js itself uses.
+ *   4. The resolved Firestore project id must be exactly "sky5-development",
+ *      and any id containing "hpms" (case-insensitive) is rejected outright as
+ *      defense in depth.
+ * The resolved project id is printed before any repository is touched.
+ *
+ * The imports below are DYNAMIC on purpose: a static `import` is hoisted and
+ * evaluated before any module body statement, which would let
+ * config/firebaseAdmin.js connect (potentially to production) before the guard
+ * could run. Importing after the guard is what makes it fail closed.
+ * Mirrors backend/scripts/seedDevFirestore.mjs, seedDevInventory.mjs and
+ * backend/tests/testInventoryPhaseA.mjs.
+ *
+ * Run: cross-env HPMS_ENV=development node backend/tests/testFirestoreRepositories.mjs
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+import path from 'path';
+import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const BACKEND_ROOT = path.join(__dirname, '..');
+
+// ── Guard 1: HPMS_ENV must be explicitly "development" ──────────────────────
+if (process.env.HPMS_ENV !== 'development') {
+  console.error(
+    `[SAFETY_ABORT] HPMS_ENV must be exactly "development" (got: ${JSON.stringify(process.env.HPMS_ENV)}). ` +
+    `This suite writes and deletes documents across 19 collections and must never run against production. ` +
+    `Run via: cross-env HPMS_ENV=development node backend/tests/testFirestoreRepositories.mjs`
+  );
+  process.exit(1);
+}
+
+// ── Guard 2: load ONLY backend/.env.development — never backend/.env ────────
+dotenv.config({ path: path.join(BACKEND_ROOT, '.env.development') });
+
+// ── Guard 3: fail closed if the resolved project is production ──────────────
+const { isProductionProject } = await import('../config/productionSafetyGuard.js');
+if (isProductionProject()) {
+  console.error(
+    `[SAFETY_ABORT] FIREBASE_PROJECT_ID resolved to the PRODUCTION project ` +
+    `("${process.env.FIREBASE_PROJECT_ID}"). Refusing to initialize. Nothing was contacted.`
+  );
+  process.exit(1);
+}
+
+// ── Guard 4: exact-match + "hpms" rejection ─────────────────────────────────
+const resolvedProjectId = process.env.FIREBASE_PROJECT_ID;
+if (resolvedProjectId !== 'sky5-development') {
+  console.error(`[SAFETY_ABORT] Resolved Firebase project is "${resolvedProjectId}", expected exactly "sky5-development". Refusing to run.`);
+  process.exit(1);
+}
+if (/hpms/i.test(String(resolvedProjectId))) {
+  console.error(`[SAFETY_ABORT] Resolved Firebase project id "${resolvedProjectId}" contains "hpms" — refusing unconditionally, regardless of the exact-match check above.`);
+  process.exit(1);
+}
+
+console.log(`[GUARD] Resolved Firebase project: ${resolvedProjectId} (DEV) — safe to proceed.`);
+
+// ── Only now may Firebase Admin and the repositories be loaded ──────────────
+const { db, isFirebaseConfigured } = await import('../config/firebaseAdmin.js');
+const {
   createRoomFirestore, getRoomByIdFirestore, getAllRoomsFirestore, updateRoomFirestore, deleteRoomFirestore,
   createBookingFirestore, getBookingByIdFirestore, getAllBookingsFirestore, updateBookingFirestore, deleteBookingFirestore,
   createReservationFirestore, getReservationByIdFirestore, getAllReservationsFirestore, deleteReservationFirestore,
@@ -20,7 +94,7 @@ import {
   createRazorpayTransactionFirestore, getRazorpayTransactionByOrderIdFirestore,
   getSystemDateFirestore, updateSystemDateFirestore,
   RepositoryError
-} from '../repositories/firestore/index.js';
+} = await import('../repositories/firestore/index.js');
 
 async function runFull19RepositoryTests() {
   console.log('========================================================================');
@@ -207,11 +281,22 @@ async function runFull19RepositoryTests() {
       unit_price: 250
     });
     createdTestDocs.push({ collection: 'inventory_products', id: `prod_${testSku.toLowerCase()}` });
-    assert(createdProd && createdProd.stock_quantity === 50, 'createInventoryProductFirestore');
+    // Phase A: a product is always created with ZERO stock. Stock only ever
+    // arrives through inventoryStockService (which writes an
+    // inventory_stock_movements ledger entry in the same transaction), so a
+    // stock value passed to the repository is intentionally ignored.
+    assert(createdProd && createdProd.stock_quantity === 0, 'createInventoryProductFirestore (creates with zero stock)');
 
-    await updateProductStockFirestore(`prod_${testSku.toLowerCase()}`, -10);
+    // Phase A: direct stock writes that would bypass the ledger are refused.
+    let directStockWriteBlocked = false;
+    try {
+      await updateProductStockFirestore(`prod_${testSku.toLowerCase()}`, -10);
+    } catch (err) {
+      directStockWriteBlocked = err.code === 'STOCK_WRITE_FORBIDDEN';
+    }
+    assert(directStockWriteBlocked, 'updateProductStockFirestore is disabled (stock must go through the ledger)');
     const updatedProd = await getInventoryProductByIdFirestore(`prod_${testSku.toLowerCase()}`);
-    assert(updatedProd && updatedProd.stock_quantity === 40, 'updateProductStockFirestore');
+    assert(updatedProd && updatedProd.stock_quantity === 0, 'stock unchanged by the refused direct write');
 
     // 12. inventoryCategoriesRepository
     console.log('\n--- [12/19] inventoryCategoriesRepository ---');

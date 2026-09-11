@@ -57,9 +57,9 @@ console.log(`[GUARD] Resolved Firebase project: ${resolvedProjectId} (DEV) — s
 
 // ── Imports only after the guard ──────────────────────────────────────────
 const { db } = await import('../config/firebaseAdmin.js');
-const { GoodsReceiptService } = await import('../services/goodsReceiptService.js');
-const { PurchaseOrderService } = await import('../services/purchaseOrderService.js');
-const { PurchaseRequestService } = await import('../services/purchaseRequestService.js');
+const { GoodsReceiptService: RealGoodsReceiptService } = await import('../services/goodsReceiptService.js');
+const { PurchaseOrderService: RealPurchaseOrderService } = await import('../services/purchaseOrderService.js');
+const { PurchaseRequestService: RealPurchaseRequestService } = await import('../services/purchaseRequestService.js');
 const { PurchaseRequestApprovalService } = await import('../services/purchaseRequestApprovalService.js');
 const { InventoryCutoverService } = await import('../services/inventoryCutoverService.js');
 const { createGoodsReceipt } = await import('../controllers/goodsReceiptController.js');
@@ -76,6 +76,27 @@ const { createInventorySupplierFirestore } = await import('../repositories/fires
 const { getAllInventoryLocationsFirestore, createInventoryLocationFirestore } = await import('../repositories/firestore/inventoryLocationsRepository.js');
 const { updateInventoryApprovalConfigFirestore } = await import('../repositories/firestore/inventoryApprovalConfigRepository.js');
 const { PO_STATUS, VARIANCE_TYPE, RECEIVING_ROLES } = await import('../utils/inventoryConstants.js');
+const { createOwnership, census, censusDiff } = await import('./helpers/inventoryTestOwnership.mjs');
+
+// ── Ownership-scoped cleanup ────────────────────────────────────────────────
+// This suite used to end by deleting every document in goods_receipts,
+// goods_receipt_items, purchase_orders, purchase_order_items,
+// purchase_requests and purchase_request_items. That destroyed a purchase
+// request a person had raised through the DEV application. The services are
+// wrapped so every call site records the ids it produced, and cleanup deletes
+// exactly those. Nothing here deletes by collection or by prefix.
+const own = createOwnership(db);
+const GoodsReceiptService = own.wrapService(RealGoodsReceiptService, {
+  receive: own.recordReceipt
+});
+const PurchaseOrderService = own.wrapService(RealPurchaseOrderService, {
+  createFromRequest: own.recordOrder,
+  issue: own.recordOrder
+});
+const PurchaseRequestService = own.wrapService(RealPurchaseRequestService, {
+  createDraft: own.recordRequest,
+  updateDraft: own.recordRequest
+});
 
 const API_BASE = process.env.TEST_API_BASE || 'http://127.0.0.1:5001/api';
 const RUN_ID = Date.now().toString(36);
@@ -112,6 +133,8 @@ async function main() {
 
   const cleanup = [];
   await updateInventoryApprovalConfigFirestore({ enabled: true, allowed_roles: ['admin', 'super_admin'] });
+  // Every watched collection, by document id, before anything is created.
+  const censusBefore = await census(db);
 
   // Snapshot the PERSISTENT products — they must be untouched at the end.
   const persistentBefore = {};
@@ -575,17 +598,12 @@ async function main() {
 
   // ── cleanup ─────────────────────────────────────────────────────────────
   console.log('\n── Cleanup ───────────────────────────────────────────────────────────────────');
-  for (const col of ['goods_receipts', 'goods_receipt_items']) {
-    const snap = await db.collection(col).get();
-    for (const d of snap.docs) await d.ref.delete();
-  }
   for (const fn of cleanup) {
     try { await fn(); } catch (err) { console.warn(`  [cleanup warning] ${err.message}`); }
   }
-  for (const col of ['purchase_orders', 'purchase_order_items', 'purchase_requests', 'purchase_request_items']) {
-    const snap = await db.collection(col).get();
-    for (const d of snap.docs) await d.ref.delete();
-  }
+  // Exactly the documents this run created, children before parents.
+  await own.adoptChildren();
+  await own.sweep();
   // Scoped by actor-uid prefix instead of scanning the whole audit_logs
   // collection. Every audit this suite writes carries one of its synthetic
   // `phaseftest_*` uids, so the range covers exactly the same documents the
@@ -597,20 +615,38 @@ async function main() {
     if (blob.includes('phaseftest_') || blob.includes(RUN_ID)) await d.ref.delete();
   }
 
-  ok(await countOf(db.collection('goods_receipts')) === 0, 'Cleanup: no goods receipts left behind');
-  ok(await countOf(db.collection('goods_receipt_items')) === 0, 'Cleanup: no orphan receipt items left behind');
-  ok(await countOf(db.collection('purchase_orders')) === 0, 'Cleanup: no purchase orders left behind');
+  // Scoped to what THIS run created. Asserting the collections are globally
+  // empty was the assertion that made a destructive sweep look necessary.
+  {
+    const left = await own.survivors();
+    const of = (c) => left.filter(x => x.startsWith(c + '/')).length;
+    ok(of('goods_receipts') === 0, 'Cleanup: no goods receipt this run created is left behind');
+    ok(of('goods_receipt_items') === 0, 'Cleanup: no receipt item this run created is left behind');
+    ok(of('purchase_orders') === 0, 'Cleanup: no purchase order this run created is left behind');
+    ok(of('purchase_requests') === 0, 'Cleanup: no purchase request this run created is left behind');
+    ok(left.length === 0, `Ownership: all ${own.size()} documents this run created are re-read and gone`,
+      left.slice(0, 6).join(', '));
+  }
   const strayProd = (await db.collection('inventory_products').get()).docs.filter(d => /^PHASE-F-/i.test(String(d.data().sku || '')));
   ok(strayProd.length === 0, 'Cleanup: no synthetic test products left behind', `found ${strayProd.length}`);
 
   // The ledger is append-only: the ONLY movements removed are those belonging
   // to this run's synthetic products, which were deleted with them.
-  const movesNow = (await db.collection('inventory_stock_movements').get()).docs;
-  const leftoverTestMoves = movesNow.filter(d => !persistentMovementIds.has(d.id));
+  const movesNow = new Set((await db.collection('inventory_stock_movements').get()).docs.map(d => d.id));
+  const leftoverTestMoves = own.list('inventory_stock_movements').filter(id => movesNow.has(id));
   ok(leftoverTestMoves.length === 0, 'Cleanup: every test stock movement removed with its synthetic product',
     `found ${leftoverTestMoves.length}`);
-  ok(movesNow.length === persistentMovementIds.size, 'Cleanup: the persistent ledger is exactly as it was before the run',
-    `${persistentMovementIds.size} -> ${movesNow.length}`);
+  // The ledger is append-only, so every row that existed before must still
+  // exist. A row ADDED during the run by someone using DEV is not a failure.
+  const lostLedger = [...persistentMovementIds].filter(id => !movesNow.has(id));
+  ok(lostLedger.length === 0, 'Cleanup: every pre-existing ledger row is still present',
+    lostLedger.slice(0, 4).join(', '));
+  {
+    const { removed, added } = censusDiff(censusBefore, await census(db));
+    ok(removed.length === 0, 'Ownership: no pre-existing DEV document was deleted by this run',
+      removed.slice(0, 6).join(', '));
+    if (added.length) console.log(`  [note] ${added.length} document(s) appeared during the run and were left alone: ${added.slice(0, 4).join(', ')}`);
+  }
 
   console.log('\n' + '═'.repeat(78));
   console.log(`  RESULT: ${pass} passed, ${fail} failed`);

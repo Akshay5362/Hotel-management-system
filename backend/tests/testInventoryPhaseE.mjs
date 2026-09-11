@@ -58,8 +58,8 @@ console.log(`[GUARD] Resolved Firebase project: ${resolvedProjectId} (DEV) — s
 
 // ── Imports only after the guard ──────────────────────────────────────────
 const { db } = await import('../config/firebaseAdmin.js');
-const { PurchaseOrderService } = await import('../services/purchaseOrderService.js');
-const { PurchaseRequestService } = await import('../services/purchaseRequestService.js');
+const { PurchaseOrderService: RealPurchaseOrderService } = await import('../services/purchaseOrderService.js');
+const { PurchaseRequestService: RealPurchaseRequestService } = await import('../services/purchaseRequestService.js');
 const { PurchaseRequestApprovalService } = await import('../services/purchaseRequestApprovalService.js');
 const { InventoryCutoverService } = await import('../services/inventoryCutoverService.js');
 const {
@@ -76,6 +76,22 @@ const { createInventorySupplierFirestore } = await import('../repositories/fires
 const { getAllInventoryLocationsFirestore } = await import('../repositories/firestore/inventoryLocationsRepository.js');
 const { updateInventoryApprovalConfigFirestore } = await import('../repositories/firestore/inventoryApprovalConfigRepository.js');
 const { PO_STATUS, PR_STATUS } = await import('../utils/inventoryConstants.js');
+const { createOwnership, census, censusDiff } = await import('./helpers/inventoryTestOwnership.mjs');
+
+// ── Ownership-scoped cleanup ────────────────────────────────────────────────
+// This suite used to end by deleting every document in purchase_orders and
+// purchase_order_items. That reaches documents it never created. The services
+// are wrapped so every call site records the ids it produced, and cleanup
+// deletes exactly those. Nothing here deletes by collection or by prefix.
+const own = createOwnership(db);
+const PurchaseOrderService = own.wrapService(RealPurchaseOrderService, {
+  createFromRequest: own.recordOrder,
+  issue: own.recordOrder
+});
+const PurchaseRequestService = own.wrapService(RealPurchaseRequestService, {
+  createDraft: own.recordRequest,
+  updateDraft: own.recordRequest
+});
 
 const API_BASE = process.env.TEST_API_BASE || 'http://127.0.0.1:5001/api';
 const RUN_ID = Date.now().toString(36);
@@ -114,6 +130,9 @@ async function main() {
   console.log('═'.repeat(78));
 
   const cleanup = [];
+  // Every watched collection, by document id, before anything is created.
+  // Compared again after cleanup: nothing that existed here may disappear.
+  const censusBefore = await census(db);
 
   // ── fixtures ────────────────────────────────────────────────────────────
   console.log('\n── Fixtures ──────────────────────────────────────────────────────────────────');
@@ -238,6 +257,8 @@ async function main() {
     // and by the shared requireRole tests in Phase A/C).
     const { req, res } = makeCtx({ user: admin, body: { source_request_id: approvedForRbac.id } });
     await createPurchaseOrder(req, res);
+    // Created through the controller, so the service wrapper never saw it.
+    own.recordOrder(res.payload);
     ok(res.statusCode === 201, '11. An admin can create a purchase order', `got ${res.statusCode}`);
     ok(res.payload.order.status === PO_STATUS.DRAFT, 'New purchase order starts as DRAFT');
   }
@@ -245,6 +266,7 @@ async function main() {
     const approved2 = await makeApproved([{ product_id: prodA2.id, requested_quantity: 2 }]);
     const { req, res } = makeCtx({ user: superAdmin, body: { source_request_id: approved2.id } });
     await createPurchaseOrder(req, res);
+    own.recordOrder(res.payload);
     ok(res.statusCode === 201, '12. A super_admin can create a purchase order', `got ${res.statusCode}`);
   }
   {
@@ -510,10 +532,9 @@ async function main() {
   for (const fn of cleanup) {
     try { await fn(); } catch (err) { console.warn(`  [cleanup warning] ${err.message}`); }
   }
-  for (const col of ['purchase_orders', 'purchase_order_items']) {
-    const snap = await db.collection(col).get();
-    for (const d of snap.docs) await d.ref.delete();
-  }
+  // Exactly the documents this run created, children before parents.
+  await own.adoptChildren();
+  await own.sweep();
   // Scoped by actor-uid prefix instead of scanning the whole audit_logs
   // collection. Every audit this suite writes carries one of its synthetic
   // `phaseetest_*` uids, so the range covers exactly the same documents the
@@ -526,10 +547,33 @@ async function main() {
   }
 
   const countOf = async (q) => (await q.count().get()).data().count;   // aggregation: ~1 read
-  ok(await countOf(db.collection('purchase_orders')) === 0, 'Cleanup: no purchase orders left behind');
-  ok(await countOf(db.collection('purchase_order_items')) === 0, 'Cleanup: no orphan purchase-order items left behind');
-  ok(await countOf(db.collection('purchase_requests')) === 0, 'Cleanup: no purchase requests left behind');
-  ok(await countOf(db.collection('purchase_request_items')) === 0, 'Cleanup: no orphan request items left behind');
+  // Scoped to the documents THIS suite created, identified by its own marker or
+  // run id. Asserting that the whole collection is empty made the check fail
+  // whenever DEV held a purchase request raised by a person through the app,
+  // which says nothing about whether this suite cleaned up after itself. The
+  // invariant is unchanged: nothing this suite created may survive it.
+  const mineE = (d) => {
+    const blob = JSON.stringify(d.data() || {}) + '|' + d.id;
+    return blob.includes('phaseetest_') || blob.includes(RUN_ID);
+  };
+  const leftOf = async (col) => (await db.collection(col).get()).docs.filter(mineE).length;
+  ok(await leftOf('purchase_orders') === 0, 'Cleanup: no purchase orders left behind');
+  ok(await leftOf('purchase_order_items') === 0, 'Cleanup: no orphan purchase-order items left behind');
+  ok(await leftOf('purchase_requests') === 0, 'Cleanup: no purchase requests left behind');
+  ok(await leftOf('purchase_request_items') === 0, 'Cleanup: no orphan request items left behind');
+  // A delete call reports success for a document that was never there, so it
+  // proves nothing. Every recorded id is re-read instead.
+  {
+    const left = await own.survivors();
+    ok(left.length === 0, `Ownership: all ${own.size()} documents this run created are re-read and gone`,
+      left.slice(0, 6).join(', '));
+  }
+  {
+    const { removed, added } = censusDiff(censusBefore, await census(db));
+    ok(removed.length === 0, 'Ownership: no pre-existing DEV document was deleted by this run',
+      removed.slice(0, 6).join(', '));
+    if (added.length) console.log(`  [note] ${added.length} document(s) appeared during the run and were left alone: ${added.slice(0, 4).join(', ')}`);
+  }
   const strayProd = (await db.collection('inventory_products').get()).docs.filter(d => /^PHASE-E-/i.test(String(d.data().sku || '')));
   ok(strayProd.length === 0, 'Cleanup: no orphan test products left behind', `found ${strayProd.length}`);
   const straySup = (await db.collection('inventory_suppliers').get()).docs.filter(d => /PHASE_E_TEST|RENAMED SUPPLIER/i.test(String(d.data().name || '')));

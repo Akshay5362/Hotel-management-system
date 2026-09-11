@@ -456,10 +456,19 @@ async function main() {
     const blob = String(d.data().user_id || '') + '|' + String(d.data().details || '');
     if (blob.includes('phasedtest_') || blob.includes(RUN_ID)) await d.ref.delete();
   }
-  const leftReq = await db.collection('purchase_requests').get();
-  const leftItems = await db.collection('purchase_request_items').get();
-  ok(leftReq.empty, 'Cleanup: no purchase requests left behind', `found ${leftReq.size}`);
-  ok(leftItems.empty, 'Cleanup: no orphan purchase-request items left behind', `found ${leftItems.size}`);
+  // Scoped to the documents THIS suite created, identified by its own marker or
+  // run id. Asserting that the whole collection is empty made the check fail
+  // whenever DEV held a purchase request raised by a person through the app,
+  // which says nothing about whether this suite cleaned up after itself. The
+  // invariant is unchanged: nothing this suite created may survive it.
+  const mineD = (d) => {
+    const blob = JSON.stringify(d.data() || {}) + '|' + d.id;
+    return blob.includes('phasedtest_') || blob.includes(RUN_ID);
+  };
+  const leftReq = (await db.collection('purchase_requests').get()).docs.filter(mineD);
+  const leftItems = (await db.collection('purchase_request_items').get()).docs.filter(mineD);
+  ok(leftReq.length === 0, 'Cleanup: no purchase requests left behind', `found ${leftReq.length}`);
+  ok(leftItems.length === 0, 'Cleanup: no orphan purchase-request items left behind', `found ${leftItems.length}`);
   const strayProd = (await db.collection('inventory_products').get()).docs.filter(d => /^PHASE-D-/i.test(String(d.data().sku || '')));
   ok(strayProd.length === 0, 'Cleanup: no orphan test products left behind', `found ${strayProd.length}`);
   const cfgNow = await db.collection('settings').doc(PR_APPROVAL_CONFIG_DOC_ID).get();
