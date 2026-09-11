@@ -125,7 +125,14 @@ L('ENV', `isDev = ${isDev}  (based on app.isPackaged)`);
 //  production   installer (app.isPackaged)  → dist/ + spawns packaged backend
 const ELECTRON_MODE  = process.env.ELECTRON_MODE || (app.isPackaged ? 'production' : 'local');
 const USES_VITE      = ELECTRON_MODE === 'local' || ELECTRON_MODE === 'docker-dev';
-const SPAWNS_BACKEND = ELECTRON_MODE === 'production' || process.env.SPAWNS_BACKEND === 'true';
+// A packaged installer deliberately ships NO backend (see build.files — backend/**
+// is excluded so Firebase Admin credentials never reach a client PC). Spawning is
+// therefore only ever valid when running unpackaged from the repo, where
+// backend/server.js exists. Without this guard the packaged app throws
+// "server.js not found", which also poisons the subsequent health wait and
+// removes the retry window for a backend that is merely slow to start.
+const SPAWNS_BACKEND = !app.isPackaged
+  && (ELECTRON_MODE === 'production' || process.env.SPAWNS_BACKEND === 'true');
 
 L('ENV', `ELECTRON_MODE  = ${ELECTRON_MODE}`);
 L('ENV', `USES_VITE      = ${USES_VITE}   (true → load http://localhost:5173)`);
