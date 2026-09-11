@@ -43,9 +43,13 @@ export default function InventoryOverview({ token, perms, onNavigate }) {
     const safe = (label, p) => p.catch(err => { errs.push(`${label}: ${humanError(err)}`); return null; });
 
     // Only what this role may read. The stock endpoint carries the KPIs.
+    //
+    // ONE stock request, not two. `include_buckets=true` returns metrics plus
+    // both attention lists from a single server-side product scan; asking for
+    // LOW_STOCK and OUT_OF_STOCK separately made the backend read every product
+    // document twice and returned the same `metrics` block both times.
     const jobs = {
-      low: safe('Low stock', inventoryFetch(`/inventory/stock?page_size=${PAGE}&stock_status=LOW_STOCK`, { token })),
-      out: safe('Out of stock', inventoryFetch(`/inventory/stock?page_size=${PAGE}&stock_status=OUT_OF_STOCK`, { token })),
+      stock: safe('Stock', inventoryFetch(`/inventory/stock?page_size=${PAGE}&include_buckets=true`, { token })),
       prs: perms.request ? safe('Approvals', inventoryFetch(`/inventory/purchase-requests?status=PENDING_APPROVAL&limit=${PAGE}`, { token })) : Promise.resolve(null),
       issued: perms.manage ? safe('Purchase orders', inventoryFetch(`/inventory/purchase-orders?status=ISSUED&limit=${PAGE}`, { token })) : Promise.resolve(null),
       partial: perms.manage ? safe('Purchase orders', inventoryFetch(`/inventory/purchase-orders?status=PARTIALLY_RECEIVED&limit=${PAGE}`, { token })) : Promise.resolve(null),
@@ -54,10 +58,13 @@ export default function InventoryOverview({ token, perms, onNavigate }) {
       moves: safe('Recent activity', inventoryFetch('/inventory/movements?limit=8', { token }))
     };
     const r = await Promise.all(Object.values(jobs));
-    const [lowR, outR, prR, issuedR, partialR, billsR, movesR] = r;
+    const [stockR, prR, issuedR, partialR, billsR, movesR] = r;
 
-    if (lowR) { setMetrics(lowR.metrics || null); setLow(lowR.items || []); }
-    if (outR) { setOut(outR.items || []); if (!lowR && outR.metrics) setMetrics(outR.metrics); }
+    if (stockR) {
+      setMetrics(stockR.metrics || null);
+      setLow(stockR.lowStock || []);
+      setOut(stockR.outOfStock || []);
+    }
     setPendingPRs(prR?.requests || []);
     setReceivablePOs([...(issuedR?.orders || []), ...(partialR?.orders || [])]);
     setOpenBills((billsR || []).flatMap(b => b?.bills || []));

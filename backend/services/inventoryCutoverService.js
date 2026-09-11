@@ -242,7 +242,25 @@ export class InventoryCutoverService {
     return { products: paged.items, metrics, page: paged.page, page_size: paged.page_size, total: paged.total, total_pages: paged.total_pages };
   }
 
-  /** Stock tab: active products, optional per-location view, paginated. */
+  /**
+   * Stock tab: active products, optional per-location view, paginated.
+   *
+   * `include_buckets=true` additionally returns the low-stock and out-of-stock
+   * lists, cut from the SAME in-memory scan that already produced `metrics`.
+   *
+   * The Inventory Overview needs the counts and both attention lists at once.
+   * It used to ask for them with two requests — `stock_status=LOW_STOCK` and
+   * `stock_status=OUT_OF_STOCK` — and because this method reads the whole
+   * product collection before filtering in memory (page_size only slices the
+   * result), that meant every product document was read TWICE per Overview
+   * mount, for two responses carrying identical `metrics`.
+   *
+   * The flag is opt-in and purely additive: without it the response is byte-for
+   * byte what it always was, so the Stock page, its filters and its pagination
+   * are untouched. The buckets are cut from `all` — before applyCommonFilters —
+   * so a search or category filter narrows `items` only, never the attention
+   * lists, and `pageSize` caps each bucket the same way it caps a page.
+   */
   static async getStock(query = {}) {
     const { page, pageSize } = parsePage(query);
     const locationId = query.location_id ? String(query.location_id) : null;
@@ -254,7 +272,14 @@ export class InventoryCutoverService {
     };
     const filtered = InventoryCutoverService.applyCommonFilters(all, query);
     const paged = paginate(filtered, page, pageSize);
-    return { items: paged.items, metrics, location_id: locationId, page: paged.page, page_size: paged.page_size, total: paged.total, total_pages: paged.total_pages };
+    const response = { items: paged.items, metrics, location_id: locationId, page: paged.page, page_size: paged.page_size, total: paged.total, total_pages: paged.total_pages };
+
+    if (String(query.include_buckets) === 'true') {
+      response.lowStock = all.filter(p => p.stock_status === STOCK_STATUS.LOW).slice(0, pageSize);
+      response.outOfStock = all.filter(p => p.stock_status === STOCK_STATUS.OUT).slice(0, pageSize);
+    }
+
+    return response;
   }
 
   /**
