@@ -10,7 +10,8 @@ import {
   isFirebaseGuestLoginEnabled,
   isFirebaseOnlyGuestResolutionEnabled,
   isFirebaseOnlyRbacEnabled,
-  isMysqlCutoverFallbacksDisabled
+  isMysqlCutoverFallbacksDisabled,
+  isStrictRbacEnabled
 } from '../config/featureFlags.js';
 import {
   getGuestByIdFirestore,
@@ -1036,10 +1037,30 @@ export const authenticate = async (req, res, next) => {
   }
 };
 
-/** Admin or Staff — general hotel operations. */
+/**
+ * Administrator-only authorization.
+ *
+ * This previously admitted `req.user.type === 'staff'` — a value
+ * resolveCanonicalFirebaseUser hardcodes to 'staff' for EVERY staff member — so
+ * a cleaner, a chef or a pantry boy passed it. That silently opened all eleven
+ * /api/reports routes, the hotel-config write, invoice-number generation and
+ * cash-payment confirmation to the entire hotel. The hazard was already known:
+ * backend/routes/inventoryRoutes.js carries the note "requireAdmin is
+ * deliberately NOT used here (it admits every staff role)" and routes around it
+ * rather than fixing it.
+ *
+ * Authorization now runs through normalizeUserRole — the same canonical helper
+ * requireRole uses — so a raw claim ('ADMIN') and an already-normalized value
+ * ('admin') both resolve correctly, and super_admin is admitted as an
+ * administrator. isRootAdmin is honoured explicitly, mirroring requireSuperAdmin
+ * and hasPermission, so the root account can never be locked out of its own
+ * system by an unexpected claim shape.
+ */
 export const requireAdmin = (req, res, next) => {
   if (!req.user) return res.status(401).json({ error: 'Authorization token required' });
-  if (req.user.role === 'admin' || req.user.type === 'staff') return next();
+  if (req.user.isRootAdmin === true) return next();
+  const role = normalizeUserRole(req.user);
+  if (role === 'admin' || role === 'super_admin') return next();
   return res.status(403).json({ error: 'Forbidden: Admin access required' });
 };
 
@@ -1145,6 +1166,18 @@ export function normalizeUserRole(user) {
   return rawRole.toLowerCase();
 }
 
+// Non-strict RBAC is a deliberate, explicitly-requested configuration, but it
+// collapses every role gate to "admin or any staff". Announce it ONCE at module
+// load so it can never be in force unnoticed. Deliberately not per-request:
+// these gates run on nearly every API call.
+if (!isStrictRbacEnabled()) {
+  console.warn(
+    '[RBAC] ENABLE_STRICT_RBAC=false — STRICT ROLE AUTHORIZATION IS DISABLED. ' +
+    'Every requireRole(...) gate now admits any authenticated staff member. ' +
+    'This is intended only for explicitly non-strict environments.'
+  );
+}
+
 /**
  * Flexible multi-role authorization middleware supporting feature flag ENABLE_STRICT_RBAC.
  */
@@ -1154,7 +1187,13 @@ export const requireRole = (...allowedRoles) => {
       return res.status(401).json({ error: 'Authorization token required' });
     }
 
-    const isStrictEnabled = process.env.ENABLE_STRICT_RBAC === 'true';
+    // Fail CLOSED. This read used to be `=== 'true'`, so a missing, renamed or
+    // misspelled ENABLE_STRICT_RBAC silently downgraded every requireRole(...)
+    // gate in HPMS to "admin or any staff" — with no error and no log line. It
+    // also disagreed with config/featureFlags.js, which has always read the same
+    // variable as `!== 'false'`. Both now share one implementation, so only an
+    // explicit "false" opts out of strict authorization.
+    const isStrictEnabled = isStrictRbacEnabled();
 
     if (!isStrictEnabled) {
       if (req.user.role === 'admin' || req.user.type === 'staff') {

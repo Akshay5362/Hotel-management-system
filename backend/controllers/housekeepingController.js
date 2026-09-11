@@ -66,7 +66,16 @@ export const updateHousekeepingStatus = async (req, res) => {
       // L1: the service enforces that a 'housekeeper' caller may only
       // update a room currently assigned to them (403 otherwise).
       // Admin/receptionist are unrestricted.
-      caller: req.user
+      //
+      // The role MUST be normalized here. The service tests
+      // `caller?.role === 'housekeeper'`, but req.user.role carries the RAW
+      // Firebase claim — 'CLEANER' — so passing req.user unchanged made that
+      // comparison permanently false and the ownership guard never fired: a
+      // cleaner could mark any room in the hotel clean, including one assigned
+      // to someone else. Spreading req.user keeps uid / id / mysql_id, which
+      // isRoomAssignedToUser needs to identify the assignee. This mirrors what
+      // getHousekeepingRooms already does for the read path.
+      caller: { ...req.user, role: normalizeUserRole(req.user) }
     });
     res.json(result);
   } catch (error) {

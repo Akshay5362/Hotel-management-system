@@ -69,39 +69,77 @@ service cloud.firestore {
       allow write: if isOwner(userUid) || isAdmin();
     }
 
+    // A guest document is created and maintained server-side at signup and
+    // provisioning (authController -> createGuestFirestore / updateGuestFirestore,
+    // Admin SDK). The clauses below bound direct client-SDK access only.
+    //
+    // The former single `write` rule tested request.resource.data.user_uid - the
+    // INCOMING document - which on an update is entirely attacker-controlled. Any
+    // authenticated user could therefore overwrite ANY other guest record by
+    // supplying their own uid, destroying or hijacking it. create and update are
+    // now separated so an update is judged on the document that already exists,
+    // and ownership itself is pinned.
     match /guests/{guestId} {
       allow read: if isStaff() || (isAuthenticated() && resource.data.user_uid == request.auth.uid);
-      allow write: if isStaff() || (isAuthenticated() && request.resource.data.user_uid == request.auth.uid);
+
+      // Create: a guest may only bring into existence a record owned by itself.
+      allow create: if isStaff()
+                    || (isAuthenticated() && request.resource.data.user_uid == request.auth.uid);
+
+      // Update: the EXISTING document must already belong to the caller, and
+      // user_uid may not change - so ownership can neither be seized nor handed
+      // away.
+      allow update: if isStaff()
+                    || (isAuthenticated()
+                        && resource.data.user_uid == request.auth.uid
+                        && request.resource.data.user_uid == resource.data.user_uid);
+
+      // Delete: no guest-facing deletion workflow exists anywhere in the
+      // application (deleteGuestFirestore has no caller), and a guest record is
+      // referenced by bookings, invoices and history. Staff only.
+      allow delete: if isStaff();
     }
 
+    // Server-owned: roomsRepository (Admin SDK) via the room state machine. A
+    // direct client write could mark a room vacant while occupied, or delete it.
     match /rooms/{roomId} {
       allow read: if isAuthenticated();
-      allow write: if isStaff();
+      allow write: if false;
     }
 
+    // Server-owned: bookingsRepository and the check-in / check-out / room-shift
+    // services (Admin SDK). A booking carries dates, status and money; a direct
+    // client write - and `write` also covers delete - would bypass the entire
+    // state machine, the folio and the audit trail.
     match /bookings/{bookingId} {
       allow read: if isStaff() || (isAuthenticated() && resource.data.user_uid == request.auth.uid);
-      allow write: if isStaff();
+      allow write: if false;
 
       match /ledger_items/{itemId} {
         allow read: if isStaff() || (isAuthenticated() && get(/databases/$(database)/documents/bookings/$(bookingId)).data.user_uid == request.auth.uid);
-        allow write: if isStaff();
+        allow write: if false;
       }
 
       match /payments/{paymentId} {
         allow read: if isStaff() || (isAuthenticated() && get(/databases/$(database)/documents/bookings/$(bookingId)).data.user_uid == request.auth.uid);
-        allow write: if isStaff();
+        allow write: if false;
       }
 
       match /history/{historyId} {
         allow read: if isStaff() || (isAuthenticated() && get(/databases/$(database)/documents/bookings/$(bookingId)).data.user_uid == request.auth.uid);
-        allow create: if isStaff();
-        allow update, delete: if false; // Immutable — Admin SDK only
+        allow write: if false; // Immutable — Admin SDK only
       }
     }
 
+    // Server-owned: reservationsRepository and reservationFirestoreAdapter
+    // (Admin SDK) via reservationController — every write in the codebase goes
+    // through those, and no client uses the Firestore SDK. A reservation holds
+    // guest name, contact, dates and rate, and the former `write` also covered
+    // delete, so a staff token could have erased a booking commitment outright.
+    // Read is unchanged.
     match /reservations/{reservationId} {
-      allow read, write: if isStaff();
+      allow read: if isStaff();
+      allow write: if false;
     }
 
     match /stay_extensions/{extensionId} {
@@ -251,30 +289,31 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // Server-owned: cashLogsRepository / cashSubmissionsRepository (Admin SDK)
+    // via cashController. Cash records are the reconciliation trail.
     match /cash_logs/{logId} {
       allow read: if isStaff();
-      allow create: if isStaff();
-      allow update: if isAdmin();
-      allow delete: if false;
+      allow write: if false;
     }
 
     match /cash_submissions/{submissionId} {
       allow read: if isStaff();
-      allow create: if isStaff();
-      allow update, delete: if isAdmin();
+      allow write: if false;
     }
 
+    // Server-owned: auditLogsRepository (Admin SDK). An audit log is only
+    // evidence if the subject of the audit cannot author it, so client create is
+    // removed and entries can no longer be forged.
     match /audit_logs/{logId} {
       allow read: if isStaff();
-      allow create: if isStaff();
-      allow update, delete: if false;
+      allow write: if false;
     }
 
+    // Server-owned: invoicesRepository (Admin SDK) via invoiceController. An
+    // invoice must always correspond to a real folio.
     match /invoices/{invoiceId} {
       allow read: if isStaff() || (isAuthenticated() && resource.data.user_uid == request.auth.uid);
-      allow create: if isStaff();
-      allow update: if isAdmin();
-      allow delete: if false;
+      allow write: if false;
     }
 
     match /housekeeping/{recordId} {
@@ -284,24 +323,24 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    // Server-owned: bookingHistoryRepository (Admin SDK). Append-only history.
     match /booking_history/{historyId} {
       allow read: if isStaff();
-      allow create: if isStaff();
-      allow update, delete: if false;
+      allow write: if false;
     }
 
+    // Server-owned: paymentsRepository (Admin SDK) via paymentController. Client
+    // create is removed so a payment record can never be fabricated for money
+    // that was never collected.
     match /payments/{paymentId} {
       allow read: if isStaff();
-      allow create: if isStaff();
-      allow update: if isAdmin();
-      allow delete: if false;
+      allow write: if false;
     }
 
+    // Server-owned: ledgerRepository (Admin SDK). Folio charges are money.
     match /ledger_items/{itemId} {
       allow read: if isStaff();
-      allow create: if isStaff();
-      allow update: if isAdmin();
-      allow delete: if false;
+      allow write: if false;
     }
 
     match /razorpay_transactions/{txId} {
@@ -352,11 +391,11 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    // Server-owned: foodPaymentsRepository (Admin SDK) via the food billing
+    // controller. Immutable payment audit trail.
     match /food_payments/{paymentId} {
       allow read:   if isStaff();
-      allow create: if isStaff();
-      allow update: if isAdmin();
-      allow delete: if false; // Immutable payment audit trail
+      allow write:  if false;
     }
 
     match /food_complimentary_requests/{reqId} {
