@@ -289,6 +289,15 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // Server-owned: inventoryApprovalAuthoritiesRepository (Admin SDK) via
+    // inventoryApprovalAuthoritiesController. Phase H1. Unlike the other
+    // inventory collections this denies READ as well: the documents hold staff
+    // WhatsApp numbers and verification metadata, which no client screen needs
+    // and which the API serves to administrators only.
+    match /inventory_approval_authorities/{authorityId} {
+      allow read, write: if false;
+    }
+
     // Server-owned: cashLogsRepository / cashSubmissionsRepository (Admin SDK)
     // via cashController. Cash records are the reconciliation trail.
     match /cash_logs/{logId} {
