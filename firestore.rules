@@ -298,6 +298,16 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // Server-owned: inventoryApprovalActionsRepository (Admin SDK). Phase H2.
+    // One-time approval action tokens. Read is denied along with write: the
+    // documents are keyed by the SHA-256 of a secret, and letting a client
+    // enumerate ids or consumption state would hand it an oracle. The raw token
+    // is never stored here, so a leak of this collection yields nothing
+    // presentable, but there is no reason for a client to see it at all.
+    match /inventory_approval_actions/{actionId} {
+      allow read, write: if false;
+    }
+
     // Server-owned: cashLogsRepository / cashSubmissionsRepository (Admin SDK)
     // via cashController. Cash records are the reconciliation trail.
     match /cash_logs/{logId} {
