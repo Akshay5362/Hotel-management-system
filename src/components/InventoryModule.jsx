@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { 
   Package, 
   Plus, 
@@ -17,6 +17,41 @@ import {
 } from 'lucide-react';
 
 import { API_URL as API_BASE, getAssetUrl, getApiHeaders } from '../config/apiConfig';
+
+/**
+ * Column geometry for the item table.
+ *
+ * These widths exist so the table does not resize itself when the search
+ * results change. Under the browser default (`table-layout: auto`) each column
+ * is sized from its widest cell, so searching "re" and searching "red" produced
+ * measurably different layouts: Category swung 36px, Product Name 17px, and the
+ * "Current Stock" header wrapped to a second line, changing the header row from
+ * 58px to 41px. With `table-layout: fixed` the browser reads these widths and
+ * stops measuring content, so geometry is identical for every result set.
+ *
+ * Percentages total 100. Each one clears the column's real minimum — the header
+ * label at `nowrap` plus 32px padding, and for Photo the 40px thumbnail — with
+ * the leftover space given to the two long text columns. TABLE_MIN_WIDTH is the
+ * sum of those minimums rounded up; below it the existing horizontal scroller
+ * takes over rather than letting headers collide.
+ */
+const COLUMNS = [
+  { key: 'photo',    label: 'Photo',         width: '6%' },
+  { key: 'sku',      label: 'SKU',           width: '11%' },
+  { key: 'name',     label: 'Product Name',  width: '19%' },
+  { key: 'category', label: 'Category',      width: '10%' },
+  { key: 'unit',     label: 'Unit',          width: '5%' },
+  { key: 'stock',    label: 'Current Stock', width: '10%' },
+  { key: 'min',      label: 'Min Stock',     width: '8%' },
+  { key: 'price',    label: 'Unit Price',    width: '8%' },
+  { key: 'ss',       label: 'Stock Status',  width: '10%' },
+  { key: 'status',   label: 'Status',        width: '6%' },
+  { key: 'actions',  label: 'Actions',       width: '7%', align: 'right' }
+];
+const TABLE_MIN_WIDTH = 1080;
+
+/** Long values truncate instead of widening their column. */
+const CLIP = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
 
 export default function InventoryModule({ token: tokenProp, embedded = false }) {
   const [products, setProducts] = useState([]);
@@ -37,7 +72,12 @@ export default function InventoryModule({ token: tokenProp, embedded = false }) 
   const [toast, setToast] = useState({ show: false, message: '', type: 'info' });
 
   // Filter States
+  // `searchTerm` drives the input so typing stays instant; `debouncedSearch` is
+  // what actually reaches the server. Only the free-text box is debounced —
+  // the category, status and low-stock filters are deliberate single clicks and
+  // still apply immediately.
   const [searchTerm, setSearchTerm] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('');
   const [selectedStatus, setSelectedStatus] = useState('');
   const [onlyLowStock, setOnlyLowStock] = useState(false);
@@ -46,6 +86,18 @@ export default function InventoryModule({ token: tokenProp, embedded = false }) 
   const [page, setPage] = useState(1);
   const [pageInfo, setPageInfo] = useState({ total: 0, total_pages: 1 });
   const PAGE_SIZE = 100;
+
+  // Changing the query drops you back to page one. This is done DURING RENDER,
+  // which is React's sanctioned way to derive state from other state, rather
+  // than in an effect. An effect would be too late: effects in the same commit
+  // all run together, so the fetch below would fire once with the stale page
+  // and again after the reset landed — two requests for one keystroke.
+  const queryKey = `${debouncedSearch}|${selectedCategory}|${selectedStatus}|${onlyLowStock}`;
+  const [prevQueryKey, setPrevQueryKey] = useState(queryKey);
+  if (prevQueryKey !== queryKey) {
+    setPrevQueryKey(queryKey);
+    setPage(1);
+  }
 
   // Modal States
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -121,18 +173,27 @@ export default function InventoryModule({ token: tokenProp, embedded = false }) 
   }, [tokenProp]);
 
   // Fetch Products & Metrics (paginated — see PAGE_SIZE above)
+  // The request currently in flight. A newer search aborts it, so a slow early
+  // response can never land after a fast later one and repaint stale rows.
+  const inFlightRef = useRef(null);
+
   const fetchProducts = useCallback(async () => {
+    inFlightRef.current?.abort();
+    const controller = new AbortController();
+    inFlightRef.current = controller;
+
     setLoading(true);
     setError('');
     try {
       const params = new URLSearchParams({ page: String(page), page_size: String(PAGE_SIZE) });
-      if (searchTerm) params.append('search', searchTerm);
+      if (debouncedSearch) params.append('search', debouncedSearch);
       if (selectedCategory) params.append('category_id', selectedCategory);
       if (selectedStatus) params.append('status', selectedStatus);
       if (onlyLowStock) params.append('low_stock', 'true');
 
       const res = await fetch(`${API_BASE}/inventory/products?${params.toString()}`, {
-        headers: getAuthHeader()
+        headers: getAuthHeader(),
+        signal: controller.signal
       });
 
       if (!res.ok) {
@@ -140,17 +201,23 @@ export default function InventoryModule({ token: tokenProp, embedded = false }) 
       }
 
       const data = await res.json();
+      if (controller.signal.aborted) return;
       setProducts(data.products || []);
       if (data.metrics) {
         setMetrics(data.metrics);
       }
       setPageInfo({ total: data.total || 0, total_pages: data.total_pages || 1 });
     } catch (err) {
+      // An abort is this component superseding its own request, not a failure.
+      // It must not surface as an error, and it must not clear the loading flag
+      // either — the request that replaced it now owns that.
+      if (err?.name === 'AbortError' || controller.signal.aborted) return;
       setError(err.message || 'Unable to load items right now. Please try again.');
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
+      if (inFlightRef.current === controller) inFlightRef.current = null;
     }
-  }, [searchTerm, selectedCategory, selectedStatus, onlyLowStock, page, tokenProp]);
+  }, [debouncedSearch, selectedCategory, selectedStatus, onlyLowStock, page, tokenProp]);
 
 
   useEffect(() => {
@@ -159,13 +226,27 @@ export default function InventoryModule({ token: tokenProp, embedded = false }) 
     fetchLocations();
   }, [fetchCategories, fetchUnits, fetchLocations]);
 
+  // Typing does not fire a request per keystroke.
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(searchTerm.trim()), 250);
+    return () => clearTimeout(t);
+  }, [searchTerm]);
+
   useEffect(() => {
     fetchProducts();
   }, [fetchProducts]);
 
-  useEffect(() => {
-    setPage(1);
-  }, [searchTerm, selectedCategory, selectedStatus, onlyLowStock]);
+  // Abort whatever is still in flight when the screen goes away.
+  useEffect(() => () => inFlightRef.current?.abort(), []);
+
+  // Two different loading modes, and the distinction is what keeps the layout
+  // still. With nothing on screen yet there is nothing to preserve, so the
+  // skeleton is right. Once rows exist, emptying the table would collapse the
+  // page from thousands of pixels to a few hundred, drop the vertical
+  // scrollbar, and hand its width back to the content column — every element
+  // on the page shifts. So a refetch leaves the rows where they are.
+  const isInitialLoad = loading && products.length === 0;
+  const isRefetching = loading && products.length > 0;
 
   // Open Modal for Create or Edit
   const openModal = (product = null) => {
@@ -538,37 +619,62 @@ export default function InventoryModule({ token: tokenProp, embedded = false }) 
       )}
 
       {/* Product Master Table */}
+      {/*
+        The table, its header and this container stay mounted while a search is
+        in flight, and so do the rows themselves — a refetch only dims them.
+        Two earlier versions of this got it wrong. Branching on `loading` out
+        here destroyed and recreated the whole table on every keystroke. Moving
+        that branch into <tbody> stopped the table unmounting but still emptied
+        it, which collapsed the page below the viewport, removed the vertical
+        scrollbar, and gave its width back to the content column — so every
+        element on the page resized on each keystroke. Keeping the rows is what
+        actually holds the layout still.
+      */}
       <div className="glass" style={{ borderRadius: '12px', overflow: 'hidden', border: '1px solid rgba(255,255,255,0.08)' }}>
-        {loading ? (
-          <div style={{ padding: '24px 16px', display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {[70, 55, 65, 60].map((w, i) => <span key={i} className="inv-skel" style={{ width: `${w}%` }} />)}
-          </div>
-        ) : products.length === 0 ? (
-          <div className="inv-empty">
-            <Package size={22} style={{ opacity: 0.5 }} />
-            <strong>{searchTerm || selectedCategory || selectedStatus || onlyLowStock ? 'No items match' : 'No items have been configured'}</strong>
-            <p>{searchTerm || selectedCategory || selectedStatus || onlyLowStock ? 'Try a different search or clear the filters.' : 'Add the products the hotel keeps in stock. Each needs a category and a unit of measure.'}</p>
-            <button type="button" className="inv-btn primary sm" onClick={() => openModal()}><Plus size={13} /> Add Item</button>
-          </div>
-        ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.9rem' }}>
+        <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', minWidth: `${TABLE_MIN_WIDTH}px`, tableLayout: 'fixed', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.9rem' }}>
               <thead>
                 <tr style={{ background: 'rgba(15, 23, 42, 0.8)', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
-                  <th style={{ padding: '12px 16px' }}>Photo</th>
-                  <th style={{ padding: '12px 16px' }}>SKU</th>
-                  <th style={{ padding: '12px 16px' }}>Product Name</th>
-                  <th style={{ padding: '12px 16px' }}>Category</th>
-                  <th style={{ padding: '12px 16px' }}>Unit</th>
-                  <th style={{ padding: '12px 16px' }}>Current Stock</th>
-                  <th style={{ padding: '12px 16px' }}>Min Stock</th>
-                  <th style={{ padding: '12px 16px' }}>Unit Price</th>
-                  <th style={{ padding: '12px 16px' }}>Stock Status</th>
-                  <th style={{ padding: '12px 16px' }}>Status</th>
-                  <th style={{ padding: '12px 16px', textAlign: 'right' }}>Actions</th>
+                  {COLUMNS.map(c => (
+                    <th
+                      key={c.key}
+                      style={{ padding: '12px 16px', width: c.width, whiteSpace: 'nowrap', textAlign: c.align || 'left' }}
+                    >
+                      {c.label}
+                    </th>
+                  ))}
                 </tr>
               </thead>
-              <tbody>
+              <tbody style={{
+                // Opacity only. It never participates in layout, so the busy
+                // state cannot move anything.
+                opacity: isRefetching ? 0.45 : 1,
+                pointerEvents: isRefetching ? 'none' : undefined,
+                transition: 'opacity 120ms ease'
+              }}>
+                {isInitialLoad ? (
+                  Array.from({ length: 8 }).map((_, r) => (
+                    <tr key={`skeleton-${r}`} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                      {Array.from({ length: COLUMNS.length }).map((__, c) => (
+                        <td key={c} style={{ padding: '12px 16px' }}>
+                          <span className="inv-skel" style={{ width: `${45 + ((r * 7 + c * 13) % 40)}%` }} />
+                        </td>
+                      ))}
+                    </tr>
+                  ))
+                ) : null}
+                {!loading && products.length === 0 ? (
+                  <tr>
+                    <td colSpan={COLUMNS.length}>
+                      <div className="inv-empty">
+                        <Package size={22} style={{ opacity: 0.5 }} />
+                        <strong>{debouncedSearch || selectedCategory || selectedStatus || onlyLowStock ? 'No items match' : 'No items have been configured'}</strong>
+                        <p>{debouncedSearch || selectedCategory || selectedStatus || onlyLowStock ? 'Try a different search or clear the filters.' : 'Add the products the hotel keeps in stock. Each needs a category and a unit of measure.'}</p>
+                        <button type="button" className="inv-btn primary sm" onClick={() => openModal()}><Plus size={13} /> Add Item</button>
+                      </div>
+                    </td>
+                  </tr>
+                ) : null}
                 {products.map(p => (
                   <tr key={p.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
                     <td style={{ padding: '10px 16px' }}>
@@ -586,11 +692,11 @@ export default function InventoryModule({ token: tokenProp, embedded = false }) 
                         </div>
                       )}
                     </td>
-                    <td style={{ padding: '12px 16px', fontFamily: 'monospace', fontWeight: 600, color: '#38bdf8' }}>{p.sku}</td>
-                    <td style={{ padding: '12px 16px', fontWeight: 700 }}>{p.name}</td>
-                    <td style={{ padding: '12px 16px' }}>
-                      <span>{p.category_name}</span>
-                      <span style={{ display: 'block', fontSize: '0.75rem', color: '#64748b' }}>{p.category_department}</span>
+                    <td title={p.sku} style={{ padding: '12px 16px', fontFamily: 'monospace', fontWeight: 600, color: '#38bdf8', ...CLIP }}>{p.sku}</td>
+                    <td title={p.name} style={{ padding: '12px 16px', fontWeight: 700, ...CLIP }}>{p.name}</td>
+                    <td title={`${p.category_name} — ${p.category_department}`} style={{ padding: '12px 16px', ...CLIP }}>
+                      <span style={{ display: 'block', ...CLIP }}>{p.category_name}</span>
+                      <span style={{ display: 'block', fontSize: '0.75rem', color: '#64748b', ...CLIP }}>{p.category_department}</span>
                     </td>
                     <td style={{ padding: '12px 16px' }}>{p.unit_of_measure}</td>
                     <td style={{ padding: '12px 16px', fontWeight: 700, fontSize: '1rem' }}>{p.current_stock}</td>
@@ -644,8 +750,7 @@ export default function InventoryModule({ token: tokenProp, embedded = false }) 
                 ))}
               </tbody>
             </table>
-          </div>
-        )}
+        </div>
       </div>
 
       {pageInfo.total_pages > 1 && (
