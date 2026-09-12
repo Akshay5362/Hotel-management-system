@@ -40,7 +40,7 @@
 
 import { getDoc, listDocs, setDoc, updateDoc, RepositoryError } from './firestoreUtils.js';
 import { db } from '../../config/firebaseAdmin.js';
-import { PR_APPROVAL_ACTIONS } from '../../utils/inventoryConstants.js';
+import { PR_APPROVAL_ACTIONS, PR_TOKEN_PURPOSES } from '../../utils/inventoryConstants.js';
 import { generateRawToken, hashToken, isWellFormedToken } from '../../utils/approvalActionToken.js';
 
 export const APPROVAL_ACTIONS_COLLECTION = 'inventory_approval_actions';
@@ -74,6 +74,28 @@ export function normalizeAction(action) {
   return resolved;
 }
 
+/**
+ * Phase H4 — a token's purpose. A document written before H4 has no purpose
+ * field and IS a decision token, so the absent value reads as DECISION rather
+ * than as invalid. That is what keeps every H2/H3 token working untouched.
+ */
+export function tokenPurpose(doc) {
+  return (doc && doc.purpose) || PR_TOKEN_PURPOSES.DECISION;
+}
+
+function normalizePurpose(purpose) {
+  if (purpose === undefined || purpose === null || purpose === '') return PR_TOKEN_PURPOSES.DECISION;
+  const key = String(purpose).trim().toUpperCase();
+  if (!PR_TOKEN_PURPOSES[key]) {
+    throw new RepositoryError(
+      `Approval action purpose must be DECISION or REASON_CAPTURE (got '${purpose}')`,
+      'VALIDATION_ERROR',
+      400
+    );
+  }
+  return PR_TOKEN_PURPOSES[key];
+}
+
 function required(value, label) {
   const s = value === undefined || value === null ? '' : String(value).trim();
   if (!s) throw new RepositoryError(`${label} is required`, 'VALIDATION_ERROR', 400);
@@ -94,12 +116,24 @@ export const ACTION_INVALID = Object.freeze({
   NOT_FOUND: 'NOT_FOUND',
   EXPIRED: 'EXPIRED',
   CONSUMED: 'CONSUMED',
-  INCOMPLETE: 'INCOMPLETE'
+  INCOMPLETE: 'INCOMPLETE',
+  PURPOSE_MISMATCH: 'PURPOSE_MISMATCH'
 });
 
-/** Pure verdict over an already-fetched document. Shared by both read paths. */
-function evaluate(doc, nowMs = Date.now()) {
+/**
+ * Pure verdict over an already-fetched document. Shared by every read path.
+ *
+ * `expectedPurpose` is checked before the lifecycle so that presenting a
+ * decision token where an intent is required is reported as the category error
+ * it is, rather than leaking whether that unrelated token happens to be spent.
+ * Passing null keeps the pre-H4 behaviour, which is what the standalone
+ * consume primitive still wants.
+ */
+function evaluate(doc, nowMs = Date.now(), expectedPurpose = null) {
   if (!doc) return { valid: false, reason: ACTION_INVALID.NOT_FOUND };
+  if (expectedPurpose && tokenPurpose(doc) !== expectedPurpose) {
+    return { valid: false, reason: ACTION_INVALID.PURPOSE_MISMATCH };
+  }
   if (doc.consumed_at) return { valid: false, reason: ACTION_INVALID.CONSUMED };
   if (!doc.expires_at || Date.parse(doc.expires_at) <= nowMs) {
     return { valid: false, reason: ACTION_INVALID.EXPIRED };
@@ -129,11 +163,34 @@ export async function createApprovalActionFirestore(data, options = {}) {
     created_by: required(data.created_by, 'created_by')
   };
 
+  // Phase H4 — a reason-capture intent is structurally a token, so it lives in
+  // this same collection rather than a parallel one. What makes it an intent
+  // and not a decision is enforced here, once, at the only place either is
+  // created: it must name the decision token it descends from, and it may only
+  // ever carry REJECTED, because approval needs no second step.
+  const purpose = normalizePurpose(data.purpose);
+  const parentTokenHash = data.parent_token_hash === undefined || data.parent_token_hash === null
+    ? null
+    : required(data.parent_token_hash, 'parent_token_hash');
+
+  if (purpose === PR_TOKEN_PURPOSES.REASON_CAPTURE) {
+    if (!parentTokenHash) {
+      throw new RepositoryError('A reason-capture intent requires parent_token_hash', 'VALIDATION_ERROR', 400);
+    }
+    if (payload.action !== PR_APPROVAL_ACTIONS.REJECTED) {
+      throw new RepositoryError('A reason-capture intent may only carry REJECTED', 'VALIDATION_ERROR', 400);
+    }
+  } else if (parentTokenHash) {
+    throw new RepositoryError('Only a reason-capture intent may carry parent_token_hash', 'VALIDATION_ERROR', 400);
+  }
+
   const rawToken = generateRawToken();
   const tokenHash = hashToken(rawToken);
 
   const doc = {
     ...payload,
+    purpose,
+    parent_token_hash: parentTokenHash,
     token_hash: tokenHash,
     consumed_at: null,
     consumed_via: data.consumed_via ?? null,
@@ -160,10 +217,11 @@ export async function createApprovalActionFirestore(data, options = {}) {
  * EXPIRED are useful to an operator and an enumeration oracle to an attacker.
  */
 export async function findApprovalActionByTokenFirestore(rawToken, options = {}) {
+  const { expectedPurpose = null, ...readOptions } = options;
   if (!isWellFormedToken(rawToken)) return { valid: false, reason: ACTION_INVALID.MALFORMED };
   const tokenHash = hashToken(rawToken);
-  const doc = await getDoc(APPROVAL_ACTIONS_COLLECTION, tokenHash, options);
-  return { ...evaluate(doc), token_hash: tokenHash };
+  const doc = await getDoc(APPROVAL_ACTIONS_COLLECTION, tokenHash, readOptions);
+  return { ...evaluate(doc, Date.now(), expectedPurpose), token_hash: tokenHash };
 }
 
 export async function getApprovalActionByHashFirestore(tokenHash, options = {}) {
@@ -211,11 +269,12 @@ export async function consumeApprovalActionFirestore(rawToken, { via = null, met
  *   txn.update(prRef, updates);                      // then writes
  *   markApprovalActionConsumedInTxn(txn, tokenHash, { via });
  */
-export async function readApprovalActionInTxn(txn, tokenHash, nowMs = Date.now()) {
+export async function readApprovalActionInTxn(txn, tokenHash, options = {}) {
+  const { nowMs = Date.now(), expectedPurpose = null } = options;
   const ref = db.collection(APPROVAL_ACTIONS_COLLECTION).doc(required(tokenHash, 'token_hash'));
   const snap = await txn.get(ref);
   const doc = snap.exists ? { id: snap.id, ...snap.data() } : null;
-  return { ...evaluate(doc, nowMs), token_hash: tokenHash, ref };
+  return { ...evaluate(doc, nowMs, expectedPurpose), token_hash: tokenHash, ref };
 }
 
 /** Write half. Call during the transaction's write phase. Synchronous. */

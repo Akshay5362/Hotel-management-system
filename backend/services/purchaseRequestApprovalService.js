@@ -40,6 +40,9 @@ import {
   readApprovalActionInTxn,
   markApprovalActionConsumedInTxn,
   invalidateApprovalActionsForRequestFirestore,
+  createApprovalActionFirestore,
+  getApprovalActionByHashFirestore,
+  tokenPurpose,
   normalizeAction as normalizeApprovalActionToken,
   ACTION_INVALID
 } from '../repositories/firestore/inventoryApprovalActionsRepository.js';
@@ -56,7 +59,8 @@ import {
 import { createAuditLogFirestore } from '../repositories/firestore/auditLogsRepository.js';
 import {
   PR_STATUS, PR_TRANSITIONS, PR_APPROVAL_ACTIONS, PR_ACTION_TO_STATUS,
-  MIN_REJECTION_REASON_LENGTH
+  MIN_REJECTION_REASON_LENGTH, PR_TOKEN_PURPOSES, PR_REASON_CAPTURE_TTL_MS,
+  PR_REJECTION_REASON_CODES
 } from '../utils/inventoryConstants.js';
 
 function fail(message, code, status = 400) {
@@ -352,6 +356,8 @@ function throwForTokenVerdict(verdict) {
   switch (verdict.reason) {
     case ACTION_INVALID.CONSUMED: throw fail('This approval link has already been used.', 'TOKEN_CONSUMED', 409);
     case ACTION_INVALID.EXPIRED:  throw fail('This approval link has expired.', 'TOKEN_EXPIRED', 403);
+    case ACTION_INVALID.PURPOSE_MISMATCH:
+      throw fail('This approval link cannot be used for this step.', 'TOKEN_PURPOSE_MISMATCH', 403);
     default:                      throw fail('This approval link is not valid.', 'TOKEN_INVALID', 403);
   }
 }
@@ -394,10 +400,15 @@ function assertStaffEligible(staff, approverUid) {
  * @param {string} [p.reason]         mandatory for a rejection, exactly as in-app
  * @param {string} [p.request_id]     optional; when supplied it must match the token's request
  * @param {string} [p.consumed_via]   recorded on the token; defaults to the channel name
+ * @param {string} [p.expected_purpose] H4 — which KIND of token this must be.
+ *   Defaults to DECISION, so the one-step approval path is exactly what it was
+ *   and a reason-capture intent can never be presented in its place.
+ * @param {object} [p.audit_extra]    extra audit details; never carries a secret
  * @returns {{ duplicate: boolean, request: object }}  the same shape approve()/reject() return
  */
 async function decideWithApprovalActionToken({
-  raw_token, decided_by_uid, action, reason = null, request_id = null, consumed_via = 'APPROVAL_ACTION_TOKEN'
+  raw_token, decided_by_uid, action, reason = null, request_id = null, consumed_via = 'APPROVAL_ACTION_TOKEN',
+  expected_purpose = PR_TOKEN_PURPOSES.DECISION, audit_extra = {}
 } = {}) {
   const approverUid = String(decided_by_uid || '').trim();
   if (!approverUid) throw fail('An approver identity is required.', 'APPROVER_REQUIRED', 401);
@@ -407,7 +418,7 @@ async function decideWithApprovalActionToken({
   // Fail-fast preflight. Nothing here is authoritative: the same token and
   // the same two identity records are re-read inside the transaction below.
   // Order is cheapest-refusal-first: one read decides most bad requests.
-  const pre = await findApprovalActionByTokenFirestore(raw_token);
+  const pre = await findApprovalActionByTokenFirestore(raw_token, { expectedPurpose: expected_purpose });
   throwForTokenVerdict(pre);
   assertTokenBinding(pre.action, { approverUid, action: wanted, requestDocId: request_id });
   const requestDocId = formatRequestDocId(pre.action.pr_id);
@@ -427,12 +438,12 @@ async function decideWithApprovalActionToken({
   return await decide(requestDocId, wanted, {
     comment: reason,
     actor,
-    audit_extra: { decision_channel: consumed_via },
+    audit_extra: { decision_channel: consumed_via, ...audit_extra },
     hooks: {
       // READ PHASE. Token first, so a spent token costs one read and refuses
       // before anything else is fetched; then the two identity records.
       async afterRead(txn, current) {
-        const verdict = await readApprovalActionInTxn(txn, pre.token_hash);
+        const verdict = await readApprovalActionInTxn(txn, pre.token_hash, { expectedPurpose: expected_purpose });
         throwForTokenVerdict(verdict);
         assertTokenBinding(verdict.action, { approverUid, action: wanted, requestDocId: current.id });
 
@@ -448,6 +459,205 @@ async function decideWithApprovalActionToken({
         markApprovalActionConsumedInTxn(txn, pre.token_hash, { via: consumed_via });
       }
     }
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// H4 — TWO-STEP REJECTION
+//
+// An approval is one tap. A rejection is not, because a rejection must carry a
+// reason and the engine has always refused one without it. Rather than invent
+// a second rejection engine, or let a channel write arbitrary words onto a
+// request, H4 splits the same decision into two server-side steps:
+//
+//   beginTokenRejection    validates everything a rejection needs EXCEPT the
+//                          reason, then mints a short-lived intent. It consumes
+//                          nothing, so an approver who wanders off still holds
+//                          a working decision token and can start again.
+//
+//   completeTokenRejection validates a reason CODE from a fixed server-owned
+//                          vocabulary, then hands the intent to the ONE
+//                          existing decision path. The intent is consumed in
+//                          the same transaction that rejects the request.
+//
+// Neither function decides anything itself. The engine, its rules, its
+// transaction and its audit are untouched.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Maps a caller-supplied reason CODE to the server's own words. */
+function resolveRejectionReason(reasonCode) {
+  const code = String(reasonCode || '').trim().toUpperCase();
+  if (!code) {
+    throw fail('A rejection reason must be chosen.', 'REJECTION_REASON_CODE_REQUIRED', 400);
+  }
+  const text = PR_REJECTION_REASON_CODES[code];
+  if (!text) {
+    throw fail('That rejection reason is not one of the available options.', 'REJECTION_REASON_CODE_INVALID', 400);
+  }
+  return { code, text };
+}
+
+/**
+ * Verifies that an intent really descends from a decision token that would
+ * itself have authorised this rejection. Costs one read, and nothing it checks
+ * can change afterwards: an action document is written once and only ever
+ * patched by the consume primitive, so re-reading it inside the transaction
+ * would buy no safety.
+ */
+async function assertIntentParent(intent) {
+  const parentHash = intent.parent_token_hash;
+  if (!parentHash) {
+    throw fail('This approval link is not valid.', 'TOKEN_PARENT_MISMATCH', 403);
+  }
+  const parent = await getApprovalActionByHashFirestore(parentHash);
+  if (!parent
+    || tokenPurpose(parent) !== PR_TOKEN_PURPOSES.DECISION
+    || String(parent.approver_uid) !== String(intent.approver_uid)
+    || formatRequestDocId(parent.pr_id) !== formatRequestDocId(intent.pr_id)
+    || parent.action !== PR_APPROVAL_ACTIONS.REJECTED) {
+    throw fail('This approval link is not valid.', 'TOKEN_PARENT_MISMATCH', 403);
+  }
+  return parent;
+}
+
+/**
+ * STEP ONE — the approver has chosen to reject and now owes a reason.
+ *
+ * Everything a rejection requires is established here except the reason
+ * itself, so an approver is never asked for one they were never going to be
+ * allowed to give. None of it is trusted later: step two re-establishes all of
+ * it inside the decision transaction.
+ *
+ * @param {object} p
+ * @param {string} p.raw_token       the REJECT decision token the approver holds
+ * @param {string} p.decided_by_uid  TRUSTED identity, resolved by the channel
+ * @param {string} [p.request_id]    optional; when supplied it must match the token
+ * @returns {{ raw_token: string, expires_at: string, request_id: string,
+ *             request_number: string, action: string, reason_codes: string[] }}
+ *   The intent's raw token is returned ONCE, to be handed straight to the
+ *   approver's channel. It is not stored and cannot be recovered.
+ */
+async function beginTokenRejection({ raw_token, decided_by_uid, request_id = null } = {}) {
+  const approverUid = String(decided_by_uid || '').trim();
+  if (!approverUid) throw fail('An approver identity is required.', 'APPROVER_REQUIRED', 401);
+
+  // The decision token, and only a REJECT one: an approver holding an APPROVE
+  // token has no business starting a rejection.
+  const pre = await findApprovalActionByTokenFirestore(raw_token, { expectedPurpose: PR_TOKEN_PURPOSES.DECISION });
+  throwForTokenVerdict(pre);
+  assertTokenBinding(pre.action, {
+    approverUid, action: PR_APPROVAL_ACTIONS.REJECTED, requestDocId: request_id
+  });
+  const requestDocId = formatRequestDocId(pre.action.pr_id);
+
+  const authority = await getApprovalAuthorityByUidFirestore(approverUid);
+  assertAuthorityActive(authority);
+  const staff = await getStaffByUidFirestore(approverUid);
+  const actor = {
+    uid: approverUid,
+    name: staff?.full_name || staff?.username || null,
+    email: staff?.email || null,
+    role: assertStaffEligible(staff, approverUid)
+  };
+
+  // Preflight only. The authoritative status check is the existing one inside
+  // the decision transaction in step two; this exists so an approver is not
+  // walked through choosing a reason for a request that is already closed.
+  const request = await getPurchaseRequestByIdFirestore(requestDocId);
+  if (!request) throw fail('Purchase request not found.', 'REQUEST_NOT_FOUND', 404);
+  if (request.status !== PR_STATUS.PENDING_APPROVAL) {
+    throw fail(
+      `This purchase request is already ${request.status} and can no longer be rejected.`,
+      'INVALID_STATUS_TRANSITION',
+      409
+    );
+  }
+  await assertCanApprove(request, actor);
+
+  // The original decision token is deliberately NOT consumed. If this flow is
+  // abandoned the intent simply expires, and the approver can begin again.
+  const intent = await createApprovalActionFirestore({
+    pr_id: requestDocId,
+    pr_number: request.request_number || pre.action.pr_number,
+    approver_uid: approverUid,
+    action: PR_APPROVAL_ACTIONS.REJECTED,
+    expires_at: new Date(Date.now() + PR_REASON_CAPTURE_TTL_MS).toISOString(),
+    created_by: approverUid,
+    purpose: PR_TOKEN_PURPOSES.REASON_CAPTURE,
+    parent_token_hash: pre.token_hash
+  });
+
+  return {
+    raw_token: intent.raw_token,
+    expires_at: intent.action.expires_at,
+    request_id: requestDocId,
+    request_number: intent.action.pr_number,
+    action: PR_APPROVAL_ACTIONS.REJECTED,
+    reason_codes: Object.keys(PR_REJECTION_REASON_CODES)
+  };
+}
+
+/**
+ * STEP TWO — the reason is in, so record the rejection.
+ *
+ * The identity is taken from the INTENT, which the server wrote in step one
+ * after the channel verified the sender. A caller may pass decided_by_uid to
+ * be cross-checked, but it can only ever narrow the outcome: it is never the
+ * source of the identity, so a caller cannot reject as somebody else.
+ *
+ * @param {object} p
+ * @param {string} p.raw_token        the reason-capture intent from step one
+ * @param {string} p.reason_code      a key of PR_REJECTION_REASON_CODES
+ * @param {string} [p.decided_by_uid] optional cross-check against the intent
+ * @param {string} [p.request_id]     optional; when supplied it must match
+ * @param {string} [p.consumed_via]   recorded on the intent
+ * @param {string} [p.reason]         MUST be absent — free text is refused here
+ * @param {string} [p.comment]        MUST be absent — free text is refused here
+ * @returns {{ duplicate: boolean, request: object }}  the same shape reject() returns
+ */
+async function completeTokenRejection({
+  raw_token, reason_code, decided_by_uid = null, request_id = null,
+  consumed_via = 'REASON_CAPTURE_INTENT', reason = null, comment = null
+} = {}) {
+  // Free text is not merely ignored on this path, it is refused, so a caller
+  // cannot believe it set a reason that the server silently dropped.
+  if (cleanText(reason, 1000) || cleanText(comment, 1000)) {
+    throw fail(
+      'This rejection accepts a reason code only; free text is not permitted here.',
+      'REJECTION_REASON_TEXT_NOT_ACCEPTED',
+      400
+    );
+  }
+  const { code, text } = resolveRejectionReason(reason_code);
+
+  const pre = await findApprovalActionByTokenFirestore(raw_token, { expectedPurpose: PR_TOKEN_PURPOSES.REASON_CAPTURE });
+  throwForTokenVerdict(pre);
+  const intent = pre.action;
+
+  // The intent's own uid IS the identity. A supplied one is only ever a check.
+  const approverUid = String(intent.approver_uid || '').trim();
+  if (!approverUid) throw fail('This approval link is not valid.', 'TOKEN_INVALID', 403);
+  if (decided_by_uid && String(decided_by_uid).trim() !== approverUid) {
+    throw fail('This approval link was issued to a different approver.', 'TOKEN_APPROVER_MISMATCH', 403);
+  }
+  assertTokenBinding(intent, {
+    approverUid, action: PR_APPROVAL_ACTIONS.REJECTED, requestDocId: request_id
+  });
+  await assertIntentParent(intent);
+
+  // One engine, one transaction. Everything that matters is re-established
+  // there: the intent, its purpose and bindings, the staff and authority
+  // records, the current role against the live configuration, and every
+  // existing rule about status, self-approval and who has already acted.
+  return await decideWithApprovalActionToken({
+    raw_token,
+    decided_by_uid: approverUid,
+    action: PR_APPROVAL_ACTIONS.REJECTED,
+    reason: text,
+    request_id,
+    consumed_via,
+    expected_purpose: PR_TOKEN_PURPOSES.REASON_CAPTURE,
+    audit_extra: { rejection_reason_code: code }
   });
 }
 
@@ -485,7 +695,20 @@ export const PurchaseRequestApprovalService = {
    * transaction, same post-commit audit. The caller emits PR_EVENTS.DECIDED
    * after this resolves, exactly as the in-app controller does.
    */
-  decideWithApprovalActionToken
+  decideWithApprovalActionToken,
+
+  /**
+   * H4 — step one of a token-driven rejection. Validates everything except the
+   * reason and mints a short-lived intent. Consumes nothing.
+   */
+  beginTokenRejection,
+
+  /**
+   * H4 — step two. Turns a reason CODE into the server's own words and lets the
+   * existing engine record the rejection, consuming the intent in the same
+   * transaction.
+   */
+  completeTokenRejection
 };
 
 export default PurchaseRequestApprovalService;

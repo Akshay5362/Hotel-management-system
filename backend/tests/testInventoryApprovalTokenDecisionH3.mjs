@@ -43,7 +43,11 @@ const txnStart = CODE.indexOf('db.runTransaction(async (txn) => {');
 const txnEnd = CODE.indexOf('});', CODE.indexOf('approvalRecord };', txnStart)) + 3;
 const TXN = CODE.slice(txnStart, txnEnd);
 const tokenFnStart = CODE.indexOf('async function decideWithApprovalActionToken');
-const TOKEN_FN = CODE.slice(tokenFnStart, CODE.indexOf('export const PurchaseRequestApprovalService'));
+// End at the H4 two-step rejection when it exists, so this slice stays exactly
+// the one-step decision entry point these assertions were written against.
+const tokenFnEnd = [CODE.indexOf('async function beginTokenRejection'), CODE.indexOf('export const PurchaseRequestApprovalService')]
+  .filter(i => i > tokenFnStart).sort((a, b) => a - b)[0];
+const TOKEN_FN = CODE.slice(tokenFnStart, tokenFnEnd);
 
 console.log('═══ PART A — source invariants (no Firebase) ═══');
 
@@ -70,7 +74,9 @@ ok('8. no token-only shortcut: the token path performs no request write of its o
 ok('  it never sets a purchase-request status itself', !/status:\s*(targetStatus|PR_STATUS)/.test(TOKEN_FN));
 
 console.log('\n  -- inside the one transaction --');
-ok('6. token is re-read inside the transaction', /readApprovalActionInTxn\(txn, pre\.token_hash\)/.test(TOKEN_FN));
+ok('6. token is re-read inside the transaction', /readApprovalActionInTxn\(txn, pre\.token_hash/.test(TOKEN_FN));
+ok('  and the re-read enforces the expected token purpose (H4)',
+  /readApprovalActionInTxn\(txn, pre\.token_hash, \{ expectedPurpose: expected_purpose \}\)/.test(TOKEN_FN));
 ok('  afterRead runs right after the request read and BEFORE the status check',
   TXN.indexOf('hooks.afterRead(') > TXN.indexOf('const current = formatDocSnapshot(snap);') &&
   TXN.indexOf('hooks.afterRead(') < TXN.indexOf('current.status !== PR_STATUS.PENDING_APPROVAL'));
@@ -79,7 +85,11 @@ ok('7. token consumption happens in the SAME transaction, after the request upda
   TXN.indexOf('hooks.beforeCommit(') < TXN.indexOf('return { duplicate: false'));
 ok('  consumption uses the txn-scoped write primitive', /markApprovalActionConsumedInTxn\(txn, pre\.token_hash/.test(TOKEN_FN));
 ok('  the standalone consume primitive is NOT used (no separate consume transaction)', !/consumeApprovalActionFirestore/.test(CODE));
-ok('  the preflight token read is re-verified in the transaction', /findApprovalActionByTokenFirestore\(raw_token\)/.test(TOKEN_FN) && /throwForTokenVerdict\(verdict\)/.test(TOKEN_FN));
+ok('  the preflight token read is re-verified in the transaction', /findApprovalActionByTokenFirestore\(raw_token/.test(TOKEN_FN) && /throwForTokenVerdict\(verdict\)/.test(TOKEN_FN));
+ok('  the preflight also enforces the expected purpose (H4)',
+  /findApprovalActionByTokenFirestore\(raw_token, \{ expectedPurpose: expected_purpose \}\)/.test(TOKEN_FN));
+ok('  the one-step path defaults to a DECISION token, never an intent (H4)',
+  /expected_purpose = PR_TOKEN_PURPOSES\.DECISION/.test(TOKEN_FN));
 
 console.log('\n  -- bindings --');
 ok('10/11. action binding: token.action must equal the requested action', /tokenDoc\.action !== action/.test(CODE) && /TOKEN_ACTION_MISMATCH/.test(CODE));
@@ -116,7 +126,7 @@ ok('16. no Socket.IO emit inside the transaction', !/\.emit\(/.test(TXN) && !/\b
 ok('  PR_EVENTS.DECIDED is still emitted by the controller AFTER the service resolves', /if \(!result\.duplicate\) emitPurchaseRequestDecided\(req, result\.request, actor\);/.test(CTRL));
 ok('  the service itself never emits', !/\.emit\(/.test(CODE));
 ok('17. the same audit events are written post-commit', /'INVENTORY_PR_APPROVED' : 'INVENTORY_PR_REJECTED'/.test(CODE) && CODE.indexOf('await writeAudit(') > CODE.indexOf('const result = await db.runTransaction'));
-ok('  token path adds only a channel marker to the audit details', /audit_extra: \{ decision_channel: consumed_via \}/.test(TOKEN_FN));
+ok('  token path records the channel in the audit details', /audit_extra: \{ decision_channel: consumed_via/.test(TOKEN_FN));
 ok('  no token hash or raw token reaches the audit', !/writeAudit\([^;]*token_hash/.test(CODE) && !/writeAudit\([^;]*raw_token/.test(CODE));
 ok('  sibling tokens retired post-commit, best-effort, outside the transaction',
   CODE.indexOf('await retireOutstandingActions(') > CODE.indexOf('const result = await db.runTransaction') && /try \{[\s\S]{0,80}invalidateApprovalActionsForRequestFirestore/.test(CODE));

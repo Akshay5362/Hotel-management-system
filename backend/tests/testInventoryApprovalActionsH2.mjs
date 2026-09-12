@@ -161,6 +161,26 @@ ok('  it re-reads inside the transaction rather than trusting a prior read',
   /const snap = await txn\.get\(ref\);[\s\S]{0,200}evaluate\(doc\)/.test(REPO));
 ok('  no client-side lock or in-memory mutex', !/mutex|setTimeout|lockfile|\.lock/.test(REPO));
 
+// Purpose (Phase H4) — the collection now carries two kinds of token.
+console.log('\n  -- token purpose is backward compatible (H4) --');
+ok('a token written before H4 has no purpose field and reads as DECISION',
+  /export function tokenPurpose\(doc\) \{\s*\n\s*return \(doc && doc\.purpose\) \|\| PR_TOKEN_PURPOSES\.DECISION;/.test(REPO));
+ok('  an unrecognised purpose is refused at creation', /Approval action purpose must be DECISION or REASON_CAPTURE/.test(REPO));
+ok('  the expected purpose is checked before the token lifecycle, so a wrong-kind token leaks no state',
+  (() => { const e = REPO.slice(REPO.indexOf('function evaluate('), REPO.indexOf('// \u2500\u2500 Creation'));
+    return e.indexOf('PURPOSE_MISMATCH') < e.indexOf('ACTION_INVALID.CONSUMED'); })());
+ok('  a reason-capture intent must name its parent decision token',
+  /A reason-capture intent requires parent_token_hash/.test(REPO));
+ok('  a reason-capture intent may only ever carry REJECTED',
+  /A reason-capture intent may only carry REJECTED/.test(REPO));
+ok('  a decision token may NOT carry a parent hash',
+  /Only a reason-capture intent may carry parent_token_hash/.test(REPO));
+ok('  the parent link stores a HASH, never a raw token',
+  /parent_token_hash: parentTokenHash/.test(REPO) && !/parent_raw_token|parent_token:/.test(REPO));
+ok('  both kinds live in the one collection — H4 added none',
+  (REPO.match(/db\.collection\(/g) || []).every(() => true) &&
+  !/collection\(['\"]inventory_rejection|collection\(['\"]inventory_approval_intents/.test(REPO));
+
 // Invalidation
 console.log('\n  -- invalidation --');
 ok('invalidation is scoped by pr_id, never a collection scan',

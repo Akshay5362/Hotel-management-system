@@ -188,6 +188,53 @@ export const PR_ACTION_TO_STATUS = Object.freeze({
 });
 
 /**
+ * Phase H4 — what an approval action token is FOR.
+ *
+ *   DECISION        the token a notified approver presents to record a
+ *                   decision. This is every token H2 and H3 deal with.
+ *   REASON_CAPTURE  a short-lived intent minted once an approver has chosen to
+ *                   reject, which carries the mandatory reason back into the
+ *                   same decision engine. It is never a decision on its own,
+ *                   and it is useless without the rest of the checks.
+ *
+ * Tokens written before H4 carry no purpose field and are read as DECISION, so
+ * existing behaviour is unchanged.
+ */
+export const PR_TOKEN_PURPOSES = Object.freeze({
+  DECISION: 'DECISION',
+  REASON_CAPTURE: 'REASON_CAPTURE'
+});
+
+/**
+ * A reason-capture intent covers the few minutes between choosing to reject
+ * and picking a reason. It is not a standing credential, so it expires far
+ * sooner than the decision token that spawned it.
+ */
+export const PR_REASON_CAPTURE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * The ONLY rejection reasons a token-driven rejection may record.
+ *
+ * The approver chooses a CODE; the SERVER owns the words. Free text is
+ * deliberately not accepted on this path, so a caller that holds nothing but a
+ * token cannot write arbitrary words onto a purchase request it does not
+ * otherwise control. Every string here clears MIN_REJECTION_REASON_LENGTH, so
+ * the existing rejection rule is satisfied by construction rather than by
+ * hoping the caller typed enough characters.
+ *
+ * Free-text rejection is a later phase, and it will need its own answer to
+ * "who is allowed to put these words on the record".
+ */
+export const PR_REJECTION_REASON_CODES = Object.freeze({
+  BUDGET_UNAVAILABLE:      'Budget is not available for this request.',
+  ALREADY_IN_STOCK:        'These items are already in stock.',
+  QUANTITY_TOO_HIGH:       'The quantity requested is higher than required.',
+  SUPPLIER_OR_PRICE_WRONG: 'The supplier or price on this request is not acceptable.',
+  NOT_REQUIRED_NOW:        'These items are not required at this time.',
+  DUPLICATE_REQUEST:       'This duplicates another purchase request.'
+});
+
+/**
  * Fail-safe default when settings/inventory_pr_approval is missing or invalid:
  * only administrators may approve. This is deliberately NOT the Phase B
  * REQUEST role set — being able to raise a request must never imply being able
