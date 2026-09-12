@@ -154,8 +154,13 @@ ok('  first-valid-decision-wins still enforced',
 ok('  idempotent replay for the same approver still present', /alreadyMine/.test(APPROVAL));
 ok('  a second approver is still refused', /APPROVER_ALREADY_ACTED/.test(APPROVAL));
 ok('  the rejection-reason rule still stands', /MIN_REJECTION_REASON_LENGTH/.test(APPROVAL));
-ok('  H1 added nothing to the approval service',
-  !/approval_authorities|whatsapp/i.test(APPROVAL));
+// H3 wires the authority record into the engine, so "no reference at all" is
+// no longer the invariant. What must stay true: the engine never treats a
+// WhatsApp number or its verification state as authorization. Comments are
+// stripped first so documentation naming WhatsApp cannot trip this.
+ok('  the approval service never consults a WhatsApp number or verification state',
+  !/whatsapp_e164|whatsapp_verified_at|whatsapp_verification_method|WhatsAppNumber/.test(
+    APPROVAL.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')));
 ok('  nor to the approval config repository', !/whatsapp/i.test(CONFIG_REPO));
 ok('  nor to the purchase request controller',
   !/approval_authorities|whatsapp/i.test(src('backend', 'controllers', 'purchaseRequestController.js')));

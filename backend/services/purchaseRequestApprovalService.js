@@ -26,6 +26,23 @@
 import crypto from 'crypto';
 import { db } from '../config/firebaseAdmin.js';
 import { formatDocSnapshot, RepositoryError } from '../repositories/firestore/firestoreUtils.js';
+// H3 -- a service importing from a controller already has precedent here
+// (housekeepingCutoverService does the same). authController imports no
+// service that imports this one, so there is no cycle.
+import { normalizeUserRole } from '../controllers/authController.js';
+import { getStaffByUidFirestore } from '../repositories/firestore/staffRepository.js';
+import {
+  getApprovalAuthorityByUidFirestore,
+  APPROVAL_AUTHORITIES_COLLECTION
+} from '../repositories/firestore/inventoryApprovalAuthoritiesRepository.js';
+import {
+  findApprovalActionByTokenFirestore,
+  readApprovalActionInTxn,
+  markApprovalActionConsumedInTxn,
+  invalidateApprovalActionsForRequestFirestore,
+  normalizeAction as normalizeApprovalActionToken,
+  ACTION_INVALID
+} from '../repositories/firestore/inventoryApprovalActionsRepository.js';
 import {
   formatRequestDocId,
   requestRef,
@@ -125,15 +142,10 @@ export async function assertCanApprove(request, actor) {
 }
 
 /**
- * Records one approval decision atomically.
- *
- * @param {'APPROVED'|'REJECTED'} action
- * @returns {{ duplicate: boolean, request: object }}
+ * The one rejection-reason rule, shared by both entry points so the token path
+ * can never drift from the in-app path. Pure: reads nothing.
  */
-async function decide(requestId, action, { comment, actor }) {
-  if (!PR_APPROVAL_ACTIONS[action]) throw fail(`Unknown approval action '${action}'.`, 'INVALID_APPROVAL_ACTION');
-  const targetStatus = PR_ACTION_TO_STATUS[action];
-
+function assertRejectionReason(action, comment) {
   const reason = cleanText(comment, 1000);
   if (action === PR_APPROVAL_ACTIONS.REJECTED && (!reason || reason.length < MIN_REJECTION_REASON_LENGTH)) {
     throw fail(
@@ -141,6 +153,44 @@ async function decide(requestId, action, { comment, actor }) {
       'REJECTION_REASON_REQUIRED'
     );
   }
+  return reason;
+}
+
+/**
+ * Retires every approval-action token still outstanding for a request that
+ * has just become terminal. Post-commit and best-effort, like the audit
+ * write: a leftover token is inert anyway (any use meets the terminal-status
+ * guard inside the transaction), so a failure here must never undo a
+ * committed decision. One bounded query scoped by pr_id; no scan.
+ */
+async function retireOutstandingActions(requestDocId, status) {
+  try {
+    await invalidateApprovalActionsForRequestFirestore(requestDocId, { reason: `PR_${status}` });
+  } catch (err) {
+    console.warn(`[PurchaseRequestApproval] token retirement failed (${requestDocId}): ${err.message}`);
+  }
+}
+
+/**
+ * Records one approval decision atomically.
+ *
+ * @param {'APPROVED'|'REJECTED'} action
+ * @param {object}  opts
+ * @param {object} [opts.hooks]  H3 -- extra factors verified INSIDE the transaction.
+ *   afterRead(txn, current)    read phase: runs right after the request is read
+ *                              and before any rule can throw, so every txn read
+ *                              it performs precedes every write.
+ *   beforeCommit(txn, current) write phase, synchronous: runs after the request
+ *                              update, so its writes commit with the decision.
+ *   The in-app path passes no hooks and behaves exactly as before.
+ * @param {object} [opts.audit_extra]  merged into the audit details (no secrets).
+ * @returns {{ duplicate: boolean, request: object }}
+ */
+async function decide(requestId, action, { comment, actor, hooks = null, audit_extra = {} }) {
+  if (!PR_APPROVAL_ACTIONS[action]) throw fail(`Unknown approval action '${action}'.`, 'INVALID_APPROVAL_ACTION');
+  const targetStatus = PR_ACTION_TO_STATUS[action];
+
+  const reason = assertRejectionReason(action, comment);
 
   const docId = formatRequestDocId(requestId);
   const ref = requestRef(docId);
@@ -158,6 +208,13 @@ async function decide(requestId, action, { comment, actor }) {
     const snap = await txn.get(ref);
     if (!snap.exists) throw fail('Purchase request not found.', 'REQUEST_NOT_FOUND', 404);
     const current = formatDocSnapshot(snap);
+
+    // H3 -- the action token and the approver's live staff and authority
+    // records are re-read and verified HERE, before the status check, so a
+    // spent token is reported as spent instead of falling into the replay
+    // branch below, and so every read still precedes the write.
+    if (hooks?.afterRead) await hooks.afterRead(txn, current);
+
     const approvals = Array.isArray(current.approvals) ? [...current.approvals] : [];
 
     if (current.status !== PR_STATUS.PENDING_APPROVAL) {
@@ -227,6 +284,9 @@ async function decide(requestId, action, { comment, actor }) {
     }
 
     txn.update(ref, updates);
+    // H3 -- the token is marked consumed in the SAME transaction as the
+    // decision, so neither can commit without the other.
+    if (hooks?.beforeCommit) hooks.beforeCommit(txn, current);
     return { duplicate: false, request: { ...current, ...updates }, approvalRecord };
   });
 
@@ -235,11 +295,160 @@ async function decide(requestId, action, { comment, actor }) {
       action === PR_APPROVAL_ACTIONS.APPROVED ? 'INVENTORY_PR_APPROVED' : 'INVENTORY_PR_REJECTED',
       result.request,
       actor,
-      action === PR_APPROVAL_ACTIONS.REJECTED ? { rejection_reason: reason } : { comment: reason }
+      { ...(action === PR_APPROVAL_ACTIONS.REJECTED ? { rejection_reason: reason } : { comment: reason }), ...audit_extra }
     );
+    // A terminal request retires every token still outstanding for it, on
+    // BOTH entry points: an in-app decision must also retire the tokens H5
+    // will have issued for the same request.
+    await retireOutstandingActions(docId, result.request.status);
   }
 
   return { duplicate: result.duplicate, request: await withItems(result.request) };
+}
+
+// =============================================================================
+// H3 -- TOKEN-AWARE DECISION
+//
+// A token is one factor, never the authorization. Before the ONE existing
+// engine records anything, this path establishes -- inside the same
+// transaction that records the decision --
+//
+//   a valid, unspent, unexpired token
+//     AND bound to THIS request, THIS approver and THIS action
+//     AND the approver's staff record is still active
+//     AND an active H1 authority record exists for them
+//     AND their CURRENT role passes the live approval configuration
+//     AND every rule decide() already enforces: status, transition,
+//         self-approval, already-acted, rejection reason
+//
+// Nothing is reimplemented: this function resolves an actor and hands it to
+// decide() with hooks. decide() does what it always did.
+//
+// `decided_by_uid` is a TRUSTED, server-side argument. This service refuses a
+// token whose approver_uid differs from it, which is what stops "token X
+// presented by identity Y". The future webhook (H4) must derive the identity
+// it passes here from its own verified channel binding -- the registered
+// WhatsApp number resolved through the H1 authority record -- never from a
+// field an external party controls. H3 exposes no HTTP surface of its own.
+// =============================================================================
+
+/** Mirrors the H1 controller's predicate; consolidating them is a follow-up. */
+function isStaffActive(staff) {
+  if (!staff) return false;
+  if (staff.deleted === true || staff.deleted === 1 || staff.is_deleted === true || staff.is_deleted === 1 || staff.deleted_at) return false;
+  if (staff.is_active === false || staff.is_active === 0 || staff.active === false || staff.active === 0) return false;
+  if (staff.status === 'Inactive' || staff.status === 'Disabled' || staff.status === 'Deleted') return false;
+  return true;
+}
+
+/**
+ * Maps a repository verdict to a decision error. Malformed and unknown tokens
+ * collapse to one code so this path is not an oracle for which hashes exist.
+ * Consumed and expired are distinguished: the bearer already holds the token
+ * and learns nothing they could not learn by presenting it.
+ */
+function throwForTokenVerdict(verdict) {
+  if (verdict.valid) return;
+  switch (verdict.reason) {
+    case ACTION_INVALID.CONSUMED: throw fail('This approval link has already been used.', 'TOKEN_CONSUMED', 409);
+    case ACTION_INVALID.EXPIRED:  throw fail('This approval link has expired.', 'TOKEN_EXPIRED', 403);
+    default:                      throw fail('This approval link is not valid.', 'TOKEN_INVALID', 403);
+  }
+}
+
+/** The three bindings. Pure; never echoes the token. */
+function assertTokenBinding(tokenDoc, { approverUid, action, requestDocId }) {
+  if (String(tokenDoc.approver_uid) !== String(approverUid)) {
+    throw fail('This approval link was issued to a different approver.', 'TOKEN_APPROVER_MISMATCH', 403);
+  }
+  if (tokenDoc.action !== action) {
+    throw fail(`This approval link permits ${tokenDoc.action}, not ${action}.`, 'TOKEN_ACTION_MISMATCH', 403);
+  }
+  if (requestDocId && formatRequestDocId(tokenDoc.pr_id) !== formatRequestDocId(requestDocId)) {
+    throw fail('This approval link belongs to a different purchase request.', 'TOKEN_PR_MISMATCH', 403);
+  }
+}
+
+function assertAuthorityActive(authority) {
+  if (!authority) throw fail('The approver is not configured as an approval authority.', 'AUTHORITY_NOT_FOUND', 403);
+  if (authority.is_active === false) throw fail('The approval authority for this approver has been deactivated.', 'AUTHORITY_INACTIVE', 403);
+}
+
+/** Returns the approver's normalized CURRENT role, or throws with a specific code. */
+function assertStaffEligible(staff, approverUid) {
+  if (!staff) throw fail('The approver is not a recognised staff member.', 'STAFF_NOT_FOUND', 403);
+  if (!isStaffActive(staff)) throw fail('The approver is no longer an active staff member.', 'STAFF_INACTIVE', 403);
+  if (String(staff.user_uid || '') !== String(approverUid)) {
+    throw fail('The approver identity does not match a staff account.', 'STAFF_UID_MISMATCH', 403);
+  }
+  return normalizeUserRole({ ...staff, type: 'staff' });
+}
+
+/**
+ * Records a decision authorised by an approval-action token.
+ *
+ * @param {object} p
+ * @param {string} p.raw_token        the secret presented by the bearer
+ * @param {string} p.decided_by_uid   TRUSTED identity of the deciding approver (see above)
+ * @param {'APPROVED'|'REJECTED'|'APPROVE'|'REJECT'} p.action
+ * @param {string} [p.reason]         mandatory for a rejection, exactly as in-app
+ * @param {string} [p.request_id]     optional; when supplied it must match the token's request
+ * @param {string} [p.consumed_via]   recorded on the token; defaults to the channel name
+ * @returns {{ duplicate: boolean, request: object }}  the same shape approve()/reject() return
+ */
+async function decideWithApprovalActionToken({
+  raw_token, decided_by_uid, action, reason = null, request_id = null, consumed_via = 'APPROVAL_ACTION_TOKEN'
+} = {}) {
+  const approverUid = String(decided_by_uid || '').trim();
+  if (!approverUid) throw fail('An approver identity is required.', 'APPROVER_REQUIRED', 401);
+  const wanted = normalizeApprovalActionToken(action);   // APPROVE/REJECT aliases -> canonical
+  assertRejectionReason(wanted, reason);                  // fails before any read, as in-app does
+
+  // Fail-fast preflight. Nothing here is authoritative: the same token and
+  // the same two identity records are re-read inside the transaction below.
+  // Order is cheapest-refusal-first: one read decides most bad requests.
+  const pre = await findApprovalActionByTokenFirestore(raw_token);
+  throwForTokenVerdict(pre);
+  assertTokenBinding(pre.action, { approverUid, action: wanted, requestDocId: request_id });
+  const requestDocId = formatRequestDocId(pre.action.pr_id);
+
+  const authority = await getApprovalAuthorityByUidFirestore(approverUid);
+  assertAuthorityActive(authority);
+  const staff = await getStaffByUidFirestore(approverUid);
+  const actor = {
+    uid: approverUid,
+    name: staff?.full_name || staff?.username || null,
+    email: staff?.email || null,
+    role: assertStaffEligible(staff, approverUid)
+  };
+  const staffRef = db.collection('staff').doc(staff.id);
+  const authorityRef = db.collection(APPROVAL_AUTHORITIES_COLLECTION).doc(approverUid);
+
+  return await decide(requestDocId, wanted, {
+    comment: reason,
+    actor,
+    audit_extra: { decision_channel: consumed_via },
+    hooks: {
+      // READ PHASE. Token first, so a spent token costs one read and refuses
+      // before anything else is fetched; then the two identity records.
+      async afterRead(txn, current) {
+        const verdict = await readApprovalActionInTxn(txn, pre.token_hash);
+        throwForTokenVerdict(verdict);
+        assertTokenBinding(verdict.action, { approverUid, action: wanted, requestDocId: current.id });
+
+        const [staffSnap, authoritySnap] = await txn.getAll(staffRef, authorityRef);
+        assertAuthorityActive(authoritySnap.exists ? formatDocSnapshot(authoritySnap) : null);
+        // The role at DECISION time is what the record carries and what the
+        // existing authorization is evaluated against -- never a send-time copy.
+        actor.role = assertStaffEligible(staffSnap.exists ? formatDocSnapshot(staffSnap) : null, approverUid);
+        await assertCanApprove(current, actor);
+      },
+      // WRITE PHASE, after decide() has queued the request update.
+      beforeCommit(txn) {
+        markApprovalActionConsumedInTxn(txn, pre.token_hash, { via: consumed_via });
+      }
+    }
+  });
 }
 
 export const PurchaseRequestApprovalService = {
@@ -269,7 +478,14 @@ export const PurchaseRequestApprovalService = {
     };
   },
 
-  assertCanApprove
+  assertCanApprove,
+
+  /**
+   * H3 -- decision authorised by an approval-action token. Same engine, same
+   * transaction, same post-commit audit. The caller emits PR_EVENTS.DECIDED
+   * after this resolves, exactly as the in-app controller does.
+   */
+  decideWithApprovalActionToken
 };
 
 export default PurchaseRequestApprovalService;

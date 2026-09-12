@@ -142,9 +142,13 @@ ok('  the boundary is documented in the file header', /A TOKEN IS NOT AUTHORIZAT
 // Precise, not a loose substring: the service legitimately contains the
 // PRE-EXISTING constant PR_APPROVAL_ACTIONS, which case-insensitively contains
 // "approval_actions". The real question is whether H2 wired itself in.
-ok('  the existing approval engine is untouched',
+// H3 wires this repository into the engine, so "not imported" is no longer the
+// invariant. What must stay true: the engine reaches tokens ONLY through the
+// primitives above — it never names the collection, never hashes a token
+// itself, and never consumes one outside the decision transaction.
+ok('  the approval engine touches tokens only through the repository primitives',
   (() => { const a = codeOnly(src('backend', 'services', 'purchaseRequestApprovalService.js'));
-    return !/inventoryApprovalActionsRepository|'inventory_approval_actions'|approvalActionToken|raw_token/.test(a); })());
+    return !/'inventory_approval_actions'|approvalActionToken\.js|hashToken|createHash|consumeApprovalActionFirestore/.test(a); })());
 ok('  the purchase request controller is untouched',
   !/approval_actions/i.test(src('backend', 'controllers', 'purchaseRequestController.js')));
 
