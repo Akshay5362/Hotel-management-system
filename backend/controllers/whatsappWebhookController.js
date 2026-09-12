@@ -1,0 +1,215 @@
+/**
+ * backend/controllers/whatsappWebhookController.js
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Phase H5 — the public webhook. Transport only.
+ *
+ * This file authenticates an inbound delivery, deduplicates the events inside
+ * it, and stops. It contains NO approval logic: it does not mint tokens, does
+ * not resolve an approver, does not decide anything and does not send anything.
+ * Those belong to H6, H7 and H8, and the seam they attach to is
+ * `dispatchVerifiedWebhookEvents` at the bottom of this file.
+ *
+ * ORDER OF OPERATIONS — the whole point of the phase
+ *   1. feature flag        disabled → 404, nothing else runs
+ *   2. rate limit          applied by the router, before the body is buffered
+ *   3. signature           HMAC over the RAW bytes, timing-safe
+ *   4. parse               ONLY after the signature proved the bytes are Meta's
+ *   5. claim               each event exactly once
+ *   6. dispatch            H7's seam; a no-op today
+ *
+ * Nothing at step 4 or later may run if step 3 failed, because a payload that
+ * has not been authenticated is attacker-controlled input.
+ *
+ * WHAT IS NEVER LOGGED
+ * The app secret, the verify token, the signature header, and the raw body.
+ * Event ids and counts are logged, because they are the operational signal and
+ * carry no secret.
+ */
+
+import {
+  verifyWebhookSignature,
+  timingSafeCompare,
+  SIGNATURE_HEADER
+} from '../utils/whatsappSignature.js';
+import { isWhatsAppWebhookEnabled } from '../config/featureFlags.js';
+import {
+  claimWebhookEventFirestore,
+  digestDelivery
+} from '../repositories/firestore/whatsappWebhookEventsRepository.js';
+
+const LOG = '[WhatsAppWebhook]';
+
+/**
+ * A disabled feature answers as though the route does not exist. Meta's setup
+ * screen reports the failure just as clearly as a 403 would, and an unconfigured
+ * deployment gives a prober nothing to confirm.
+ */
+function notFound(res) {
+  return res.status(404).json({ error: 'Not found.' });
+}
+
+/**
+ * GET — Meta's subscription handshake.
+ *
+ * Meta calls this once when the webhook URL is saved, with a verify token we
+ * chose and a challenge it expects echoed back verbatim as plain text.
+ */
+export const verifyWebhookSubscription = (req, res) => {
+  if (!isWhatsAppWebhookEnabled()) return notFound(res);
+
+  const expected = process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN;
+  if (!expected) {
+    // Misconfiguration must fail closed, and must not say which secret is absent.
+    console.warn(`${LOG} handshake refused: webhook is enabled but not fully configured`);
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
+
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode !== 'subscribe' || typeof token !== 'string' || !timingSafeCompare(token, expected)) {
+    console.warn(`${LOG} handshake refused: mode or verify token did not match`);
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
+
+  console.log(`${LOG} handshake accepted`);
+  // Echoed verbatim as text/plain — Meta rejects a JSON-wrapped challenge.
+  return res.status(200).type('text/plain').send(String(challenge ?? ''));
+};
+
+/**
+ * Pulls the dedupe keys out of an authenticated payload.
+ *
+ * Two namespaces, deliberately separated:
+ *   message  one inbound message, keyed by its own id
+ *   status   a delivery receipt, which REUSES the original message id across
+ *            sent/delivered/read — so the status value is part of the key, or
+ *            the 'read' receipt would be dropped as a duplicate of 'delivered'
+ *
+ * Everything is optional-chained. A payload that passed the signature check is
+ * authentic, but authentic is not the same as well-formed.
+ */
+export function extractWebhookEvents(payload) {
+  const events = [];
+  const entries = Array.isArray(payload?.entry) ? payload.entry : [];
+
+  for (const entry of entries) {
+    const changes = Array.isArray(entry?.changes) ? entry.changes : [];
+    for (const change of changes) {
+      const value = change?.value;
+
+      for (const message of Array.isArray(value?.messages) ? value.messages : []) {
+        if (!message?.id) continue;
+        events.push({
+          event_id: `msg:${message.id}`,
+          event_type: 'message',
+          meta_message_id: String(message.id)
+        });
+      }
+
+      for (const status of Array.isArray(value?.statuses) ? value.statuses : []) {
+        if (!status?.id || !status?.status) continue;
+        events.push({
+          event_id: `status:${status.id}:${status.status}`,
+          event_type: 'status',
+          meta_message_id: String(status.id)
+        });
+      }
+    }
+  }
+  return events;
+}
+
+/**
+ * POST — an inbound delivery from Meta.
+ *
+ * Always answers 200 once the signature has been accepted and the payload
+ * parsed, because a non-2xx makes Meta retry and a retry cannot fix anything
+ * that is already claimed. The two exceptions are deliberate: an unverifiable
+ * signature is 403 because it is not Meta, and an unparseable body is 400
+ * because a 2xx would be claiming responsibility for something we could not
+ * read.
+ */
+export const receiveWebhook = async (req, res) => {
+  if (!isWhatsAppWebhookEnabled()) return notFound(res);
+
+  const appSecret = process.env.WHATSAPP_APP_SECRET;
+  if (!appSecret) {
+    console.warn(`${LOG} delivery refused: webhook is enabled but not fully configured`);
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
+
+  // express.raw() leaves a Buffer here. Anything else means the router was
+  // mounted after a body parser, which would make verification impossible —
+  // so it is refused rather than worked around.
+  const rawBody = req.body;
+  if (!Buffer.isBuffer(rawBody)) {
+    console.error(`${LOG} delivery refused: raw body unavailable (parser order is wrong)`);
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
+
+  if (!verifyWebhookSignature(rawBody, req.get(SIGNATURE_HEADER), appSecret)) {
+    console.warn(`${LOG} delivery refused: signature did not verify`);
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
+
+  // ── Everything below this line is authenticated as having come from Meta. ──
+  let payload;
+  try {
+    payload = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    console.warn(`${LOG} delivery refused: body is not valid JSON`);
+    return res.status(400).json({ error: 'Malformed payload.' });
+  }
+
+  const events = extractWebhookEvents(payload);
+  const deliveryDigest = digestDelivery(rawBody);
+  const claimed = [];
+  let duplicates = 0;
+
+  for (const event of events) {
+    try {
+      // Claimed BEFORE any downstream work — see the repository header for why
+      // this direction is the safe one.
+      const result = await claimWebhookEventFirestore(event.event_id, {
+        ...event,
+        delivery_digest: deliveryDigest
+      });
+      if (result.duplicate) duplicates += 1;
+      else claimed.push(event);
+    } catch (err) {
+      // One bad event must not discard the rest of the delivery.
+      console.error(`${LOG} claim failed for ${event.event_id}: ${err.message}`);
+    }
+  }
+
+  if (events.length) {
+    console.log(`${LOG} delivery accepted: ${events.length} event(s), ${claimed.length} claimed, ${duplicates} duplicate(s)`);
+  }
+
+  await dispatchVerifiedWebhookEvents(claimed, req);
+
+  return res.status(200).json({
+    received: events.length,
+    claimed: claimed.length,
+    duplicates
+  });
+};
+
+/**
+ * ── H7 SEAM ──────────────────────────────────────────────────────────────────
+ * Deliberately a no-op in H5.
+ *
+ * H7 will map the sender to an H1 approval authority and route an Approve or
+ * Reject into the EXISTING decision engine, then emit PR_EVENTS.DECIDED. It
+ * receives only events THIS process claimed, so it is called at most once per
+ * event no matter how often Meta re-delivers.
+ *
+ * It must stay non-throwing: the claim has already committed, and an exception
+ * here would turn a handled delivery into a 500 and a pointless retry.
+ */
+async function dispatchVerifiedWebhookEvents(claimedEvents /* , req */) {
+  if (!claimedEvents.length) return;
+  // Intentionally empty until H7. No approval logic belongs in H5.
+};

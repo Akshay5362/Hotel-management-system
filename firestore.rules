@@ -308,6 +308,16 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // Server-owned: whatsappWebhookEventsRepository (Admin SDK). Phase H5.
+    // The exactly-once claim for an inbound Meta webhook delivery. A client
+    // that could create a document here would pre-claim an event id and
+    // silently suppress a real approval decision, and a client that could read
+    // one would learn message ids it has no business seeing — so both are
+    // denied. The rows hold a digest of the delivery, never its contents.
+    match /whatsapp_webhook_events/{eventId} {
+      allow read, write: if false;
+    }
+
     // Server-owned: cashLogsRepository / cashSubmissionsRepository (Admin SDK)
     // via cashController. Cash records are the reconciliation trail.
     match /cash_logs/{logId} {

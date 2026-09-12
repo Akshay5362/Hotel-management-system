@@ -2,6 +2,16 @@
  * Central Feature Flags Configuration for HPMS-Sky5 Architecture
  */
 
+/**
+ * Phase H5 — the WhatsApp webhook. Defaults to FALSE, and the endpoint answers
+ * 404 while it is off, so an unconfigured deployment exposes no public surface
+ * at all. Opt in explicitly with ENABLE_WHATSAPP_WEBHOOK=true once the Meta app
+ * secret and verify token are present in the environment.
+ */
+export const isWhatsAppWebhookEnabled = () => {
+  return process.env.ENABLE_WHATSAPP_WEBHOOK === 'true';
+};
+
 export const isFirestoreReadsEnabled = () => {
   return process.env.ENABLE_FIRESTORE_READS === 'true';
 };
@@ -323,5 +333,6 @@ export const FEATURE_FLAGS = {
   DISABLE_RBAC_SHADOW_VERIFICATION: isRbacShadowVerificationDisabled(),
   DISABLE_BUSINESS_DATE_SHADOW_VERIFICATION: isBusinessDateShadowVerificationDisabled(),
   DISABLE_MASTER_DATA_SHADOW_VERIFICATION: isMasterDataShadowVerificationDisabled(),
-  DISABLE_OPERATIONAL_SHADOW_VERIFICATION: isOperationalShadowVerificationDisabled()
+  DISABLE_OPERATIONAL_SHADOW_VERIFICATION: isOperationalShadowVerificationDisabled(),
+  ENABLE_WHATSAPP_WEBHOOK: isWhatsAppWebhookEnabled()
 };

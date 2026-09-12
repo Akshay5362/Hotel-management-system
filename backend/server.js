@@ -14,6 +14,7 @@ import cors from 'cors';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import apiRouter from './routes/api.js';
+import whatsappRoutes from './routes/whatsappRoutes.js';
 
 const app = express();
 const server = createServer(app);
@@ -71,6 +72,18 @@ app.set('io', io);
 
 const PORT = process.env.PORT || 5000;
 
+
+// ── WhatsApp webhook (Phase H5) ─────────────────────────────────────────────
+// MOUNTED BEFORE express.json() DELIBERATELY. Meta signs the RAW request bytes
+// with HMAC-SHA256; once the global JSON parser has consumed the stream the
+// original bytes cannot be reproduced (key order, whitespace and unicode
+// escaping all differ after a round trip), so the signature could never be
+// verified. This router carries its own express.raw() parser and its own rate
+// limiter, and it is the ONLY public write surface in the application.
+//
+// Nothing else changes: Express matches in mount order, so every other path
+// still reaches express.json() exactly as before.
+app.use('/api/whatsapp', whatsappRoutes);
 
 app.use(express.json());
 
