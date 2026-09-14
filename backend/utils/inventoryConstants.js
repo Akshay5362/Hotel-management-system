@@ -272,6 +272,50 @@ export const WHATSAPP_VERIFICATION_CHALLENGE_TTL_MS = 15 * 60 * 1000;
 export const WHATSAPP_VERIFICATION_MAX_ATTEMPTS = 5;
 export const WHATSAPP_VERIFICATION_CODE_LENGTH = 8;
 
+// ── Outbound WhatsApp correlation (Phase H8-A) ───────────────────────────────
+//
+//  One row per OUTBOUND dispatch, so that an inbound tap — which carries only
+//  the id of the message its button belonged to — can be resolved back to a
+//  request and an authority. Meta's template quick-reply buttons carry no
+//  developer payload, so this correlation is the only way a tap is attributable.
+
+/** Only outbound dispatches are recorded; inbound lives in whatsapp_webhook_events. */
+export const WHATSAPP_DISPATCH_DIRECTION = Object.freeze({ OUTBOUND: 'OUTBOUND' });
+
+/**
+ * What a dispatch was for. Two purposes for the same request and authority are
+ * two different dispatches, and therefore two different deterministic ids.
+ */
+export const WHATSAPP_DISPATCH_PURPOSE = Object.freeze({
+  PR_REVIEW_NOTIFICATION: 'PR_REVIEW_NOTIFICATION',
+  PR_DECISION_PROMPT: 'PR_DECISION_PROMPT'
+});
+
+/**
+ * OUR side of the send. UNKNOWN is the honest answer when a call timed out and
+ * Meta may or may not have accepted the message; it is reported, never retried
+ * automatically, because retrying a billable message to a real person on a
+ * guess is worse than surfacing it.
+ */
+export const WHATSAPP_SEND_STATE = Object.freeze({
+  CLAIMED: 'CLAIMED',
+  SENT: 'SENT',
+  FAILED: 'FAILED',
+  UNKNOWN: 'UNKNOWN'
+});
+
+/**
+ * META'S side, normalized to this project's upper-case convention on the way in.
+ * Deliberately separate from send_state: transport state must never be mistaken
+ * for, or promoted into, purchase-request business state.
+ */
+export const WHATSAPP_DELIVERY_STATUS = Object.freeze({
+  SENT: 'SENT',
+  DELIVERED: 'DELIVERED',
+  READ: 'READ',
+  FAILED: 'FAILED'
+});
+
 /**
  * Fail-safe default when settings/inventory_pr_approval is missing or invalid:
  * only administrators may approve. This is deliberately NOT the Phase B

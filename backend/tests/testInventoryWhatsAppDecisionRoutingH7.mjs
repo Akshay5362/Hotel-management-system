@@ -34,6 +34,9 @@ const ok = (l, c, d = '') => {
 const CRLF = new RegExp(String.fromCharCode(13) + String.fromCharCode(10), 'g');
 const src = (...p) => fs.readFileSync(path.join(ROOT, ...p), 'utf8').replace(CRLF, '\n');
 const codeOnly = (t) => t.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+/** Every `match /whatsapp_*` rules block, body included. Used by A15. */
+const whatsappRuleBlocks = (rules) =>
+  rules.match(/match \/whatsapp_[A-Za-z_]+\/\{[^}]*\}\s*\{[^}]*\}/g) || [];
 
 const PAYLOAD_SRC = codeOnly(src('backend', 'utils', 'whatsappActionPayload.js'));
 const CLIENT = codeOnly(src('backend', 'services', 'whatsappOutboundClient.js'));
@@ -187,9 +190,22 @@ ok('  H5 ordering is intact: verify, then parse, then claim, then dispatch',
   WCTRL.indexOf('claimWebhookEventFirestore(') < WCTRL.indexOf('dispatchVerifiedWebhookEvents(claimed'));
 
 console.log('\n  -- scope --');
-ok('A15. H7 adds no Firestore collection and no rules change',
-  !/whatsapp_messages|collection\('whatsapp_(?!number_bindings|webhook_events)/.test(H7_CODE) &&
-  !/whatsapp_messages/.test(RULES));
+ok('A15. H7 adds no Firestore collection of its own',
+  !/whatsapp_messages|collection\('whatsapp_(?!number_bindings|webhook_events)/.test(H7_CODE));
+// NARROWED in H8-A, not dropped. This assertion used to require that the name
+// whatsapp_messages was absent from firestore.rules, which held only while the
+// collection did not exist. H8-A introduced it legitimately, so the clause is
+// replaced by the guarantee it was really standing in for: H7 did not put it
+// there, and every WhatsApp collection remains server-owned. A rule that
+// GRANTED a client access now fails here — something the absence check never
+// actually tested.
+ok('  and every whatsapp_* collection is still deny-all to clients',
+  (() => {
+    const blocks = whatsappRuleBlocks(RULES);
+    return blocks.length >= 3 &&
+      blocks.some(b => /whatsapp_messages/.test(b)) &&
+      blocks.every(b => /allow read,\s*write:\s*if false;/.test(b));
+  })());
 ok('  H7 adds no route: the public surface is still the two H5 paths',
   (codeOnly(src('backend', 'routes', 'whatsappRoutes.js')).match(/router\.(get|post)\(/g) || []).length === 2);
 ok('  no submit-time minting, no authority picker, no template (H8 scope)',

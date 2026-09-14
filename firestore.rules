@@ -327,6 +327,17 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // Server-owned: whatsappMessagesRepository (Admin SDK). Phase H8.
+    // One row per outbound dispatch, mapping a WhatsApp message id back to the
+    // purchase request and approval authority it was sent about. A client that
+    // could write here could forge that mapping and redirect a review tap at a
+    // request of its choosing; one that could read would learn the whole
+    // approval graph — who is asked to approve what. Both denied. The rows
+    // carry no token, no verification code and no phone number.
+    match /whatsapp_messages/{dispatchId} {
+      allow read, write: if false;
+    }
+
     // Server-owned: cashLogsRepository / cashSubmissionsRepository (Admin SDK)
     // via cashController. Cash records are the reconciliation trail.
     match /cash_logs/{logId} {
