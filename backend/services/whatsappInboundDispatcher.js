@@ -1,14 +1,17 @@
 /**
  * backend/services/whatsappInboundDispatcher.js
  * ─────────────────────────────────────────────────────────────────────────────
- * Phase H6 — what happens to an inbound WhatsApp message AFTER H5 has proven
- * it came from Meta and claimed it exactly once.
+ * Phase H6, extended in H7 — what happens to an inbound WhatsApp message AFTER
+ * H5 has proven it came from Meta and claimed it exactly once.
  *
- * IN H6 THIS ROUTES ONE THING: a verification code, sent by an authority from
- * their own number. Nothing here approves, rejects, mints a token, consumes a
- * token, or touches a purchase request. Approve and Reject taps are H7, and
- * this file deliberately does not import the approval service, the token
- * repository, or anything that could decide.
+ * TWO KINDS OF MESSAGE, ONE RULE EACH
+ *   a tapped control  → the H7 decision router
+ *   plain text        → the H6 verification redeemer
+ *
+ * This file still decides nothing itself. It does not approve, reject, mint or
+ * consume a token, or touch a purchase request; it chooses which specialist to
+ * call and records the outcome. The approval engine is reached only through
+ * whatsappDecisionRouter, never from here.
  *
  * TRUST
  * Every field on an event was extracted by the webhook controller from a body
@@ -26,14 +29,31 @@ import {
   WEBHOOK_EVENT_STATUS
 } from '../repositories/firestore/whatsappWebhookEventsRepository.js';
 import { redeemVerificationFromSender } from './whatsappAuthorityVerificationService.js';
+import { routeWhatsAppAction } from './whatsappDecisionRouter.js';
 
 const LOG = '[WhatsAppInbound]';
 
-/** Only a plain text message from a known sender can carry a verification code. */
-async function handleOne(event) {
+/**
+ * One event, one specialist. A tapped control carries an action payload and
+ * goes to the decision router; plain text goes to verification. Anything else
+ * is ignored safely, which is the correct answer for a photo, a sticker or a
+ * message we have no business interpreting.
+ */
+async function handleOne(event, { io }) {
   if (event.event_type !== 'message') return 'IGNORED_NOT_A_MESSAGE';
-  if (event.message_type !== 'text') return 'IGNORED_NOT_TEXT';
   if (!event.sender_id) return 'IGNORED_NO_SENDER';
+
+  if (event.action_payload) {
+    const outcome = await routeWhatsAppAction({
+      sender_id: event.sender_id,
+      payload: event.action_payload,
+      meta_message_id: event.meta_message_id,
+      io
+    });
+    return `DECISION_${outcome}`;
+  }
+
+  if (event.message_type !== 'text') return 'IGNORED_NOT_TEXT';
   if (!isWhatsAppVerificationEnabled()) return 'IGNORED_VERIFICATION_DISABLED';
 
   const result = await redeemVerificationFromSender({
@@ -49,12 +69,12 @@ async function handleOne(event) {
  * already committed and Meta has already been told 200, so an error here is
  * recorded on the event row and logged, not propagated.
  */
-export async function dispatchInboundWhatsAppEvents(claimedEvents = []) {
+export async function dispatchInboundWhatsAppEvents(claimedEvents = [], { io = null } = {}) {
   for (const event of claimedEvents) {
     let status = WEBHOOK_EVENT_STATUS.PROCESSED;
     let errorCode = null;
     try {
-      const outcome = await handleOne(event);
+      const outcome = await handleOne(event, { io });
       // Outcome and event id only. Never the sender, never the text.
       console.log(`${LOG} ${event.event_id}: ${outcome}`);
     } catch (err) {

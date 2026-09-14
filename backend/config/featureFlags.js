@@ -21,6 +21,18 @@ export const isWhatsAppVerificationEnabled = () => {
   return process.env.ENABLE_WHATSAPP_VERIFICATION === 'true';
 };
 
+/**
+ * Phase H7 — inbound WhatsApp Approve/Reject routing. Defaults to FALSE, and
+ * is evaluated server-side at decision time, BEFORE any token is read. While
+ * off, a tap consumes no token, mints no rejection intent and changes no
+ * purchase request; the authority receives only a generic unavailable reply.
+ * This is the instant kill switch for the whole channel, independent of
+ * deactivating any single authority.
+ */
+export const isWhatsAppDecisionsEnabled = () => {
+  return process.env.ENABLE_WHATSAPP_DECISIONS === 'true';
+};
+
 export const isFirestoreReadsEnabled = () => {
   return process.env.ENABLE_FIRESTORE_READS === 'true';
 };
@@ -344,5 +356,6 @@ export const FEATURE_FLAGS = {
   DISABLE_MASTER_DATA_SHADOW_VERIFICATION: isMasterDataShadowVerificationDisabled(),
   DISABLE_OPERATIONAL_SHADOW_VERIFICATION: isOperationalShadowVerificationDisabled(),
   ENABLE_WHATSAPP_WEBHOOK: isWhatsAppWebhookEnabled(),
-  ENABLE_WHATSAPP_VERIFICATION: isWhatsAppVerificationEnabled()
+  ENABLE_WHATSAPP_VERIFICATION: isWhatsAppVerificationEnabled(),
+  ENABLE_WHATSAPP_DECISIONS: isWhatsAppDecisionsEnabled()
 };

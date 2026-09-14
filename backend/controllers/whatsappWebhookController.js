@@ -94,6 +94,25 @@ export const verifyWebhookSubscription = (req, res) => {
  * Everything is optional-chained. A payload that passed the signature check is
  * authentic, but authentic is not the same as well-formed.
  */
+/**
+ * The machine-readable identifier attached to a tapped control, or null.
+ * Reads only the documented reply shapes; anything else yields null rather
+ * than a guess, so an ordinary message can never be read as an action.
+ */
+export function extractActionPayload(message, messageType) {
+  if (messageType === 'button' && typeof message?.button?.payload === 'string') {
+    return message.button.payload.slice(0, MAX_TEXT_LENGTH);
+  }
+  if (messageType === 'interactive') {
+    const interactive = message?.interactive;
+    const id = interactive?.type === 'button_reply' ? interactive?.button_reply?.id
+      : interactive?.type === 'list_reply' ? interactive?.list_reply?.id
+        : null;
+    if (typeof id === 'string') return id.slice(0, MAX_TEXT_LENGTH);
+  }
+  return null;
+}
+
 export function extractWebhookEvents(payload) {
   const events = [];
   const entries = Array.isArray(payload?.entry) ? payload.entry : [];
@@ -119,7 +138,12 @@ export function extractWebhookEvents(payload) {
           meta_message_id: String(message.id),
           sender_id: message.from ? String(message.from) : null,
           message_type: messageType,
-          text
+          text,
+          // H7 — the identifier behind a tapped control. Meta reports a template
+          // quick reply as `button` and an in-window control as `interactive`,
+          // whose reply is either a button_reply or a list_reply. All three are
+          // read here and nowhere else, capped like the text, and never logged.
+          action_payload: extractActionPayload(message, messageType)
         });
       }
 
@@ -203,7 +227,9 @@ export const receiveWebhook = async (req, res) => {
     console.log(`${LOG} delivery accepted: ${events.length} event(s), ${claimed.length} claimed, ${duplicates} duplicate(s)`);
   }
 
-  await dispatchVerifiedWebhookEvents(claimed, req);
+  // H7 — the Socket.IO server travels as a plain handle, so the dispatcher
+  // never depends on Express and no caller-supplied field can reach it.
+  await dispatchVerifiedWebhookEvents(claimed, req?.app?.get('io') ?? null);
 
   return res.status(200).json({
     received: events.length,
@@ -214,20 +240,19 @@ export const receiveWebhook = async (req, res) => {
 
 /**
  * ── DISPATCH SEAM ────────────────────────────────────────────────────────────
- * H5 left this empty. H6 hands the claimed events to the inbound dispatcher,
- * which in H6 routes ONE thing — a verification code from an authority's own
- * number — and ignores everything else. Approve and Reject taps are H7 and are
- * deliberately not routed here.
+ * H5 left this empty. H6 routed verification codes through it, and H7 adds
+ * Approve and Reject taps. This controller still decides nothing: it hands the
+ * claimed events to the dispatcher and stops.
  *
  * It receives only events THIS process claimed, so downstream work runs at
  * most once per event no matter how often Meta re-delivers. It must stay
  * non-throwing: the claim has already committed, and an exception here would
  * turn a handled delivery into a 500 and a pointless retry.
  */
-async function dispatchVerifiedWebhookEvents(claimedEvents /* , req */) {
+async function dispatchVerifiedWebhookEvents(claimedEvents, io) {
   if (!claimedEvents.length) return;
   try {
-    await dispatchInboundWhatsAppEvents(claimedEvents);
+    await dispatchInboundWhatsAppEvents(claimedEvents, { io });
   } catch (err) {
     console.error(`${LOG} dispatch failed: ${err?.message || err}`);
   }

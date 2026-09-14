@@ -44,6 +44,7 @@ import {
   authorityRef,
   newApprovalAuthorityDoc,
   getApprovalAuthorityByIdFirestore,
+  assessAuthorityVerification,
   readApprovalAuthorityInTxn,
   updateApprovalAuthorityDisplayFirestore,
   setApprovalAuthorityActiveFirestore,
@@ -54,6 +55,7 @@ import {
 import {
   newNumberBindingDoc,
   readNumberBindingInTxn,
+  getNumberBindingByNumberFirestore,
   clearedChallengeFields,
   BINDING_STATUS
 } from '../repositories/firestore/whatsappNumberBindingsRepository.js';
@@ -415,6 +417,69 @@ export async function deactivateApprovalAuthority({ authority_id, actor } = {}) 
     display_name: authority.display_name
   }, actor);
   return authority;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SENDER RESOLUTION — the ONE canonical path from a WhatsApp number to an
+// authority that may act. Every inbound caller uses this; there is deliberately
+// no second, subtly different copy of these rules anywhere.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Why a sender cannot act. UNKNOWN_SENDER is answered with silence, never a reply. */
+export const SENDER_RESOLUTION = Object.freeze({
+  UNPARSEABLE_SENDER: 'UNPARSEABLE_SENDER',
+  UNKNOWN_SENDER: 'UNKNOWN_SENDER',
+  BINDING_NOT_VERIFIED: 'BINDING_NOT_VERIFIED',
+  BINDING_INCONSISTENT: 'BINDING_INCONSISTENT',
+  AUTHORITY_INACTIVE: 'AUTHORITY_INACTIVE'
+});
+
+/**
+ * Resolves a Meta-attested sender to the authority that may act as them.
+ *
+ * The chain is: number → whatsapp_number_bindings → authority_id →
+ * inventory_approval_authorities → external, verified, unexpired, active.
+ *
+ * Reuses assessAuthorityVerification, so the 180-day policy and the
+ * revoked/unverified distinctions are defined in exactly one place and cannot
+ * drift between the verification path and the decision path.
+ *
+ * Never throws for an expected outcome, and never reveals to a caller which
+ * numbers exist: an unregistered sender is simply UNKNOWN_SENDER.
+ *
+ * @returns {{ ok: true, authority: object, authority_id: string, sender_e164: string }}
+ *        | {{ ok: false, code: string, authority_id: string|null, sender_e164: string|null }}
+ */
+export async function resolveAuthorityBySender(senderId) {
+  const senderE164 = normalizeSenderToE164(senderId);
+  if (!senderE164) {
+    return { ok: false, code: SENDER_RESOLUTION.UNPARSEABLE_SENDER, authority_id: null, sender_e164: null };
+  }
+
+  const binding = await getNumberBindingByNumberFirestore(senderE164);
+  if (!binding) {
+    return { ok: false, code: SENDER_RESOLUTION.UNKNOWN_SENDER, authority_id: null, sender_e164: senderE164 };
+  }
+  if (binding.status !== BINDING_STATUS.VERIFIED) {
+    return { ok: false, code: SENDER_RESOLUTION.BINDING_NOT_VERIFIED, authority_id: binding.authority_id, sender_e164: senderE164 };
+  }
+
+  const authority = await getApprovalAuthorityByIdFirestore(binding.authority_id);
+  // The binding and the authority must still agree about the number; a
+  // mismatch means a change is half-applied and nothing may act on it.
+  if (!authority || authority.whatsapp_e164 !== senderE164) {
+    return { ok: false, code: SENDER_RESOLUTION.BINDING_INCONSISTENT, authority_id: binding.authority_id, sender_e164: senderE164 };
+  }
+
+  const verdict = assessAuthorityVerification(authority);
+  if (!verdict.ok) {
+    return { ok: false, code: verdict.code, authority_id: authority.authority_id, sender_e164: senderE164 };
+  }
+  if (authority.is_active !== true) {
+    return { ok: false, code: SENDER_RESOLUTION.AUTHORITY_INACTIVE, authority_id: authority.authority_id, sender_e164: senderE164 };
+  }
+
+  return { ok: true, authority, authority_id: authority.authority_id, sender_e164: senderE164 };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

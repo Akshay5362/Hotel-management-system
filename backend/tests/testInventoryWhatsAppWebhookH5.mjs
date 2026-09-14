@@ -86,9 +86,12 @@ ok('  the feature flag is checked before the signature', iFlag > -1 && iFlag < i
 ok('  events are claimed AFTER parsing and BEFORE dispatch', iParse < iClaim && iClaim < iDispatch);
 ok('  a non-Buffer body is refused rather than coerced', /if \(!Buffer\.isBuffer\(rawBody\)\)/.test(CTRL_CODE));
 ok('4. the dispatch seam exists', /async function dispatchVerifiedWebhookEvents/.test(CTRL_CODE));
-ok('  it hands off to the H6 inbound dispatcher and nothing else (H6)',
-  /dispatchInboundWhatsAppEvents\(claimedEvents\)/.test(CTRL_CODE) &&
+ok('  it hands off to the inbound dispatcher and decides nothing itself',
+  /dispatchInboundWhatsAppEvents\(claimedEvents, \{ io \}\)/.test(CTRL_CODE) &&
   !/decideWithApprovalActionToken|beginTokenRejection|completeTokenRejection/.test(CTRL_CODE));
+ok('  it passes ONLY the Socket.IO handle downstream, never the request (H7)',
+  /dispatchVerifiedWebhookEvents\(claimed, req\?\.app\?\.get\('io'\) \?\? null\)/.test(CTRL_CODE) &&
+  /async function dispatchVerifiedWebhookEvents\(claimedEvents, io\)/.test(CTRL_CODE));
 ok('  the sender it carries is the one Meta attested inside the signed body (H6)',
   /sender_id: message\.from \? String\(message\.from\) : null/.test(CTRL_CODE));
 ok('  no approval logic leaked into H5',

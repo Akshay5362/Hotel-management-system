@@ -171,8 +171,10 @@ ok('  still exactly one decision transaction in the approval service', (SVC.matc
 console.log('\n  -- WEBHOOK --');
 ok('51. the sender comes from the signed Meta payload only', /sender_id: message\.from \? String\(message\.from\) : null/.test(WCTRL));
 ok('52. nothing on the inbound path reads a caller-supplied sender', !/req\.|res\.|body\.sender|query\./.test(DISPATCH) && !/\bsender\b[^_]/.test(WCTRL.replace(/sender_id/g, '')));
-ok('53/54. the dispatcher routes no approval or rejection',
-  !/APPROVE|REJECT|decideWithApprovalActionToken|beginTokenRejection|completeTokenRejection|inventoryApprovalActionsRepository|purchaseRequestApprovalService/.test(DISPATCH));
+// H7 gave the dispatcher a second specialist. What must stay true is that the
+// dispatcher itself still decides nothing: it delegates and records an outcome.
+ok('53/54. the dispatcher never decides; it delegates and owns no approval logic',
+  !/decideWithApprovalActionToken|beginTokenRejection|completeTokenRejection|inventoryApprovalActionsRepository|purchaseRequestApprovalService|purchase_requests|txn\./.test(DISPATCH));
 ok('55. unknown messages are ignored, not errors', /IGNORED_NOT_A_MESSAGE/.test(DISPATCH) && /IGNORED_NOT_TEXT/.test(DISPATCH) && /IGNORED_NO_SENDER/.test(DISPATCH));
 ok('  the dispatcher never logs a sender or a body', !/console\.[a-z]+\([^)]*(sender|text|body)/.test(DISPATCH));
 ok('  H5 preserved: verify before parse, raw body, claim before dispatch',
@@ -495,8 +497,10 @@ try {
   const T_rej2 = await mint(PR2, 'REJECT', A.authority_id);
   await sendText(digits(NUM_A), 'APPROVE'); writes++;
   ok('53. an "APPROVE" text from a verified authority is not routed anywhere', lastOutcome().includes('IGNORED_NOT_A_CODE'));
+  // A control whose payload is not an H7 action: recognised as not-an-action,
+  // and critically it consumes nothing, so the token below is still usable.
   await sendMessage(digits(NUM_A), { type: 'button', button: { payload: `hpms:REJECT:${T_rej2.raw_token}`, text: 'Reject' } }); writes++;
-  ok('54. a button tap is not routed anywhere in H6', lastOutcome().includes('IGNORED_NOT_TEXT'));
+  ok('54. a control carrying a foreign payload decides nothing', lastOutcome().includes('NOT_AN_ACTION'));
   ok('  and no token was consumed by either', (await tokenDoc(T_rej2.token_hash)).consumed_at === null && (await tokenDoc(T_app2.token_hash)).consumed_at === null);
   const intent = await svc.beginTokenRejection({ raw_token: T_rej2.raw_token, decided_by_uid: A.authority_id }); writes++; cleanup.tokens.push(hashToken(intent.raw_token)); secrets.add(intent.raw_token);
   ok('43. an external authority can begin an H4 rejection', /^[A-Za-z0-9_-]{43}$/.test(intent.raw_token) && intent.reason_codes.includes('BUDGET_UNAVAILABLE'));
