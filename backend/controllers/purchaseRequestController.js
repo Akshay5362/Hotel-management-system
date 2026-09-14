@@ -61,6 +61,24 @@ async function emitPurchaseRequestSubmitted(req, request) {
   }
 }
 
+/**
+ * Phase H8-C — announces a just-submitted request to every eligible WhatsApp
+ * approval authority.
+ *
+ * Post-commit and guarded by the same replay check as the event above, so a
+ * retried submit never produces a second notification. Wrapped here as well as
+ * inside the service: a notification must never break the request workflow, and
+ * the response the caller already earned must not depend on WhatsApp.
+ */
+async function notifyAuthoritiesOfSubmittedRequest(req, request) {
+  try {
+    const { notifyAuthoritiesOfPurchaseRequest } = await import('../services/whatsappNotificationService.js');
+    await notifyAuthoritiesOfPurchaseRequest({ request, io: req.app.get('io') });
+  } catch (err) {
+    console.warn(`[PurchaseRequest] WhatsApp notification failed: ${err.message}`);
+  }
+}
+
 /** Phase D — decision event, used by clients to retire the pending notification. */
 function emitPurchaseRequestDecided(req, request, actor) {
   try {
@@ -192,6 +210,13 @@ export const submitPurchaseRequest = async (req, res) => {
     // Emitted only after the transaction committed, and never for an
     // idempotent replay (which would re-notify for an already-pending request).
     if (!result.duplicate) await emitPurchaseRequestSubmitted(req, result.request);
+    // H8-C — the same post-commit moment, under the same replay guard. The call
+    // IS awaited, so the fan-out finishes before the response is written and the
+    // ordering stays deterministic. What makes that safe is isolation rather
+    // than timing: the wrapper catches everything and the service itself never
+    // throws, so a WhatsApp failure cannot turn an already-committed submission
+    // into an error response, and cannot roll anything back.
+    if (!result.duplicate) await notifyAuthoritiesOfSubmittedRequest(req, result.request);
     return res.status(result.duplicate ? 200 : 201).json({
       message: result.duplicate
         ? 'Purchase request was already submitted (idempotent replay).'

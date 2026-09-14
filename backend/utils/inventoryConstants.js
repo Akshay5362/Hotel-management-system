@@ -338,6 +338,22 @@ export const PR_EVENTS = Object.freeze({
   DECIDED:   'inventory:purchase_request_decided'
 });
 
+/**
+ * Phase H8-C — transport-only events for the WhatsApp notification fan-out.
+ *
+ * Deliberately separate from PR_EVENTS: these say something about a MESSAGE,
+ * never about a purchase request. A failed notification means the message did
+ * not arrive, not that the request was refused, and nothing here ever stands in
+ * for DECIDED. They are display hints carrying no phone number and no secret,
+ * and they grant nothing — the Staff Portal still authorises every call
+ * server-side.
+ */
+export const PR_WHATSAPP_EVENTS = Object.freeze({
+  QUEUED: 'inventory:purchase_request_whatsapp_queued',
+  STATUS: 'inventory:purchase_request_whatsapp_status',
+  FAILED: 'inventory:purchase_request_whatsapp_failed'
+});
+
 // ── Purchase orders (Phase E) ────────────────────────────────────────────────
 //
 //  A PURCHASE ORDER is the formal document sent to ONE supplier, created from

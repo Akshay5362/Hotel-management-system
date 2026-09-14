@@ -145,7 +145,17 @@ ok('  the rejection-reason rule still stands', /MIN_REJECTION_REASON_LENGTH/.tes
 ok('  the approval service never consults a WhatsApp number or verification timestamp',
   !/whatsapp_e164|whatsapp_verified_at|whatsapp_verification_method|WhatsAppNumber/.test(codeOnly(APPROVAL)));
 ok('  nor does the approval config repository', !/whatsapp/i.test(CONFIG_REPO));
-ok('  nor the purchase request controller', !/approval_authorities|whatsapp/i.test(src('backend', 'controllers', 'purchaseRequestController.js')));
+// NARROWED in H8-C, not dropped. This used to reject the bare word "whatsapp"
+// anywhere in the controller, which held only while the controller had no
+// WhatsApp involvement at all. H8-C legitimately calls the notification service
+// from the post-commit path. The property this clause actually stands for is
+// unchanged and is now stated directly: the controller must never touch
+// WhatsApp IDENTITY or VERIFICATION data, because that is what authorising an
+// approver on WhatsApp evidence would look like. The forbidden terms mirror the
+// approval-service clause two lines above, with the verification names widened
+// from the exact fields to their prefixes so a new variant cannot slip past.
+ok('  nor the purchase request controller',
+  !/approval_authorities|whatsapp_e164|whatsapp_verified|whatsapp_verification|WhatsAppNumber/i.test(src('backend', 'controllers', 'purchaseRequestController.js')));
 
 // ── no Meta ─────────────────────────────────────────────────────────────────
 console.log('\n  -- no outbound WhatsApp integration --');
@@ -175,6 +185,12 @@ if (PROJECT !== 'sky5-development') { console.error(`[SAFETY_ABORT] project is "
 if (/hpms/i.test(String(PROJECT))) { console.error('[SAFETY_ABORT] project contains "hpms".'); process.exit(1); }
 console.log(`  [GUARD] project=${PROJECT} (DEV)\n`);
 
+// Phase 1B — a Firestore-backed suite runs against the local emulator only.
+// Placed before the FIRST import that can reach firebaseAdmin.js, which
+// initialises the Admin SDK at import time. This ADDS to the guard above;
+// every existing check still runs and none is relaxed.
+const { requireEmulatorOrExit } = await import('./helpers/firestoreEmulator.mjs');
+await requireEmulatorOrExit();
 const repo = await import('../repositories/firestore/inventoryApprovalAuthoritiesRepository.js');
 const service = await import('../services/whatsappAuthorityVerificationService.js');
 const { db } = await import('../config/firebaseAdmin.js');
