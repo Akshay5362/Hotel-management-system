@@ -30,6 +30,8 @@ import {
 } from '../repositories/firestore/whatsappWebhookEventsRepository.js';
 import { redeemVerificationFromSender } from './whatsappAuthorityVerificationService.js';
 import { routeWhatsAppAction } from './whatsappDecisionRouter.js';
+import { looksLikeActionPayload } from '../utils/whatsappActionPayload.js';
+import { handleReviewTap, isReviewTap } from './whatsappReviewBridgeService.js';
 
 const LOG = '[WhatsAppInbound]';
 
@@ -44,6 +46,20 @@ async function handleOne(event, { io }) {
   if (!event.sender_id) return 'IGNORED_NO_SENDER';
 
   if (event.action_payload) {
+    // H8-D — a tap on the H8-C notification button. A template quick reply
+    // carries no developer payload, so it arrives as its own label and is NOT
+    // an H7 action. It is recognised here, before the router, and handed to the
+    // bridge; H7's grammar and router are untouched by this path.
+    if (!looksLikeActionPayload(event.action_payload) && isReviewTap(event.action_payload)) {
+      const outcome = await handleReviewTap({
+        sender_id: event.sender_id,
+        payload: event.action_payload,
+        context_id: event.context_id,
+        meta_message_id: event.meta_message_id
+      });
+      return `REVIEW_${outcome}`;
+    }
+
     const outcome = await routeWhatsAppAction({
       sender_id: event.sender_id,
       payload: event.action_payload,

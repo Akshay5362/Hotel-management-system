@@ -143,7 +143,15 @@ export function extractWebhookEvents(payload) {
           // quick reply as `button` and an in-window control as `interactive`,
           // whose reply is either a button_reply or a list_reply. All three are
           // read here and nowhere else, capped like the text, and never logged.
-          action_payload: extractActionPayload(message, messageType)
+          action_payload: extractActionPayload(message, messageType),
+          // H8-D — the id of the message whose button was tapped. A template
+          // quick reply returns only its own label, so this is the ONLY thing
+          // that says which notification the tap belongs to. It is an opaque
+          // provider id: it names no authority and grants nothing on its own,
+          // and the sender is still the one Meta attested.
+          context_id: typeof message?.context?.id === 'string'
+            ? message.context.id.slice(0, MAX_TEXT_LENGTH)
+            : null
         });
       }
 

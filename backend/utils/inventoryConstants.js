@@ -354,6 +354,33 @@ export const PR_WHATSAPP_EVENTS = Object.freeze({
   FAILED: 'inventory:purchase_request_whatsapp_failed'
 });
 
+// ── The Review bridge (Phase H8-D) ───────────────────────────────────────────
+
+/**
+ * The quick-reply label on the H8-C notification template.
+ *
+ * A template quick reply carries no developer payload: the tap returns the
+ * label itself. So this string IS the wire signal, and it must match the label
+ * approved at Meta exactly. It identifies nothing on its own — the request and
+ * the authority come from the correlation record and the attested sender.
+ */
+export const WHATSAPP_REVIEW_BUTTON_LABEL = 'Review Request';
+
+/**
+ * How long a decision token minted at Review stays usable. Short by intent: an
+ * authority who has just tapped Review is deciding now, and a later tap mints a
+ * fresh pair anyway. Well inside Meta's 24-hour service window, so a token can
+ * never outlive the conversation it belongs to.
+ */
+export const PR_DECISION_TOKEN_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * How many times one notification may be turned into a decision prompt. Bounds
+ * token minting from repeated taps without ever leaving a stale token usable,
+ * because each mint invalidates the previous pair first.
+ */
+export const WHATSAPP_REVIEW_MAX_MINTS = 5;
+
 // ── Purchase orders (Phase E) ────────────────────────────────────────────────
 //
 //  A PURCHASE ORDER is the formal document sent to ONE supplier, created from
