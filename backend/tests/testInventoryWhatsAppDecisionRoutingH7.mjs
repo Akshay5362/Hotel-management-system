@@ -145,8 +145,13 @@ console.log('\n  -- the reply transport --');
 const transport = await import('../services/whatsappOutboundClient.js');
 ok('A11. it is pure transport: no Firestore, no approval logic',
   !/firestore|firebaseAdmin|purchaseRequest|ApprovalService/i.test(CLIENT));
-ok('  it sends no templates and owns no message collection (H8 scope)',
-  !/template|whatsapp_messages/i.test(CLIENT));
+// NARROWED in H8-B, not dropped. This required that the transport had no
+// template capability at all, which held only until H8-B legitimately gave it
+// one. What H7 still guarantees is the boundary the clause stood for: the
+// transport owns no correlation record, so it cannot claim, record or read
+// back a dispatch, and H7 therefore still persists nothing of its own.
+ok('  the transport owns no message collection: it records nothing and reads nothing back',
+  !/whatsapp_messages|claimDispatch|recordProviderMessageId|updateDeliveryStatus|listDispatches/i.test(CLIENT));
 const unconfigured = transport.createWhatsAppReplyClient({ apiVersion: '', phoneNumberId: '', accessToken: '' });
 const unconfiguredResult = await unconfigured.sendText('919999999999', 'hello');
 ok('A12. with no credentials it is a no-op and never throws',
@@ -208,8 +213,21 @@ ok('  and every whatsapp_* collection is still deny-all to clients',
   })());
 ok('  H7 adds no route: the public surface is still the two H5 paths',
   (codeOnly(src('backend', 'routes', 'whatsappRoutes.js')).match(/router\.(get|post)\(/g) || []).length === 2);
-ok('  no submit-time minting, no authority picker, no template (H8 scope)',
-  !/submitPurchaseRequest|authority_picker|sendTemplate/.test(H7_CODE));
+// SPLIT in H8-B. This was one assertion bundling three separate promises, and
+// only the third was affected when H8-B gave the SHARED transport a template
+// capability. Splitting them keeps each promise independently visible, and
+// stops a legitimate change in one from masking a regression in another.
+//
+// The first two are unchanged in strength and still cover every H7 file. The
+// third is re-scoped to H7's OWN logic — the shared transport may now send a
+// template, but no H7 routing or dispatch code may call it — and it now also
+// covers the interactive-button send, which the original clause could not.
+ok('  H7 has no submit hook: it never reaches purchase-request submission',
+  !/submitPurchaseRequest|emitPurchaseRequestSubmitted/.test(H7_CODE));
+ok('  H7 selects no recipient: no authority picker and no fan-out',
+  !/authority_picker|listApprovalAuthorities|isAuthorityDecisionEligible|fanOut|fan_out/i.test(H7_CODE));
+ok('  H7 routing and dispatch send nothing business-initiated',
+  !/sendTemplateMessage|sendInteractiveButtonsMessage/.test(PAYLOAD_SRC + ROUTER + DISPATCH));
 
 // ═══════════════════════════════════════════════════════════════════════════
 if (process.env.HPMS_ENV !== 'development') {
@@ -230,6 +248,12 @@ const PROJECT = process.env.FIREBASE_PROJECT_ID;
 if (PROJECT !== 'sky5-development') { console.error(`[SAFETY_ABORT] project is "${PROJECT}".`); process.exit(1); }
 if (/hpms/i.test(String(PROJECT))) { console.error('[SAFETY_ABORT] project contains "hpms".'); process.exit(1); }
 
+// Phase 1B — a Firestore-backed suite runs against the local emulator only.
+// Placed before the FIRST import that can reach firebaseAdmin.js, which
+// initialises the Admin SDK at import time. This ADDS to the guard above;
+// every existing check still runs and none is relaxed.
+const { requireEmulatorOrExit } = await import('./helpers/firestoreEmulator.mjs');
+await requireEmulatorOrExit();
 const { db } = await import('../config/firebaseAdmin.js');
 const liveProject = db?._settings?.projectId || PROJECT;
 if (liveProject !== 'sky5-development') { console.error(`[SAFETY_ABORT] live handle "${liveProject}".`); process.exit(1); }

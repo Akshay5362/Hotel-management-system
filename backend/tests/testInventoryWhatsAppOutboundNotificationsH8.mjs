@@ -130,12 +130,20 @@ ok('A7. no fan-out, no template send, no bridge, no inbound routing in H8-A',
 const CTRL = codeOnly(src('backend', 'controllers', 'purchaseRequestController.js'));
 ok('  the submit controller is untouched by H8-A',
   !/whatsappMessages|claimDispatch|whatsapp_messages/i.test(CTRL));
-const CLIENT = codeOnly(src('backend', 'services', 'whatsappOutboundClient.js'));
-ok('  the reply transport still sends no template (that is H8-B)',
-  !/sendTemplate/.test(CLIENT));
-const FLAGS = src('backend', 'config', 'featureFlags.js');
-ok('  no outbound feature flag exists yet (that is H8-B)',
-  !/ENABLE_WHATSAPP_OUTBOUND/.test(FLAGS));
+// NARROWED in H8-B, not dropped. This used to require that the SHARED transport
+// had no template capability, which held only until H8-B legitimately gave it
+// one. That was never H8-A's boundary to police. H8-A's own boundary is
+// asserted directly instead, and more strictly than the original: the
+// correlation repository is persistence, and carries no transport whatsoever —
+// no send method, no HTTP, no provider envelope, no credential header, and no
+// import of the client that owns those things.
+ok('  the correlation repository implements no transport and sends nothing',
+  !/sendTemplateMessage|sendInteractiveButtonsMessage|sendText|sendReasonList/.test(REPO) &&
+  !/fetch\(|axios|graph\.facebook|messaging_product|authorization|Bearer/i.test(REPO) &&
+  !/whatsappOutboundClient|createWhatsAppReplyClient/.test(REPO));
+// The assertion that ENABLE_WHATSAPP_OUTBOUND must not exist was removed here:
+// H8-B introduced that flag legitimately, and its default-off behaviour is
+// asserted by the H8-B transport suite, which owns it.
 
 // ── constants ───────────────────────────────────────────────────────────────
 console.log('\n  -- constants --');
@@ -175,6 +183,12 @@ const PROJECT = process.env.FIREBASE_PROJECT_ID;
 if (PROJECT !== 'sky5-development') { console.error(`[SAFETY_ABORT] project is "${PROJECT}".`); process.exit(1); }
 if (/hpms/i.test(String(PROJECT))) { console.error('[SAFETY_ABORT] project contains "hpms".'); process.exit(1); }
 
+// Phase 1B — a Firestore-backed suite runs against the local emulator only.
+// Placed before the FIRST import that can reach firebaseAdmin.js, which
+// initialises the Admin SDK at import time. This ADDS to the guard above;
+// every existing check still runs and none is relaxed.
+const { requireEmulatorOrExit } = await import('./helpers/firestoreEmulator.mjs');
+await requireEmulatorOrExit();
 const { db } = await import('../config/firebaseAdmin.js');
 const liveProject = db?._settings?.projectId || PROJECT;
 if (liveProject !== 'sky5-development') { console.error(`[SAFETY_ABORT] live handle "${liveProject}".`); process.exit(1); }

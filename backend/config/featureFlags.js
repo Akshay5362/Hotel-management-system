@@ -33,6 +33,24 @@ export const isWhatsAppDecisionsEnabled = () => {
   return process.env.ENABLE_WHATSAPP_DECISIONS === 'true';
 };
 
+/**
+ * Phase H8-B — business-initiated WhatsApp sending. Defaults to FALSE. While
+ * off, no template and no decision prompt leaves the building: the transport
+ * refuses before it builds a request, so no network call is made at all.
+ *
+ * It governs ONLY messages we start. A reply to somebody who has just tapped a
+ * button is not business-initiated and is not gated here — switching outbound
+ * off must never leave an authority mid-conversation with silence. That path
+ * stays under ENABLE_WHATSAPP_DECISIONS.
+ *
+ * Deliberately independent of the webhook flag, so notifications can be stopped
+ * without closing the inbound channel, and inbound can be proven before
+ * anything is ever sent.
+ */
+export const isWhatsAppOutboundEnabled = () => {
+  return process.env.ENABLE_WHATSAPP_OUTBOUND === 'true';
+};
+
 export const isFirestoreReadsEnabled = () => {
   return process.env.ENABLE_FIRESTORE_READS === 'true';
 };
