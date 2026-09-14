@@ -1,17 +1,23 @@
 /**
  * backend/tests/testInventoryApprovalAuthoritiesH1.mjs
  * ─────────────────────────────────────────────────────────────────────────────
- * Phase H1 — inventory_approval_authorities.
+ * Phase H1 — inventory_approval_authorities — re-keyed in Phase H6.
+ *
+ * An approval authority is now an EXTERNAL identity: a server-generated
+ * authority_id, a WhatsApp number proven by possession, no login of any kind.
+ * This suite keeps every H1 invariant that still holds (masking, deny-all
+ * rules, no role stored, MANAGE-only management, the approval engine's own
+ * rules) and replaces the ones the model changed (uid keying, the staff
+ * requirement) with their H6 counterparts. Verification itself is proven by
+ * the H6 suite.
  *
  * PART A — STATIC / LOGIC. Touches no Firestore and imports no Firebase module.
  *   Pure functions are LIFTED OUT OF SOURCE at run time and executed against
- *   doubles, so a regression in the real file still turns this red while the
- *   test itself stays runnable when the DEV quota is gone.
+ *   doubles, so a regression in the real file still turns this red.
  *
- * PART B — DEV Firestore, behind the same four-layer guard every inventory test
- *   uses. Creates at most one throwaway authority record and removes it again.
- *   Skipped unless HPMS_ENV=development, and it aborts rather than degrades if
- *   the resolved project is anything but sky5-development.
+ * PART B — DEV Firestore, behind the four-layer guard. Registers one
+ *   throwaway authority through the service, exercises the activation invariant
+ *   and the list, and removes everything it made.
  *
  * Never writes production. Never calls Meta. Never sends a message.
  *
@@ -34,6 +40,7 @@ const ok = (l, c, d = '') => {
 };
 const CRLF = new RegExp(String.fromCharCode(13) + String.fromCharCode(10), 'g');
 const src = (...p) => fs.readFileSync(path.join(ROOT, ...p), 'utf8').replace(CRLF, '\n');
+const codeOnly = (t) => t.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
 
 /** Lifts a named function body out of source and evaluates it standalone. */
 function lift(source, name, extraPrelude = '') {
@@ -50,10 +57,13 @@ function lift(source, name, extraPrelude = '') {
 }
 
 const REPO = src('backend', 'repositories', 'firestore', 'inventoryApprovalAuthoritiesRepository.js');
+const REPO_CODE = codeOnly(REPO);
 const CTRL = src('backend', 'controllers', 'inventoryApprovalAuthoritiesController.js');
+const CTRL_CODE = codeOnly(CTRL);
 const ROUTES = src('backend', 'routes', 'inventoryRoutes.js');
 const RULES = src('firestore.rules');
 const CONFIG_REPO = src('backend', 'repositories', 'firestore', 'inventoryApprovalConfigRepository.js');
+const SERVICE = codeOnly(src('backend', 'services', 'whatsappAuthorityVerificationService.js'));
 
 // A stand-in for the RepositoryError the lifted code throws.
 const PRELUDE = `class RepositoryError extends Error {
@@ -63,116 +73,86 @@ const E164 = ${String(REPO.match(/const E164 = (\/.+\/);/)[1])};`;
 
 console.log('═══ PART A — static / logic (no Firestore) ═══');
 
-// ── 10. keyed by user_uid ───────────────────────────────────────────────────
-console.log('\n  -- identity is the staff uid --');
-const assertUsableUid = lift(REPO, 'assertUsableUid', PRELUDE);
-ok('10. document id is the raw user_uid, no prefix rewriting',
-  assertUsableUid('  abc123  ') === 'abc123');
-ok('  a uid containing "/" is refused (would forge a Firestore path)',
-  (() => { try { assertUsableUid('a/b'); return false; } catch (e) { return e.code === 'VALIDATION_ERROR'; } })());
-ok('  an empty uid is refused',
-  (() => { try { assertUsableUid('   '); return false; } catch (e) { return e.code === 'VALIDATION_ERROR'; } })());
-ok('  "." and ".." are refused',
-  ['.', '..'].every(v => { try { assertUsableUid(v); return false; } catch { return true; } }));
-ok('12. one record per uid is structural — the id IS the uid',
-  /setDoc\(APPROVAL_AUTHORITIES_COLLECTION, docId/.test(REPO) &&
-  /const docId = assertUsableUid\(data\.user_uid\)/.test(REPO));
+// ── identity ────────────────────────────────────────────────────────────────
+console.log('\n  -- identity is a server-generated authority_id (H6) --');
+const assertUsableAuthorityId = lift(REPO, 'assertUsableAuthorityId', PRELUDE);
+ok('10. the document id is the authority_id, trimmed, never rewritten', assertUsableAuthorityId('  aa_abc123  ') === 'aa_abc123');
+ok('  an id containing "/" is refused (would forge a Firestore path)',
+  (() => { try { assertUsableAuthorityId('a/b'); return false; } catch (e) { return e.code === 'VALIDATION_ERROR'; } })());
+ok('  an empty id is refused', (() => { try { assertUsableAuthorityId('   '); return false; } catch (e) { return e.code === 'VALIDATION_ERROR'; } })());
+ok('  "." and ".." are refused', ['.', '..'].every(v => { try { assertUsableAuthorityId(v); return false; } catch { return true; } }));
+ok('  the id is minted from the CSPRNG, never taken from a login', /crypto\.randomBytes\(16\)/.test(REPO_CODE) && !/user_uid|firebaseUser|verifyIdToken/.test(REPO_CODE));
+ok('12. one record per identity is structural — the id IS the document', /txn\.create\(authorityRef\(authority\.authority_id\), authority\)/.test(SERVICE) && !/upsert/i.test(REPO_CODE));
+ok('  the authority type is fixed at creation and never rewritten',
+  /authority_type: APPROVAL_AUTHORITY_TYPES\.EXTERNAL/.test(REPO_CODE) && (REPO_CODE.match(/authority_type:/g) || []).length === 1);
 
-// ── 11. an unverified number is never treated as verified ──────────────────
+// ── a stored number is not a verified number ────────────────────────────────
 console.log('\n  -- a stored number is not a verified number --');
 const normalizeWhatsAppNumber = lift(REPO, 'normalizeWhatsAppNumber', PRELUDE);
-ok('11. H1 never writes whatsapp_verified_at',
-  !/whatsapp_verified_at:\s*(now|new Date)/.test(REPO) &&
-  /whatsapp_verified_at: numberChanged \? null :/.test(REPO));
-ok('  nor whatsapp_verification_method',
-  !/whatsapp_verification_method:\s*'/.test(REPO) &&
-  /whatsapp_verification_method: numberChanged \? null :/.test(REPO));
-ok('  changing the number clears any verification it carried',
-  /const numberChanged = !!existing && existing\.whatsapp_e164 !== whatsapp;/.test(REPO));
+ok('11. the repository never writes VERIFIED — only the verification service may',
+  !/verification_status: APPROVAL_AUTHORITY_VERIFICATION\.VERIFIED/.test(REPO_CODE) &&
+  /verification_status: APPROVAL_AUTHORITY_VERIFICATION\.PENDING_VERIFICATION/.test(REPO_CODE) &&
+  /whatsapp_verified_at: null/.test(REPO_CODE) && /whatsapp_verification_method: null/.test(REPO_CODE));
+ok('  a new authority is inactive until an administrator activates a VERIFIED one', /is_active: false/.test(REPO_CODE));
+ok('  activation is refused unless verification is current', /if \(isActive\) \{\s*\n\s*const verdict = assessAuthorityVerification\(existing\);/.test(REPO_CODE));
 ok('  E.164 accepted', normalizeWhatsAppNumber('+919876543210') === '+919876543210');
 ok('  human punctuation tolerated', normalizeWhatsAppNumber('+91 98765-43210') === '+919876543210');
 ok('  a bare national number is refused, not given a country code',
   (() => { try { normalizeWhatsAppNumber('9876543210'); return false; } catch (e) { return e.code === 'VALIDATION_ERROR'; } })());
 ok('  a leading +0 is refused', (() => { try { normalizeWhatsAppNumber('+0123456789'); return false; } catch { return true; } })());
-ok('  null stays null (a number is optional in H1)', normalizeWhatsAppNumber(null) === null);
+ok('  null stays null', normalizeWhatsAppNumber(null) === null);
 const maskWhatsAppNumber = lift(REPO, 'maskWhatsAppNumber', PRELUDE);
 ok('  masking hides the middle', maskWhatsAppNumber('+919876543210') === '+9198****3210');
 
-// ── 8. role gate, using the REAL roleCanApprove ────────────────────────────
-console.log('\n  -- role eligibility uses the live approval config --');
-const roleCanApprove = lift(CONFIG_REPO, 'roleCanApprove');
-const cfg = { enabled: true, allowed_roles: ['admin', 'super_admin'] };
-ok('8. a non-approver role cannot become an authority',
-  ['receptionist', 'kitchen', 'housekeeper'].every(r => roleCanApprove(cfg, r) === false));
-ok('  an approver role can', roleCanApprove(cfg, 'admin') && roleCanApprove(cfg, 'super_admin'));
-ok('  approvals disabled blocks everyone', roleCanApprove({ ...cfg, enabled: false }, 'admin') === false);
-ok('  the controller calls roleCanApprove rather than storing the role',
-  /roleCanApprove\(config, role\)/.test(CTRL));
-ok('5(a). the role is deliberately NOT copied into the document',
-  !/\brole:/.test(REPO.slice(REPO.indexOf('const payload = {'), REPO.indexOf('await setDoc'))));
+// ── no role, no staff, no login ─────────────────────────────────────────────
+console.log('\n  -- an authority is not a staff member and has no role --');
+ok('8. the controller no longer requires a staff record or an approver role',
+  !/getStaffByUidFirestore|resolveEligibleStaff|roleCanApprove|normalizeUserRole|STAFF_NOT_FOUND|ROLE_NOT_APPROVER/.test(CTRL_CODE));
+ok('5(a). no role is ever stored on the document', !/\brole:/.test(REPO_CODE.slice(REPO_CODE.indexOf('authority_id: generateAuthorityId()'), REPO_CODE.indexOf('created_by: actor_uid'))));
+ok('  the live approval config still decides staff eligibility for the in-app path',
+  (() => { const roleCanApprove = lift(CONFIG_REPO, 'roleCanApprove'); const cfg = { enabled: true, allowed_roles: ['admin', 'super_admin'] };
+    return ['receptionist', 'kitchen', 'housekeeper'].every(r => roleCanApprove(cfg, r) === false) && roleCanApprove(cfg, 'admin') && roleCanApprove({ ...cfg, enabled: false }, 'admin') === false; })());
+ok('  linked_staff_uid is optional and grants nothing (only the self-approval guard reads it)',
+  /linked_staff_uid = null/.test(REPO_CODE) && !/linked_staff_uid[\s\S]{0,80}(role|permission|login)/.test(REPO_CODE));
 
-// ── 7. inactive staff ──────────────────────────────────────────────────────
-console.log('\n  -- staff eligibility --');
-const isStaffActiveSrc = CTRL.slice(CTRL.indexOf('function isStaffActive'));
-const isStaffActive = new Function(`${isStaffActiveSrc.slice(0, isStaffActiveSrc.indexOf('\n}') + 2)}\nreturn isStaffActive;`)();
-ok('7. inactive staff rejected (is_active false)', isStaffActive({ is_active: false }) === false);
-ok('  soft-deleted staff rejected', isStaffActive({ deleted: true }) === false);
-ok('  status Inactive/Disabled/Deleted rejected',
-  ['Inactive', 'Disabled', 'Deleted'].every(s => isStaffActive({ status: s }) === false));
-ok('  an active staff record passes', isStaffActive({ is_active: true, status: 'Active' }) === true);
-ok('6. a missing staff record is refused', /STAFF_NOT_FOUND/.test(CTRL));
-ok('  staff without a linked user_uid is refused', /STAFF_UID_MISSING/.test(CTRL));
-
-// ── 9. RBAC: normal staff cannot manage authorities ────────────────────────
+// ── RBAC ────────────────────────────────────────────────────────────────────
 console.log('\n  -- only administrators may manage authorities --');
 const authorityRoutes = ROUTES.split('\n').filter(l => l.includes("'/approval-authorities"));
-ok('9. all 5 authority routes exist', authorityRoutes.length === 5, `${authorityRoutes.length} route(s)`);
+ok('9. all 9 management routes exist', authorityRoutes.length === 9, `${authorityRoutes.length} route(s)`);
 ok('  every one is gated by MANAGE', authorityRoutes.every(l => /,\s*MANAGE,/.test(l)));
-ok('  MANAGE is admin + super_admin only',
-  /MANAGE:\s*Object\.freeze\(\['admin', 'super_admin'\]\)/.test(src('backend', 'utils', 'inventoryConstants.js')));
-ok('  so receptionist / kitchen / housekeeper cannot reach any of them',
-  !authorityRoutes.some(l => /VIEW|REQUEST|MOVE|RECEIVE/.test(l)));
-ok('7(b). there is no self-registration route', !/approval-authorities\/me|self-register/.test(ROUTES));
+ok('  MANAGE is admin + super_admin only', /MANAGE:\s*Object\.freeze\(\['admin', 'super_admin'\]\)/.test(src('backend', 'utils', 'inventoryConstants.js')));
+ok('  so receptionist / kitchen / housekeeper cannot reach any of them', !authorityRoutes.some(l => /VIEW|REQUEST|MOVE|RECEIVE/.test(l)));
+ok('7(b). there is no self-service route — the authority never logs in', !/approval-authorities\/me|self-register|self-verify/.test(ROUTES));
 
-// ── Firestore rules ────────────────────────────────────────────────────────
+// ── Firestore rules ─────────────────────────────────────────────────────────
 console.log('\n  -- the collection is server-only --');
 const ruleBlock = RULES.slice(RULES.indexOf('match /inventory_approval_authorities/'));
-ok('rules deny BOTH read and write to clients',
-  /match \/inventory_approval_authorities\/\{authorityId\} \{\s*\n\s*allow read, write: if false;/.test(ruleBlock));
-ok('  no existing inventory rule was widened',
-  (RULES.match(/allow write: if false;/g) || []).length >= 16);
+ok('rules deny BOTH read and write to clients', /match \/inventory_approval_authorities\/\{authorityId\} \{\s*\n\s*allow read, write: if false;/.test(ruleBlock));
+ok('  no existing inventory rule was widened', (RULES.match(/allow write: if false;/g) || []).length >= 16);
 
-// ── 13. the approval engine is untouched ───────────────────────────────────
-console.log('\n  -- the existing approval engine is unchanged --');
+// ── the approval engine's own rules ─────────────────────────────────────────
+console.log('\n  -- the existing approval engine keeps its rules --');
 const APPROVAL = src('backend', 'services', 'purchaseRequestApprovalService.js');
-ok('13. self-approval block still present, twice',
-  (APPROVAL.match(/PURCHASE_REQUEST_SELF_APPROVAL_FORBIDDEN/g) || []).length === 2);
-ok('  the decision is still one Firestore transaction',
-  /await db\.runTransaction\(async \(txn\) => \{/.test(APPROVAL));
-ok('  first-valid-decision-wins still enforced',
-  /current\.status !== PR_STATUS\.PENDING_APPROVAL/.test(APPROVAL));
+// Three guards: the preflight, the in-transaction re-check, and H6's external
+// guard that also compares the linked staff uid.
+ok('13. self-approval is blocked in the preflight, in the transaction, and for external authorities',
+  (APPROVAL.match(/PURCHASE_REQUEST_SELF_APPROVAL_FORBIDDEN/g) || []).length === 3);
+ok('  the decision is still one Firestore transaction', /await db\.runTransaction\(async \(txn\) => \{/.test(APPROVAL));
+ok('  first-valid-decision-wins still enforced', /current\.status !== PR_STATUS\.PENDING_APPROVAL/.test(APPROVAL));
 ok('  idempotent replay for the same approver still present', /alreadyMine/.test(APPROVAL));
 ok('  a second approver is still refused', /APPROVER_ALREADY_ACTED/.test(APPROVAL));
 ok('  the rejection-reason rule still stands', /MIN_REJECTION_REASON_LENGTH/.test(APPROVAL));
-// H3 wires the authority record into the engine, so "no reference at all" is
-// no longer the invariant. What must stay true: the engine never treats a
-// WhatsApp number or its verification state as authorization. Comments are
-// stripped first so documentation naming WhatsApp cannot trip this.
-ok('  the approval service never consults a WhatsApp number or verification state',
-  !/whatsapp_e164|whatsapp_verified_at|whatsapp_verification_method|WhatsAppNumber/.test(
-    APPROVAL.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')));
-ok('  nor to the approval config repository', !/whatsapp/i.test(CONFIG_REPO));
-ok('  nor to the purchase request controller',
-  !/approval_authorities|whatsapp/i.test(src('backend', 'controllers', 'purchaseRequestController.js')));
+ok('  the approval service never consults a WhatsApp number or verification timestamp',
+  !/whatsapp_e164|whatsapp_verified_at|whatsapp_verification_method|WhatsAppNumber/.test(codeOnly(APPROVAL)));
+ok('  nor does the approval config repository', !/whatsapp/i.test(CONFIG_REPO));
+ok('  nor the purchase request controller', !/approval_authorities|whatsapp/i.test(src('backend', 'controllers', 'purchaseRequestController.js')));
 
-// ── No WhatsApp yet ────────────────────────────────────────────────────────
-console.log('\n  -- H1 contains no WhatsApp integration --');
-for (const [label, body] of [['repository', REPO], ['controller', CTRL]]) {
-  ok(`  ${label} calls no Meta/WhatsApp API`,
-    !/graph\.facebook|fetch\(|axios|Bearer |access_token/i.test(body));
+// ── no Meta ─────────────────────────────────────────────────────────────────
+console.log('\n  -- no outbound WhatsApp integration --');
+for (const [label, body] of [['repository', REPO_CODE], ['controller', CTRL_CODE], ['verification service', SERVICE]]) {
+  ok(`  ${label} calls no Meta/WhatsApp API`, !/graph\.facebook|fetch\(|axios|Bearer |access_token/i.test(body));
 }
-ok('  no webhook route was added', !/webhook/i.test(ROUTES));
-ok('  no token/HMAC machinery was added', !/hmac|createHmac|sha256/i.test(REPO + CTRL));
+ok('  no webhook route lives in the inventory router', !/webhook/i.test(ROUTES));
 
 // ═══════════════════════════════════════════════════════════════════════════
 if (process.env.HPMS_ENV !== 'development') {
@@ -196,57 +176,38 @@ if (/hpms/i.test(String(PROJECT))) { console.error('[SAFETY_ABORT] project conta
 console.log(`  [GUARD] project=${PROJECT} (DEV)\n`);
 
 const repo = await import('../repositories/firestore/inventoryApprovalAuthoritiesRepository.js');
+const service = await import('../services/whatsappAuthorityVerificationService.js');
 const { db } = await import('../config/firebaseAdmin.js');
+const { FieldPath } = await import('firebase-admin/firestore');
 
-const TEST_UID = `h1test_${Date.now()}`;
-let created = false;
+const TS = Date.now();
+const NUMBER = `+9195${String(TS).slice(-8)}`;
+const ACTOR = { uid: `h1test_admin_${TS}`, name: 'H1 Admin', role: 'admin' };
+let authorityId = null;
 try {
-  // 1 + 10
-  const a = await repo.upsertApprovalAuthorityFirestore({
-    user_uid: TEST_UID, display_name: 'H1 Test Authority',
-    whatsapp_e164: '+919876543210', actor_uid: 'h1_test'
-  });
-  created = true;
-  ok('1. authority created', a.created === true);
-  ok('10. stored under the raw uid', a.authority.user_uid === TEST_UID);
-  ok('11. stored but NOT verified',
-    a.authority.whatsapp_e164 === '+919876543210' &&
-    a.authority.whatsapp_verified_at === null &&
-    a.authority.whatsapp_verification_method === null);
-
-  // 2 + 12
-  const b = await repo.upsertApprovalAuthorityFirestore({
-    user_uid: TEST_UID, display_name: 'H1 Test Authority', actor_uid: 'h1_test'
-  });
-  ok('2. repeat upsert is idempotent, not a second record', b.created === false);
-  ok('  created_at was preserved', b.authority.created_at === a.authority.created_at);
-  ok('  omitting the number left it alone', b.authority.whatsapp_e164 === '+919876543210');
-
-  // 3
-  const c = await repo.upsertApprovalAuthorityFirestore({
-    user_uid: TEST_UID, display_name: 'H1 Renamed', actor_uid: 'h1_test'
-  });
-  ok('3. authority updated in place', c.authority.display_name === 'H1 Renamed' && c.created === false);
-
-  // 4 + 5
-  await repo.setApprovalAuthorityActiveFirestore(TEST_UID, false, 'h1_test');
-  const after = await repo.getApprovalAuthorityByUidFirestore(TEST_UID);
-  ok('4. authority deactivated', after.is_active === false);
-  ok('  the record still exists (soft, not deleted)', !!after);
+  const { authority: a } = await service.registerApprovalAuthority({ display_name: 'H1 Test Authority', whatsapp_e164: NUMBER, actor: ACTOR });
+  authorityId = a.authority_id;
+  ok('1. authority created with a server-generated id', /^aa_[0-9a-f]{32}$/.test(a.authority_id));
+  ok('10. stored under that id', (await repo.getApprovalAuthorityByIdFirestore(a.authority_id))?.authority_id === a.authority_id);
+  ok('11. stored but NOT verified, and inactive', a.whatsapp_e164 === NUMBER && a.verification_status === 'PENDING_VERIFICATION' && a.whatsapp_verified_at === null && a.is_active === false);
+  ok('2. registering the same number again is refused, not duplicated',
+    await service.registerApprovalAuthority({ display_name: 'Dup', whatsapp_e164: NUMBER, actor: ACTOR }).then(() => false).catch(e => e.code === 'NUMBER_ALREADY_BOUND'));
+  const { authority: c } = await service.updateApprovalAuthorityDisplay({ authority_id: authorityId, display_name: 'H1 Renamed', actor: ACTOR });
+  ok('3. display metadata updated in place', c.display_name === 'H1 Renamed' && c.created_at === a.created_at);
+  ok('4. an unverified authority cannot be activated',
+    await service.activateApprovalAuthority({ authority_id: authorityId, actor: ACTOR }).then(() => false).catch(e => e.code === 'AUTHORITY_NOT_VERIFIED'));
   const activeList = await repo.listApprovalAuthoritiesFirestore();
-  ok('5. inactive authority excluded from the active list',
-    !activeList.some(x => x.user_uid === TEST_UID));
+  ok('5. an inactive authority is excluded from the active list', !activeList.some(x => x.authority_id === authorityId));
   const allList = await repo.listApprovalAuthoritiesFirestore({ includeInactive: true });
-  ok('  but present when inactive are included',
-    allList.some(x => x.user_uid === TEST_UID));
-
-  // 12
-  ok('12. exactly one document for this uid',
-    allList.filter(x => x.user_uid === TEST_UID).length === 1);
+  ok('  but present when inactive are included', allList.some(x => x.authority_id === authorityId));
+  ok('12. exactly one document for this identity', allList.filter(x => x.authority_id === authorityId).length === 1);
 } finally {
-  if (created) {
-    await db.collection('inventory_approval_authorities').doc(TEST_UID).delete();
-    console.log(`\n  [CLEANUP] removed the single throwaway record ${TEST_UID}`);
+  if (authorityId) {
+    await db.collection('inventory_approval_authorities').doc(authorityId).delete();
+    await db.collection('whatsapp_number_bindings').doc(`wa_${NUMBER.slice(1)}`).delete();
+    const rows = await db.collection('audit_logs').where(FieldPath.documentId(), '>=', `audit_inv_wa_${authorityId}_`).where(FieldPath.documentId(), '<', `audit_inv_wa_${authorityId}_`).get();
+    for (const d of rows.docs) await d.ref.delete();
+    console.log(`\n  [CLEANUP] removed the throwaway authority, its binding and ${rows.size} audit row(s)`);
   }
 }
 

@@ -32,7 +32,8 @@ import { formatDocSnapshot, RepositoryError } from '../repositories/firestore/fi
 import { normalizeUserRole } from '../controllers/authController.js';
 import { getStaffByUidFirestore } from '../repositories/firestore/staffRepository.js';
 import {
-  getApprovalAuthorityByUidFirestore,
+  getApprovalAuthorityByIdFirestore,
+  assessAuthorityVerification,
   APPROVAL_AUTHORITIES_COLLECTION
 } from '../repositories/firestore/inventoryApprovalAuthoritiesRepository.js';
 import {
@@ -60,7 +61,7 @@ import { createAuditLogFirestore } from '../repositories/firestore/auditLogsRepo
 import {
   PR_STATUS, PR_TRANSITIONS, PR_APPROVAL_ACTIONS, PR_ACTION_TO_STATUS,
   MIN_REJECTION_REASON_LENGTH, PR_TOKEN_PURPOSES, PR_REASON_CAPTURE_TTL_MS,
-  PR_REJECTION_REASON_CODES
+  PR_REJECTION_REASON_CODES, APPROVAL_AUTHORITY_TYPES
 } from '../utils/inventoryConstants.js';
 
 function fail(message, code, status = 400) {
@@ -181,6 +182,8 @@ async function retireOutstandingActions(requestDocId, status) {
  * @param {'APPROVED'|'REJECTED'} action
  * @param {object}  opts
  * @param {object} [opts.hooks]  H3 -- extra factors verified INSIDE the transaction.
+ *   authorize(preflight, actor) H6 -- replaces the preflight assertCanApprove
+ *                              for a principal that is not authorised by role.
  *   afterRead(txn, current)    read phase: runs right after the request is read
  *                              and before any rule can throw, so every txn read
  *                              it performs precedes every write.
@@ -204,7 +207,10 @@ async function decide(requestId, action, { comment, actor, hooks = null, audit_e
   // status check still happens INSIDE the transaction below.
   const preflight = await getPurchaseRequestByIdFirestore(docId);
   if (!preflight) throw fail('Purchase request not found.', 'REQUEST_NOT_FOUND', 404);
-  await assertCanApprove(preflight, actor);
+  // H6 -- a principal may bring its own authorization (an EXTERNAL authority
+  // has no role). The in-app path passes no hooks and runs the original check.
+  if (hooks?.authorize) await hooks.authorize(preflight, actor);
+  else await assertCanApprove(preflight, actor);
 
   const now = new Date().toISOString();
 
@@ -334,6 +340,11 @@ async function decide(requestId, action, { comment, actor, hooks = null, audit_e
 // it passes here from its own verified channel binding -- the registered
 // WhatsApp number resolved through the H1 authority record -- never from a
 // field an external party controls. H3 exposes no HTTP surface of its own.
+//
+// H6: the approver may be an EXTERNAL authority with no HPMS login at all. In
+// that case `decided_by_uid` is the server-issued authority_id, resolved by
+// the channel from the Meta-attested sender, and the principal is built from
+// the authority record alone -- see resolveTokenPrincipal below.
 // =============================================================================
 
 /** Mirrors the H1 controller's predicate; consolidating them is a follow-up. */
@@ -390,6 +401,119 @@ function assertStaffEligible(staff, approverUid) {
   return normalizeUserRole({ ...staff, type: 'staff' });
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// H6 — WHO IS DECIDING
+//
+// Two explicit principal paths, chosen by the authority record's STORED
+// authority_type and by nothing else:
+//
+//   EXTERNAL  a WhatsApp-only person with no HPMS login. No staff document is
+//             read, no role exists. Authorization is: the approvals feature is
+//             on, the authority is verified, that verification is current,
+//             the authority is active, and the request is not their own.
+//   INTERNAL  the pre-H6 staff-based path, byte-for-byte: staff record active,
+//             uid matches, current role passes the live configuration.
+//
+// Inferring the path from "did a staff lookup succeed" is forbidden. The
+// staff repository falls back to a query on any id, so a successful lookup
+// could resolve an attacker-influenced id to a real staff member.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Every EXTERNAL precondition, each with its own code. Anything unknown fails closed. */
+function assertExternalAuthorityEligible(authority, nowMs = Date.now()) {
+  const verdict = assessAuthorityVerification(authority, nowMs);
+  if (!verdict.ok) throw fail(verdict.message, verdict.code, 403);
+  if (authority.is_active !== true) {
+    throw fail('The approval authority for this approver has been deactivated.', 'AUTHORITY_INACTIVE', 403);
+  }
+}
+
+/**
+ * Authorization for an EXTERNAL authority. There is no role: registration by
+ * an administrator plus proof of possession of the number IS the grant. The
+ * self-approval guard compares the requester against BOTH the authority id and
+ * the optional linked staff uid — an external id can never equal a staff uid,
+ * so without the link a staff requester registered as their own authority
+ * would slip through the existing check.
+ */
+export async function assertExternalAuthorityCanApprove(request, actor, authority) {
+  const config = await getInventoryApprovalConfigFirestore();
+  if (config.enabled === false) {
+    throw fail('Purchase request approvals are currently disabled.', 'PURCHASE_REQUEST_APPROVALS_DISABLED', 403);
+  }
+  if (!actor || !actor.uid) {
+    throw fail('An authenticated approver is required.', 'APPROVER_REQUIRED', 401);
+  }
+  assertExternalAuthorityEligible(authority);
+  const requester = request.requested_by_uid ? String(request.requested_by_uid) : null;
+  const linked = authority.linked_staff_uid ? String(authority.linked_staff_uid) : null;
+  if (requester && (requester === String(actor.uid) || (linked && requester === linked))) {
+    throw fail(
+      'You cannot approve or reject a purchase request that you raised yourself.',
+      'PURCHASE_REQUEST_SELF_APPROVAL_FORBIDDEN',
+      403
+    );
+  }
+  return config;
+}
+
+/**
+ * Resolves the deciding principal for a token path from the authority record
+ * alone. Returns the actor decide() records, the preflight authorization, and
+ * a re-assertion that runs INSIDE the decision transaction against freshly
+ * read documents.
+ */
+async function resolveTokenPrincipal(approverUid) {
+  const authority = await getApprovalAuthorityByIdFirestore(approverUid);
+  if (!authority) throw fail('The approver is not configured as an approval authority.', 'AUTHORITY_NOT_FOUND', 403);
+  if (authority.authority_id && String(authority.authority_id) !== String(approverUid)) {
+    throw fail('The approval authority record is inconsistent.', 'AUTHORITY_ID_MISMATCH', 403);
+  }
+  const authorityRef = db.collection(APPROVAL_AUTHORITIES_COLLECTION).doc(approverUid);
+
+  if (authority.authority_type === APPROVAL_AUTHORITY_TYPES.EXTERNAL) {
+    assertExternalAuthorityEligible(authority);
+    const actor = { uid: approverUid, name: authority.display_name || null, email: null, role: null };
+    return {
+      kind: APPROVAL_AUTHORITY_TYPES.EXTERNAL,
+      actor,
+      authorize: (request) => assertExternalAuthorityCanApprove(request, actor, authority),
+      async reassert(txn, current) {
+        const snap = await txn.get(authorityRef);
+        const live = snap.exists ? formatDocSnapshot(snap) : null;
+        await assertExternalAuthorityCanApprove(current, actor, live);
+      }
+    };
+  }
+
+  if (authority.authority_type === APPROVAL_AUTHORITY_TYPES.INTERNAL) {
+    assertAuthorityActive(authority);
+    const staff = await getStaffByUidFirestore(approverUid);
+    const actor = {
+      uid: approverUid,
+      name: staff?.full_name || staff?.username || null,
+      email: staff?.email || null,
+      role: assertStaffEligible(staff, approverUid)
+    };
+    const staffRef = db.collection('staff').doc(staff.id);
+    return {
+      kind: APPROVAL_AUTHORITY_TYPES.INTERNAL,
+      actor,
+      authorize: (request) => assertCanApprove(request, actor),
+      async reassert(txn, current) {
+        const [staffSnap, authoritySnap] = await txn.getAll(staffRef, authorityRef);
+        assertAuthorityActive(authoritySnap.exists ? formatDocSnapshot(authoritySnap) : null);
+        // The role at DECISION time is what the record carries and what the
+        // existing authorization is evaluated against -- never a send-time copy.
+        actor.role = assertStaffEligible(staffSnap.exists ? formatDocSnapshot(staffSnap) : null, approverUid);
+        await assertCanApprove(current, actor);
+      }
+    };
+  }
+
+  throw fail('The approval authority record has no recognised type.', 'AUTHORITY_TYPE_INVALID', 403);
+}
+
 /**
  * Records a decision authorised by an approval-action token.
  *
@@ -423,36 +547,26 @@ async function decideWithApprovalActionToken({
   assertTokenBinding(pre.action, { approverUid, action: wanted, requestDocId: request_id });
   const requestDocId = formatRequestDocId(pre.action.pr_id);
 
-  const authority = await getApprovalAuthorityByUidFirestore(approverUid);
-  assertAuthorityActive(authority);
-  const staff = await getStaffByUidFirestore(approverUid);
-  const actor = {
-    uid: approverUid,
-    name: staff?.full_name || staff?.username || null,
-    email: staff?.email || null,
-    role: assertStaffEligible(staff, approverUid)
-  };
-  const staffRef = db.collection('staff').doc(staff.id);
-  const authorityRef = db.collection(APPROVAL_AUTHORITIES_COLLECTION).doc(approverUid);
+  // H6 -- who is deciding is resolved from the authority record's stored
+  // type; the token binding above already proved the token names this id.
+  const principal = await resolveTokenPrincipal(approverUid);
+  const actor = principal.actor;
 
   return await decide(requestDocId, wanted, {
     comment: reason,
     actor,
-    audit_extra: { decision_channel: consumed_via, ...audit_extra },
+    audit_extra: { decision_channel: consumed_via, approver_type: principal.kind, ...audit_extra },
     hooks: {
+      authorize: principal.authorize,
       // READ PHASE. Token first, so a spent token costs one read and refuses
-      // before anything else is fetched; then the two identity records.
+      // before anything else is fetched; then the identity records.
       async afterRead(txn, current) {
         const verdict = await readApprovalActionInTxn(txn, pre.token_hash, { expectedPurpose: expected_purpose });
         throwForTokenVerdict(verdict);
         assertTokenBinding(verdict.action, { approverUid, action: wanted, requestDocId: current.id });
-
-        const [staffSnap, authoritySnap] = await txn.getAll(staffRef, authorityRef);
-        assertAuthorityActive(authoritySnap.exists ? formatDocSnapshot(authoritySnap) : null);
-        // The role at DECISION time is what the record carries and what the
-        // existing authorization is evaluated against -- never a send-time copy.
-        actor.role = assertStaffEligible(staffSnap.exists ? formatDocSnapshot(staffSnap) : null, approverUid);
-        await assertCanApprove(current, actor);
+        // Identity, eligibility and authorization, re-established against the
+        // documents as they are NOW, inside the transaction.
+        await principal.reassert(txn, current);
       },
       // WRITE PHASE, after decide() has queued the request update.
       beforeCommit(txn) {
@@ -550,15 +664,8 @@ async function beginTokenRejection({ raw_token, decided_by_uid, request_id = nul
   });
   const requestDocId = formatRequestDocId(pre.action.pr_id);
 
-  const authority = await getApprovalAuthorityByUidFirestore(approverUid);
-  assertAuthorityActive(authority);
-  const staff = await getStaffByUidFirestore(approverUid);
-  const actor = {
-    uid: approverUid,
-    name: staff?.full_name || staff?.username || null,
-    email: staff?.email || null,
-    role: assertStaffEligible(staff, approverUid)
-  };
+  const principal = await resolveTokenPrincipal(approverUid);
+  const actor = principal.actor;
 
   // Preflight only. The authoritative status check is the existing one inside
   // the decision transaction in step two; this exists so an approver is not
@@ -572,7 +679,7 @@ async function beginTokenRejection({ raw_token, decided_by_uid, request_id = nul
       409
     );
   }
-  await assertCanApprove(request, actor);
+  await principal.authorize(request);
 
   // The original decision token is deliberately NOT consumed. If this flow is
   // abandoned the intent simply expires, and the approver can begin again.

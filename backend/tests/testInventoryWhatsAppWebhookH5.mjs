@@ -85,7 +85,12 @@ ok('3. the signature is verified BEFORE the body is parsed', iVerify > -1 && iPa
 ok('  the feature flag is checked before the signature', iFlag > -1 && iFlag < iVerify);
 ok('  events are claimed AFTER parsing and BEFORE dispatch', iParse < iClaim && iClaim < iDispatch);
 ok('  a non-Buffer body is refused rather than coerced', /if \(!Buffer\.isBuffer\(rawBody\)\)/.test(CTRL_CODE));
-ok('4. the H7 seam exists and is empty', /async function dispatchVerifiedWebhookEvents/.test(CTRL_CODE));
+ok('4. the dispatch seam exists', /async function dispatchVerifiedWebhookEvents/.test(CTRL_CODE));
+ok('  it hands off to the H6 inbound dispatcher and nothing else (H6)',
+  /dispatchInboundWhatsAppEvents\(claimedEvents\)/.test(CTRL_CODE) &&
+  !/decideWithApprovalActionToken|beginTokenRejection|completeTokenRejection/.test(CTRL_CODE));
+ok('  the sender it carries is the one Meta attested inside the signed body (H6)',
+  /sender_id: message\.from \? String\(message\.from\) : null/.test(CTRL_CODE));
 ok('  no approval logic leaked into H5',
   !/decideWithApprovalActionToken|beginTokenRejection|completeTokenRejection|createApprovalActionFirestore|PurchaseRequestApprovalService/.test(CTRL_CODE + codeOnly(ROUTES) + codeOnly(REPO)));
 ok('  no outbound Meta client in H5', !/graph\.facebook|fetch\(|axios/.test(CTRL_CODE + codeOnly(ROUTES) + codeOnly(REPO)));
@@ -343,11 +348,14 @@ try {
   json = await r.json();
   ok('  a third re-delivery is still a duplicate', json.claimed === 0 && json.duplicates === 1);
   const stored = await repo.getWebhookEventFirestore(`msg:${wamid}`);
-  ok('  the stored claim records CLAIMED and the message id', stored?.status === 'CLAIMED' && stored?.meta_message_id === wamid);
+  ok('  the stored claim records the message id and when it was claimed', typeof stored?.claimed_at === 'string' && stored?.meta_message_id === wamid);
   ok('  it stores a delivery digest, not the payload',
     typeof stored?.delivery_digest === 'string' && stored.delivery_digest.length === 64 &&
     !JSON.stringify(stored).includes('whatsapp_business_account'));
-  ok('  processed_at is null — H5 claims but never processes', stored?.processed_at === null);
+  // H6: the dispatcher now marks every claimed event. This one has no sender,
+  // so it was ignored — PROCESSED with no downstream effect and no error.
+  ok('  the dispatcher marked it PROCESSED with no downstream effect (no sender → ignored)',
+    stored?.status === 'PROCESSED' && typeof stored?.processed_at === 'string' && stored?.error_code === null);
 
   console.log('\n  -- 19. a status receipt does not collide with the message --');
   const statusDelivery = JSON.stringify({

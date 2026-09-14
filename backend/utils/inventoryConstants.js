@@ -235,6 +235,44 @@ export const PR_REJECTION_REASON_CODES = Object.freeze({
 });
 
 /**
+ * Phase H6 — approval authorities as EXTERNAL identities.
+ *
+ *   EXTERNAL  a person who approves over WhatsApp and never logs into HPMS.
+ *             No Firebase account, no staff document, no role. Identity is a
+ *             server-issued authority_id; the credential is a verified WhatsApp
+ *             number. This is the only type the H6 registration path creates.
+ *   INTERNAL  the pre-H6 shape, keyed by a staff uid and authorised by the
+ *             staff role. Retained so the staff-based principal path stays
+ *             explicit and selectable by STORED type — never by whether a
+ *             staff lookup happens to succeed. Nothing in H6 creates one.
+ *
+ * External authority is never expressed as a staff role. A stored type is
+ * immutable after creation.
+ */
+export const APPROVAL_AUTHORITY_TYPES = Object.freeze({
+  EXTERNAL: 'EXTERNAL',
+  INTERNAL: 'INTERNAL'
+});
+
+/** REGISTERED IS NOT VERIFIED: a new authority starts PENDING_VERIFICATION. */
+export const APPROVAL_AUTHORITY_VERIFICATION = Object.freeze({
+  PENDING_VERIFICATION: 'PENDING_VERIFICATION',
+  VERIFIED: 'VERIFIED',
+  REVOKED: 'REVOKED'
+});
+
+/** How the number was proven: a one-time code that arrived FROM the number. */
+export const WHATSAPP_VERIFICATION_METHOD = 'WHATSAPP_INBOUND_CODE';
+
+/** A proven number stays proven for 180 days, then must be proven again. */
+export const WHATSAPP_VERIFICATION_VALIDITY_MS = 180 * 24 * 60 * 60 * 1000;
+
+/** A one-time code lives 15 minutes and survives at most 5 wrong guesses. */
+export const WHATSAPP_VERIFICATION_CHALLENGE_TTL_MS = 15 * 60 * 1000;
+export const WHATSAPP_VERIFICATION_MAX_ATTEMPTS = 5;
+export const WHATSAPP_VERIFICATION_CODE_LENGTH = 8;
+
+/**
  * Fail-safe default when settings/inventory_pr_approval is missing or invalid:
  * only administrators may approve. This is deliberately NOT the Phase B
  * REQUEST role set — being able to raise a request must never imply being able

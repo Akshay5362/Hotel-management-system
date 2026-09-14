@@ -54,7 +54,9 @@ console.log('═══ PART A — source invariants (no Firebase) ═══');
 console.log('\n  -- the existing engine is intact --');
 ok('1. approve() still exists and calls decide()', /async approve\(requestId, comment, actor\) \{\s*return await decide\(requestId, PR_APPROVAL_ACTIONS\.APPROVED/.test(CODE));
 ok('2. reject() still exists and calls decide()', /async reject\(requestId, reason, actor\) \{\s*return await decide\(requestId, PR_APPROVAL_ACTIONS\.REJECTED/.test(CODE));
-ok('3. assertCanApprove is still the preflight authorization', /const preflight = await getPurchaseRequestByIdFirestore\(docId\);[\s\S]{0,200}await assertCanApprove\(preflight, actor\);/.test(CODE));
+ok('3. assertCanApprove is still the preflight authorization', /const preflight = await getPurchaseRequestByIdFirestore\(docId\);[\s\S]{0,300}await assertCanApprove\(preflight, actor\);/.test(CODE));
+ok('  a principal may bring its own authorization, and the in-app path passes none (H6)',
+  /if \(hooks\?\.authorize\) await hooks\.authorize\(preflight, actor\);\s*\n\s*else await assertCanApprove\(preflight, actor\);/.test(CODE));
 ok('4. exactly ONE db.runTransaction in the service — no second decision transaction', (CODE.match(/db\.runTransaction\(/g) || []).length === 1);
 ok('  the transaction still re-reads the request first', /const snap = await txn\.get\(ref\);/.test(TXN) && TXN.indexOf('txn.get(ref)') < TXN.indexOf('hooks.afterRead('));
 ok('  first-valid-decision-wins guard still present', /current\.status !== PR_STATUS\.PENDING_APPROVAL/.test(TXN));
@@ -68,7 +70,8 @@ ok('  the in-app path passes no hooks (unchanged behaviour)',
 
 console.log('\n  -- the token path reuses, never duplicates --');
 ok('5. token path uses the H2 repository', /from '\.\.\/repositories\/firestore\/inventoryApprovalActionsRepository\.js'/.test(SVC));
-ok('  and the H1 authority repository', /getApprovalAuthorityByUidFirestore\(approverUid\)/.test(TOKEN_FN));
+ok('  and resolves the principal from the authority record, by id (H6)',
+  /resolveTokenPrincipal\(approverUid\)/.test(TOKEN_FN) && /getApprovalAuthorityByIdFirestore\(approverUid\)/.test(CODE));
 ok('  token path delegates to decide() with hooks', /return await decide\(requestDocId, wanted, \{[\s\S]{0,200}hooks: \{/.test(TOKEN_FN));
 ok('8. no token-only shortcut: the token path performs no request write of its own', !/txn\.update\(ref|txn\.update\(requestRef|updateDoc\(|\.set\(/.test(TOKEN_FN));
 ok('  it never sets a purchase-request status itself', !/status:\s*(targetStatus|PR_STATUS)/.test(TOKEN_FN));
@@ -100,12 +103,17 @@ ok('  bindings are re-checked inside the transaction against the freshly read re
 ok('  only the canonical PR_APPROVAL_ACTIONS vocabulary is compared', /normalizeApprovalActionToken\(action\)/.test(TOKEN_FN) && !/'APPROVE'\s*===|'REJECT'\s*===/.test(CODE));
 
 console.log('\n  -- authority revalidated at decision time --');
-ok('14. staff AND authority are re-read inside the transaction',
-  /txn\.getAll\(staffRef, authorityRef\)/.test(TOKEN_FN) &&
-  /db\.collection\('staff'\)\.doc\(staff\.id\)/.test(TOKEN_FN) &&
-  /db\.collection\(APPROVAL_AUTHORITIES_COLLECTION\)\.doc\(approverUid\)/.test(TOKEN_FN));
-ok('  decision-time role overrides the send-time role', /actor\.role = assertStaffEligible\(staffSnap\.exists \? formatDocSnapshot\(staffSnap\) : null, approverUid\);/.test(TOKEN_FN));
-ok('  the EXISTING assertCanApprove runs inside the transaction with that role', /await assertCanApprove\(current, actor\);/.test(TOKEN_FN));
+ok('14. the principal is re-asserted inside the transaction (H6)', /await principal\.reassert\(txn, current\)/.test(TOKEN_FN));
+ok('  INTERNAL path: staff AND authority are re-read inside the transaction',
+  /txn\.getAll\(staffRef, authorityRef\)/.test(CODE) &&
+  /db\.collection\('staff'\)\.doc\(staff\.id\)/.test(CODE) &&
+  /db\.collection\(APPROVAL_AUTHORITIES_COLLECTION\)\.doc\(approverUid\)/.test(CODE));
+ok('  INTERNAL path: decision-time role overrides the send-time role', /actor\.role = assertStaffEligible\(staffSnap\.exists \? formatDocSnapshot\(staffSnap\) : null, approverUid\);/.test(CODE));
+ok('  INTERNAL path: the EXISTING assertCanApprove runs inside the transaction with that role', /await assertCanApprove\(current, actor\);/.test(CODE));
+ok('  EXTERNAL path: the authority is re-read inside the transaction and re-authorised (H6)',
+  /const snap = await txn\.get\(authorityRef\);[\s\S]{0,200}await assertExternalAuthorityCanApprove\(current, actor, live\)/.test(CODE));
+ok('  the path is chosen by the STORED authority_type and fails closed on anything else (H6)',
+  (CODE.match(/authority\.authority_type === APPROVAL_AUTHORITY_TYPES\.(EXTERNAL|INTERNAL)/g) || []).length === 2 && /AUTHORITY_TYPE_INVALID/.test(CODE));
 ok('  inactive staff refused', /STAFF_INACTIVE/.test(CODE) && /STAFF_NOT_FOUND/.test(CODE));
 ok('  missing/inactive authority refused', /AUTHORITY_NOT_FOUND/.test(CODE) && /AUTHORITY_INACTIVE/.test(CODE));
 ok('  a phone number or verification state is never consulted as authorization', !/whatsapp_verified_at|whatsapp_e164/.test(CODE));
@@ -200,7 +208,10 @@ try {
     email: `h3test_${TS}@example.invalid`, role: 'admin', department: 'Administration',
     status: 'Active', is_active: true, created_at: iso(), updated_at: iso()
   }); writes++; created.staff = true;
+  // An INTERNAL (staff-keyed) authority: this suite proves the pre-H6 staff
+  // path still works byte-for-byte. The EXTERNAL path is proven by the H6 suite.
   await db.collection('inventory_approval_authorities').doc(UID).set({
+    authority_id: UID, authority_type: 'INTERNAL',
     user_uid: UID, display_name: 'H3 Test Approver', whatsapp_e164: null,
     whatsapp_verified_at: null, whatsapp_verification_method: null, is_active: true,
     created_at: iso(), created_by: 'h3_test', updated_at: iso(), updated_by: 'h3_test'

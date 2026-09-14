@@ -12,6 +12,15 @@ export const isWhatsAppWebhookEnabled = () => {
   return process.env.ENABLE_WHATSAPP_WEBHOOK === 'true';
 };
 
+/**
+ * Phase H6 — WhatsApp number verification for approval authorities. Defaults
+ * to FALSE. While off, no verification challenge can be issued and an inbound
+ * code does nothing. Requires WHATSAPP_VERIFICATION_SECRET in the environment.
+ */
+export const isWhatsAppVerificationEnabled = () => {
+  return process.env.ENABLE_WHATSAPP_VERIFICATION === 'true';
+};
+
 export const isFirestoreReadsEnabled = () => {
   return process.env.ENABLE_FIRESTORE_READS === 'true';
 };
@@ -334,5 +343,6 @@ export const FEATURE_FLAGS = {
   DISABLE_BUSINESS_DATE_SHADOW_VERIFICATION: isBusinessDateShadowVerificationDisabled(),
   DISABLE_MASTER_DATA_SHADOW_VERIFICATION: isMasterDataShadowVerificationDisabled(),
   DISABLE_OPERATIONAL_SHADOW_VERIFICATION: isOperationalShadowVerificationDisabled(),
-  ENABLE_WHATSAPP_WEBHOOK: isWhatsAppWebhookEnabled()
+  ENABLE_WHATSAPP_WEBHOOK: isWhatsAppWebhookEnabled(),
+  ENABLE_WHATSAPP_VERIFICATION: isWhatsAppVerificationEnabled()
 };

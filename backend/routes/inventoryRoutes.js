@@ -19,8 +19,9 @@ import { requireRole } from '../controllers/authController.js';
 import { INVENTORY_ROLES, RECEIVING_ROLES, REVERSAL_ROLES, SHORT_CLOSE_ROLES } from '../utils/inventoryConstants.js';
 import { uploadProductPhoto } from '../middleware/inventoryUploadMiddleware.js';
 import {
-  getApprovalAuthorities, getApprovalAuthorityByUid, upsertApprovalAuthority,
-  activateApprovalAuthority, deactivateApprovalAuthority
+  getApprovalAuthorities, getApprovalAuthorityById, createApprovalAuthority, updateApprovalAuthority,
+  issueApprovalAuthorityVerificationChallenge, activateApprovalAuthority, deactivateApprovalAuthority,
+  revokeApprovalAuthorityVerification, changeApprovalAuthorityWhatsAppNumber
 } from '../controllers/inventoryApprovalAuthoritiesController.js';
 import { billUpload, verifyUploadedBill } from '../middleware/billUploadMiddleware.js';
 import { uploadBill, listBills, getBill, streamBillFile, discardBill, extractBill, interpretBill, getBillLines, confirmBillAgainstPO, confirmBillDirect, reverseDirectReceipt,
@@ -128,18 +129,21 @@ router.post('/purchase-requests/:id/cancel', REQUEST, cancelPurchaseRequest);
 router.post('/purchase-requests/:id/approve', REQUEST, approvePurchaseRequest);
 router.post('/purchase-requests/:id/reject', REQUEST, rejectPurchaseRequest);
 
-// Phase H1 — WhatsApp approval authorities: who may be NOTIFIED of a pending
-// request, and on which number. MANAGE (admin, super_admin) throughout, so no
-// staff member can register themselves. These records carry reachability only;
-// the right to approve is still resolved from settings/inventory_pr_approval
-// at decision time, inside purchaseRequestApprovalService. PUT keyed by uid
-// rather than POST, because the uid IS the identity and a repeat must update
-// the one record instead of creating a second.
+// Phase H1/H6 — EXTERNAL WhatsApp approval authorities: people who approve
+// over WhatsApp and never log into HPMS. MANAGE (admin, super_admin)
+// throughout; there is no self-service route because the authority's only
+// interaction with the system is over WhatsApp. POST creates and the server
+// mints the identity — an authority_id, never a uid. The one-time verification
+// code is returned once, to the administrator, from the challenge route.
 router.get('/approval-authorities', MANAGE, getApprovalAuthorities);
-router.get('/approval-authorities/:uid', MANAGE, getApprovalAuthorityByUid);
-router.put('/approval-authorities/:uid', MANAGE, upsertApprovalAuthority);
-router.post('/approval-authorities/:uid/activate', MANAGE, activateApprovalAuthority);
-router.post('/approval-authorities/:uid/deactivate', MANAGE, deactivateApprovalAuthority);
+router.post('/approval-authorities', MANAGE, createApprovalAuthority);
+router.get('/approval-authorities/:authorityId', MANAGE, getApprovalAuthorityById);
+router.patch('/approval-authorities/:authorityId', MANAGE, updateApprovalAuthority);
+router.post('/approval-authorities/:authorityId/verification-challenge', MANAGE, issueApprovalAuthorityVerificationChallenge);
+router.post('/approval-authorities/:authorityId/activate', MANAGE, activateApprovalAuthority);
+router.post('/approval-authorities/:authorityId/deactivate', MANAGE, deactivateApprovalAuthority);
+router.post('/approval-authorities/:authorityId/revoke-verification', MANAGE, revokeApprovalAuthorityVerification);
+router.post('/approval-authorities/:authorityId/number', MANAGE, changeApprovalAuthorityWhatsAppNumber);
 
 // Purchase orders (Phase E) — the formal document issued to ONE supplier,
 // created from exactly ONE approved request. MANAGE-only: a PO carries

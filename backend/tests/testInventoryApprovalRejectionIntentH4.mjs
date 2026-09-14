@@ -78,8 +78,10 @@ ok('  begin accepts only a REJECT token',
   /assertTokenBinding\(pre\.action, \{[\s\S]{0,120}action: PR_APPROVAL_ACTIONS\.REJECTED/.test(BEGIN_FN));
 ok('  begin checks the token verdict (existence, expiry, consumption)', /throwForTokenVerdict\(pre\)/.test(BEGIN_FN));
 ok('  begin checks the request and approver bindings', /assertTokenBinding\(pre\.action/.test(BEGIN_FN));
-ok('  begin checks staff and authority', /assertAuthorityActive\(authority\)/.test(BEGIN_FN) && /assertStaffEligible\(staff, approverUid\)/.test(BEGIN_FN));
-ok('  begin runs the EXISTING authorization check', /await assertCanApprove\(request, actor\)/.test(BEGIN_FN));
+ok('  begin resolves the principal from the authority record (H6)', /resolveTokenPrincipal\(approverUid\)/.test(BEGIN_FN));
+ok('  begin runs the principal\'s own authorization check (H6)', /await principal\.authorize\(request\)/.test(BEGIN_FN));
+ok('  the INTERNAL principal still checks staff and authority and runs assertCanApprove',
+  /assertAuthorityActive\(authority\)/.test(CODE) && /assertStaffEligible\(staff, approverUid\)/.test(CODE) && /authorize: \(request\) => assertCanApprove\(request, actor\)/.test(CODE));
 ok('  begin requires the request to be pending', /request\.status !== PR_STATUS\.PENDING_APPROVAL/.test(BEGIN_FN));
 ok('4. begin consumes NOTHING',
   !/markApprovalActionConsumedInTxn|consumeApprovalAction|consumed_at/.test(BEGIN_FN));
@@ -258,6 +260,7 @@ try {
     status: 'Active', is_active: true, created_at: iso(), updated_at: iso()
   }); writes++; cleanup.staff = true;
   await db.collection('inventory_approval_authorities').doc(UID).set({
+    authority_id: UID, authority_type: 'INTERNAL',
     user_uid: UID, display_name: 'H4 Test Approver', whatsapp_e164: null,
     whatsapp_verified_at: null, whatsapp_verification_method: null, is_active: true,
     created_at: iso(), created_by: 'h4_test', updated_at: iso(), updated_by: 'h4_test'

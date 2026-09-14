@@ -318,6 +318,15 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // Server-owned: whatsappNumberBindingsRepository (Admin SDK). Phase H6.
+    // One WhatsApp number → one approval authority, plus the keyed HMAC of a
+    // live verification code. A client that could write here could forge a
+    // verification; one that could read could enumerate numbers and digests.
+    // Both denied.
+    match /whatsapp_number_bindings/{numberKey} {
+      allow read, write: if false;
+    }
+
     // Server-owned: cashLogsRepository / cashSubmissionsRepository (Admin SDK)
     // via cashController. Cash records are the reconciliation trail.
     match /cash_logs/{logId} {

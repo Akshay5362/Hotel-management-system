@@ -36,6 +36,10 @@ import {
   claimWebhookEventFirestore,
   digestDelivery
 } from '../repositories/firestore/whatsappWebhookEventsRepository.js';
+import { dispatchInboundWhatsAppEvents } from '../services/whatsappInboundDispatcher.js';
+
+/** A code is 8 digits; anything longer than this is not a message we act on. */
+const MAX_TEXT_LENGTH = 512;
 
 const LOG = '[WhatsAppWebhook]';
 
@@ -101,10 +105,21 @@ export function extractWebhookEvents(payload) {
 
       for (const message of Array.isArray(value?.messages) ? value.messages : []) {
         if (!message?.id) continue;
+        // H6 — the sender is the one Meta attested INSIDE the signed body. It is
+        // the only sender this system ever trusts; no caller-supplied field can
+        // stand in for it. Text is carried only for plain text messages, capped,
+        // and never logged by this controller.
+        const messageType = message.type ? String(message.type) : null;
+        const text = messageType === 'text' && typeof message.text?.body === 'string'
+          ? message.text.body.slice(0, MAX_TEXT_LENGTH)
+          : null;
         events.push({
           event_id: `msg:${message.id}`,
           event_type: 'message',
-          meta_message_id: String(message.id)
+          meta_message_id: String(message.id),
+          sender_id: message.from ? String(message.from) : null,
+          message_type: messageType,
+          text
         });
       }
 
@@ -198,18 +213,22 @@ export const receiveWebhook = async (req, res) => {
 };
 
 /**
- * ── H7 SEAM ──────────────────────────────────────────────────────────────────
- * Deliberately a no-op in H5.
+ * ── DISPATCH SEAM ────────────────────────────────────────────────────────────
+ * H5 left this empty. H6 hands the claimed events to the inbound dispatcher,
+ * which in H6 routes ONE thing — a verification code from an authority's own
+ * number — and ignores everything else. Approve and Reject taps are H7 and are
+ * deliberately not routed here.
  *
- * H7 will map the sender to an H1 approval authority and route an Approve or
- * Reject into the EXISTING decision engine, then emit PR_EVENTS.DECIDED. It
- * receives only events THIS process claimed, so it is called at most once per
- * event no matter how often Meta re-delivers.
- *
- * It must stay non-throwing: the claim has already committed, and an exception
- * here would turn a handled delivery into a 500 and a pointless retry.
+ * It receives only events THIS process claimed, so downstream work runs at
+ * most once per event no matter how often Meta re-delivers. It must stay
+ * non-throwing: the claim has already committed, and an exception here would
+ * turn a handled delivery into a 500 and a pointless retry.
  */
 async function dispatchVerifiedWebhookEvents(claimedEvents /* , req */) {
   if (!claimedEvents.length) return;
-  // Intentionally empty until H7. No approval logic belongs in H5.
-};
+  try {
+    await dispatchInboundWhatsAppEvents(claimedEvents);
+  } catch (err) {
+    console.error(`${LOG} dispatch failed: ${err?.message || err}`);
+  }
+}
