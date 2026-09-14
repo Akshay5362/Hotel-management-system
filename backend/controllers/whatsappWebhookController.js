@@ -157,10 +157,20 @@ export function extractWebhookEvents(payload) {
 
       for (const status of Array.isArray(value?.statuses) ? value.statuses : []) {
         if (!status?.id || !status?.status) continue;
+        // H8-E — the receipt's own value and, when it failed, the provider's
+        // code and title. Read here and nowhere else, clamped like the text,
+        // and never logged. The recipient number Meta also puts on a status is
+        // deliberately NOT read: correlation is by message id alone.
+        const failure = Array.isArray(status.errors) ? status.errors[0] : null;
         events.push({
           event_id: `status:${status.id}:${status.status}`,
           event_type: 'status',
-          meta_message_id: String(status.id)
+          meta_message_id: String(status.id),
+          status_value: String(status.status).slice(0, 32),
+          error_code: failure?.code === undefined || failure?.code === null ? null : String(failure.code).slice(0, 64),
+          error_message: typeof failure?.title === 'string'
+            ? failure.title.slice(0, MAX_TEXT_LENGTH)
+            : (typeof failure?.message === 'string' ? failure.message.slice(0, MAX_TEXT_LENGTH) : null)
         });
       }
     }

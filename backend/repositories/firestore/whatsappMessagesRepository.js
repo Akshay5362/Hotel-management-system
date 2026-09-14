@@ -252,6 +252,103 @@ export function normalizeDeliveryStatus(value) {
 }
 
 /**
+ * Phase H8-E — delivery is a one-way lifecycle, so a receipt may only ever move
+ * it FORWARD. Meta can redeliver a webhook and can deliver receipts out of
+ * order, so a late 'sent' must never undo a 'read' that already arrived.
+ *
+ * FAILED ranks highest and is terminal: once a message is reported failed,
+ * nothing reopens it.
+ */
+export const DELIVERY_STATUS_RANK = Object.freeze({
+  SENT: 1, DELIVERED: 2, READ: 3, FAILED: 4
+});
+
+/** The timestamp each state stamps, recorded once, on first arrival. */
+const DELIVERY_TIMESTAMP_FIELD = Object.freeze({
+  SENT: 'sent_at', DELIVERED: 'delivered_at', READ: 'read_at', FAILED: 'failed_at'
+});
+
+/** Outcomes of applying one receipt. None of them throws for an expected case. */
+export const DELIVERY_APPLY = Object.freeze({
+  APPLIED: 'APPLIED',
+  NOT_FOUND: 'NOT_FOUND',
+  IGNORED_STALE: 'IGNORED_STALE',
+  INVALID: 'INVALID'
+});
+
+/** Provider error text is theirs, not ours: single-line, clamped, never trusted. */
+export const PROVIDER_ERROR_MAX = 200;
+export function sanitizeProviderError(value) {
+  const s = String(value ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  return s.length <= PROVIDER_ERROR_MAX ? s : s.slice(0, PROVIDER_ERROR_MAX - 1) + '…';
+}
+
+/**
+ * Applies one delivery receipt to the dispatch that produced the message.
+ *
+ * Correlation is by PROVIDER MESSAGE ID only. A receipt for an id we never
+ * recorded touches nothing and creates nothing: there is no path here that
+ * writes a document which did not already exist, so a forged or unknown id
+ * cannot manufacture an outbound record.
+ *
+ * The read and the write share one transaction, so two receipts arriving at
+ * once cannot both decide they are the newer one.
+ *
+ * Transport state ONLY. This never reads or writes a purchase request, a token,
+ * an authority or a verification, and it cannot: none of them is reachable from
+ * this file.
+ *
+ * @returns {{ outcome: string, dispatch_id: string|null, from: string|null, to: string|null }}
+ */
+export async function applyDeliveryStatusFirestore(providerMessageId, { status, error_code = null, error_message = null } = {}) {
+  const wanted = String(providerMessageId ?? '').trim();
+  if (!wanted) return { outcome: DELIVERY_APPLY.INVALID, dispatch_id: null, from: null, to: null };
+
+  let normalized;
+  try { normalized = normalizeDeliveryStatus(status); }
+  catch { return { outcome: DELIVERY_APPLY.INVALID, dispatch_id: null, from: null, to: null }; }
+
+  const snap = await db.collection(WHATSAPP_MESSAGES_COLLECTION)
+    .where('provider_message_id', '==', wanted).limit(1).get();
+  if (snap.empty) {
+    // Deliberately nothing: no document is created for an id we never sent.
+    return { outcome: DELIVERY_APPLY.NOT_FOUND, dispatch_id: null, from: null, to: null };
+  }
+  const ref = snap.docs[0].ref;
+
+  return await db.runTransaction(async (txn) => {
+    const fresh = await txn.get(ref);
+    if (!fresh.exists) return { outcome: DELIVERY_APPLY.NOT_FOUND, dispatch_id: null, from: null, to: null };
+    const current = formatDocSnapshot(fresh);
+    const from = current.delivery_status || null;
+    const currentRank = from ? (DELIVERY_STATUS_RANK[from] || 0) : 0;
+    const nextRank = DELIVERY_STATUS_RANK[normalized];
+
+    // Forward only. A duplicate or a late receipt is recorded as ignored, which
+    // is what makes redelivery harmless rather than destructive.
+    if (nextRank <= currentRank) {
+      return { outcome: DELIVERY_APPLY.IGNORED_STALE, dispatch_id: current.dispatch_id, from, to: from };
+    }
+
+    const now = new Date().toISOString();
+    const updates = {
+      delivery_status: normalized,
+      delivery_updated_at: now,
+      updated_at: now,
+      // Stamped once: an existing timestamp is the first time we heard it.
+      [DELIVERY_TIMESTAMP_FIELD[normalized]]: current[DELIVERY_TIMESTAMP_FIELD[normalized]] || now
+    };
+    if (normalized === WHATSAPP_DELIVERY_STATUS.FAILED) {
+      updates.provider_error_code = error_code === null || error_code === undefined ? null : String(error_code).slice(0, 64);
+      updates.provider_error_message = sanitizeProviderError(error_message);
+    }
+    txn.update(ref, updates);
+    return { outcome: DELIVERY_APPLY.APPLIED, dispatch_id: current.dispatch_id, from, to: normalized };
+  });
+}
+
+/**
  * Updates transport state and NOTHING else. A delivery receipt never touches a
  * purchase request, a token or a decision: an undelivered notification means
  * the message did not arrive, not that the request was refused.

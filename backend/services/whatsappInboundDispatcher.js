@@ -32,6 +32,11 @@ import { redeemVerificationFromSender } from './whatsappAuthorityVerificationSer
 import { routeWhatsAppAction } from './whatsappDecisionRouter.js';
 import { looksLikeActionPayload } from '../utils/whatsappActionPayload.js';
 import { handleReviewTap, isReviewTap } from './whatsappReviewBridgeService.js';
+import {
+  applyDeliveryStatusFirestore,
+  DELIVERY_APPLY
+} from '../repositories/firestore/whatsappMessagesRepository.js';
+import { PR_WHATSAPP_EVENTS, WHATSAPP_DELIVERY_STATUS } from '../utils/inventoryConstants.js';
 
 const LOG = '[WhatsAppInbound]';
 
@@ -41,7 +46,39 @@ const LOG = '[WhatsAppInbound]';
  * is ignored safely, which is the correct answer for a photo, a sticker or a
  * message we have no business interpreting.
  */
+/**
+ * H8-E — a delivery receipt. Transport state and nothing else: it moves a
+ * dispatch forward through sent, delivered, read or failed, and cannot reach a
+ * purchase request, a token, an authority or a verification from here.
+ *
+ * A receipt for a message id we never recorded does nothing at all, so an
+ * unknown or forged id cannot manufacture an outbound record.
+ */
+async function handleStatus(event, { io }) {
+  const result = await applyDeliveryStatusFirestore(event.meta_message_id, {
+    status: event.status_value,
+    error_code: event.error_code,
+    error_message: event.error_message
+  });
+
+  if (result.outcome === DELIVERY_APPLY.APPLIED) {
+    const failed = result.to === WHATSAPP_DELIVERY_STATUS.FAILED;
+    try {
+      // A display hint only, after the write committed. No number, no token.
+      io?.emit(failed ? PR_WHATSAPP_EVENTS.FAILED : PR_WHATSAPP_EVENTS.STATUS, {
+        dispatch_id: result.dispatch_id,
+        delivery_status: result.to,
+        previous_status: result.from
+      });
+    } catch (err) {
+      console.warn(`${LOG} status emit failed: ${err.message}`);
+    }
+  }
+  return `STATUS_${result.outcome}`;
+}
+
 async function handleOne(event, { io }) {
+  if (event.event_type === 'status') return await handleStatus(event, { io });
   if (event.event_type !== 'message') return 'IGNORED_NOT_A_MESSAGE';
   if (!event.sender_id) return 'IGNORED_NO_SENDER';
 
