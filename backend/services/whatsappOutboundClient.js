@@ -509,9 +509,68 @@ export function createWhatsAppReplyClient({
  */
 export let whatsappReplyClient = createWhatsAppReplyClient();
 
-/** TEST SEAM ONLY. Installs a replacement reply client; returns the previous one. */
+/**
+ * TEST SEAM ONLY. Installs a replacement reply client; returns the previous one.
+ *
+ * H8-F — the seam now refuses to arm outside an explicitly declared development
+ * process. HPMS_ENV is the project's one environment selector and it defaults to
+ * production when unset, so a packaged build, a bare `node server.js` or any
+ * pathway that has not opted in simply cannot install a recording client. The
+ * fake transport was already unreachable from production code; this makes that
+ * structural rather than merely true.
+ */
 export function setWhatsAppReplyClient(client) {
+  if ((process.env.HPMS_ENV || 'production') !== 'development') {
+    throw new Error(
+      'setWhatsAppReplyClient is a development-only test seam and cannot be used in this environment.'
+    );
+  }
   const previous = whatsappReplyClient;
   whatsappReplyClient = client || createWhatsAppReplyClient();
   return previous;
+}
+
+/**
+ * H8-F — a safe answer to "is outbound actually ready?".
+ *
+ * Booleans and lengths only. It never returns, and can never be made to
+ * return, an access token, an app secret, a verify token, an authorization
+ * header or a recipient number: it reads the four configuration values purely
+ * to test whether they are present, and returns nothing derived from them
+ * beyond presence.
+ *
+ * `ready` is deliberately the conjunction of everything a real send needs, so a
+ * deployment that is enabled but missing a template reports not-ready rather
+ * than discovering it at the first send.
+ */
+export function getWhatsAppOutboundStatus() {
+  const graphBaseUrl = safeGraphBaseUrl(process.env.WHATSAPP_GRAPH_BASE_URL || DEFAULT_GRAPH_BASE_URL);
+  const apiVersion = String(process.env.WHATSAPP_GRAPH_API_VERSION || '').trim();
+  const phoneNumberId = String(process.env.WHATSAPP_PHONE_NUMBER_ID || '').trim();
+  const hasAccessToken = Boolean(String(process.env.WHATSAPP_ACCESS_TOKEN || '').trim());
+  const templateName = String(process.env.WHATSAPP_TEMPLATE_PR_REVIEW || '').trim();
+  const templateLanguage = String(process.env.WHATSAPP_TEMPLATE_LANGUAGE || '').trim();
+
+  const graph_configured = Boolean(graphBaseUrl && apiVersion && phoneNumberId);
+  const credentials_configured = hasAccessToken;
+  const template_configured = isValidTemplateName(templateName) && isValidLanguageCode(templateLanguage);
+  const outbound_enabled = isWhatsAppOutboundEnabled();
+
+  const missing = [];
+  if (!graphBaseUrl) missing.push('WHATSAPP_GRAPH_BASE_URL');
+  if (!apiVersion) missing.push('WHATSAPP_GRAPH_API_VERSION');
+  if (!phoneNumberId) missing.push('WHATSAPP_PHONE_NUMBER_ID');
+  if (!hasAccessToken) missing.push('WHATSAPP_ACCESS_TOKEN');
+  if (!isValidTemplateName(templateName)) missing.push('WHATSAPP_TEMPLATE_PR_REVIEW');
+  if (!isValidLanguageCode(templateLanguage)) missing.push('WHATSAPP_TEMPLATE_LANGUAGE');
+
+  return Object.freeze({
+    outbound_enabled,
+    graph_configured,
+    credentials_configured,
+    template_configured,
+    // Names of what is absent. A NAME, never a value.
+    missing: Object.freeze(missing),
+    ready: outbound_enabled && graph_configured && credentials_configured && template_configured
+  });
 }
